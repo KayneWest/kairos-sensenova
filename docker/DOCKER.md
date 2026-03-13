@@ -13,10 +13,14 @@ The official images are hosted on **GitHub Container Registry (GHCR)**.
 
 ## 🐳 Docker (recommended)
 
-- Registry: **GitHub Container Registry**
-- Image name: `ghcr.io/kairos-agi/kairos-sensenova:v0.0.1`
-- Platform: Linux (CUDA-enabled)
+Official images are hosted on GitHub Container Registry (GHCR).
 
+| Image                                                | Description                         |
+| ---------------------------------------------------- | ----------------------------------- |
+| `ghcr.io/kairos-agi/kairos-sensenova:v0.0.1`         |  For A800 / A100 |
+| `ghcr.io/kairos-agi/kairos-sensenova:v0.0.1-rtx5090` |  For RTX 5090    |
+
+Platform: Linux (CUDA-enabled)
 
 ## 1. Pull the Docker Image
 - you need to login to ghcr.io first through Personal Access Token (PAT)
