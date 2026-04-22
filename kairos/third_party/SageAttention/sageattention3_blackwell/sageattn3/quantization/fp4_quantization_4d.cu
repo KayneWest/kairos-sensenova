@@ -621,8 +621,10 @@ void scaled_fp4_quant_trans(torch::Tensor const& input,
   });
 }
 
+#ifndef KAIROS_EMBEDDED_SAGEATTN3
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("scaled_fp4_quant", &scaled_fp4_quant);
   m.def("scaled_fp4_quant_permute", &scaled_fp4_quant_permute);
   m.def("scaled_fp4_quant_trans", &scaled_fp4_quant_trans);
 }
+#endif

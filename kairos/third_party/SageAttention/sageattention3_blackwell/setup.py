@@ -8,6 +8,7 @@ from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 import torch
 from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
+import torch.utils.cpp_extension as cpp_extension
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -19,6 +20,11 @@ FORCE_BUILD = os.getenv("FAHOPPER_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FAHOPPER_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FAHOPPER_FORCE_CXX11_ABI", "FALSE") == "TRUE"
+SKIP_TORCH_CUDA_VERSION_CHECK = os.getenv("SAGEATTN3_SKIP_TORCH_CUDA_CHECK", "TRUE") == "TRUE"
+
+
+if SKIP_TORCH_CUDA_VERSION_CHECK:
+    cpp_extension._check_cuda_version = lambda *args, **kwargs: None
 
 
 

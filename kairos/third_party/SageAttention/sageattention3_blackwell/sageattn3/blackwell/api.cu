@@ -337,10 +337,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
     // printf("%s\n", cudaGetErrorString(err));
     return {out, softmax_lse};
 }
-
-
-
+#ifndef KAIROS_EMBEDDED_SAGEATTN3
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");
 }
+#endif

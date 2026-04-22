@@ -1,8 +1,12 @@
+import math
+import os
+import sys
+from pathlib import Path
+from typing import Tuple, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-from typing import Tuple, Optional
 from einops import rearrange
 from transformers.activations import ACT2CLS
 from apex.normalization.fused_layer_norm import FusedRMSNorm
@@ -10,6 +14,12 @@ from apex.normalization.fused_layer_norm import FusedRMSNorm
 FLASH_ATTN_2_AVAILABLE = False
 FLASH_ATTN_3_AVAILABLE = False
 SAGE_ATTN_AVAILABLE = False
+SAGE3_ATTN_AVAILABLE = False
+sageattn = None
+sag_attention_with_window = None
+sageattn_qk_int8_pv_fp16_cuda_with_window = None
+sageattn3_blackwell = None
+sageattn3_with_window = None
 
 try:
     import flash_attn_interface
@@ -21,7 +31,7 @@ except ModuleNotFoundError:
 
 try:
     import flash_attn
-    FLASH_ATTN_2_AVAILABLE = True
+    FLASH_ATTN_2_AVAILABLE = hasattr(flash_attn, "flash_attn_func")
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
@@ -31,13 +41,39 @@ if not IS_CUDA:
 
 from kairos.modules.utils import FLAGS_KAIROS_CUDA_SM
 
+
+def _prepend_path(path: Path):
+    path_str = str(path)
+    if path.is_dir() and path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
+
+_SAGE_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "SageAttention"
+_prepend_path(_SAGE_ROOT)
+_prepend_path(_SAGE_ROOT / "sageattention3_blackwell")
+
+
 SUPPORTED_ARCHS = {80, 89, 120, 121}
 if FLAGS_KAIROS_CUDA_SM in SUPPORTED_ARCHS:
     try:
-        from sageattention import sag_attention_with_window,sageattn_qk_int8_pv_fp16_cuda_with_window
+        from sageattention import (
+            sageattn,
+            sag_attention_with_window,
+            sageattn_qk_int8_pv_fp16_cuda_with_window,
+        )
         SAGE_ATTN_AVAILABLE = True
-    except ModuleNotFoundError:
+    except (ImportError, ModuleNotFoundError):
         SAGE_ATTN_AVAILABLE = False
+    try:
+        from sageattn3.api import sageattn3_blackwell, sageattn3_with_window
+        SAGE3_ATTN_AVAILABLE = True
+    except (ImportError, ModuleNotFoundError):
+        try:
+            from sageattn3 import sageattn3_blackwell
+            SAGE3_ATTN_AVAILABLE = True
+            sageattn3_with_window = None
+        except (ImportError, ModuleNotFoundError):
+            SAGE3_ATTN_AVAILABLE = False
 try:
     from fla.layers import GatedDeltaNet
 except ModuleNotFoundError:
@@ -230,8 +266,40 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         x = sageattn(q, k, v)
         x = rearrange(x, "b n s d -> b s n d")
     else:
-        raise RuntimeError("do not use pytorch attention")
+        if return_attn_probs:
+            raise RuntimeError("No attention backend with attn_probs support is available")
+        q = rearrange(q, "b s n d -> b n s d")
+        k = rearrange(k, "b s n d -> b n s d")
+        v = rearrange(v, "b s n d -> b n s d")
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        x = rearrange(x, "b n s d -> b s n d")
     return x
+
+
+def _resolve_attn_backend(requested_backend: str) -> str:
+    backend = os.environ.get("KAIROS_ATTN_BACKEND", requested_backend or "flashattention")
+    backend = backend.lower()
+    aliases = {
+        "flash": "flashattention",
+        "sdpa": "flashattention",
+        "sage": "sageattention",
+        "sage2": "sageattention",
+        "sageattention2": "sageattention",
+        "sage3": "sageattention3",
+    }
+    backend = aliases.get(backend, backend)
+
+    if backend == "auto":
+        if SAGE3_ATTN_AVAILABLE:
+            return "sageattention3"
+        if SAGE_ATTN_AVAILABLE:
+            return "sageattention"
+        return "flashattention"
+    if backend == "sageattention3" and not SAGE3_ATTN_AVAILABLE:
+        return "flashattention"
+    if backend == "sageattention" and not SAGE_ATTN_AVAILABLE:
+        return "flashattention"
+    return backend
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
@@ -332,6 +400,31 @@ class SagAttentionModule(nn.Module):
         x = x.transpose(1, 2).contiguous().view(b, s, n * d)
         return x
 
+
+class SageAttention3Module(nn.Module):
+    def __init__(self, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+
+    def forward(self, q, k, v, attn_mask=None, window_size=(-1, -1)):
+        if attn_mask is not None:
+            raise NotImplementedError("SageAttention3 path does not support arbitrary attn_mask")
+
+        b, s, _ = q.shape
+        n = self.num_heads
+        d = q.shape[-1] // n
+
+        q = q.view(b, s, n, d).transpose(1, 2).contiguous()
+        k = k.view(b, s, n, d).transpose(1, 2).contiguous()
+        v = v.view(b, s, n, d).transpose(1, 2).contiguous()
+
+        if sageattn3_with_window is not None and window_size != (-1, -1):
+            x = sageattn3_with_window(q, k, v, window_size=window_size)
+        else:
+            x = sageattn3_blackwell(q, k, v)
+        x = x.transpose(1, 2).contiguous().view(b, s, n * d)
+        return x
+
 class SelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, eps: float = 1e-6, dilated_length=1, window_size=3, attend_k0=False, backend = "flashattention"):
         super().__init__()
@@ -350,7 +443,11 @@ class SelfAttention(nn.Module):
         self.norm_q = FusedRMSNorm(dim, eps=eps)
         self.norm_k = FusedRMSNorm(dim, eps=eps)
 
-        if SAGE_ATTN_AVAILABLE:
+        self.backend = _resolve_attn_backend(backend)
+
+        if self.backend == "sageattention3" and SAGE3_ATTN_AVAILABLE:
+            self.attn = SageAttention3Module(self.num_heads)
+        elif self.backend == "sageattention" and SAGE_ATTN_AVAILABLE:
             self.attn = SagAttentionModule(self.num_heads)
         else:
             self.attn = AttentionModule(self.num_heads)
@@ -494,7 +591,11 @@ class SelfAttentionTP(nn.Module):
         self.norm_q = FusedRMSNorm(dim, eps=eps)
         self.norm_k = FusedRMSNorm(dim, eps=eps)
 
-        if SAGE_ATTN_AVAILABLE:
+        self.backend = _resolve_attn_backend("flashattention")
+
+        if self.backend == "sageattention3" and SAGE3_ATTN_AVAILABLE:
+            self.attn = SageAttention3Module(num_heads_local)
+        elif self.backend == "sageattention" and SAGE_ATTN_AVAILABLE:
             self.attn = SagAttentionModule(num_heads_local)
         else:
             self.attn = AttentionModule(num_heads_local)

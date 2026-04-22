@@ -1,0 +1,3291 @@
+/**
+ * kairos_engine.cu — Production CUDA engine for Kairos 4B transformer.
+ *
+ * Adapted from wan_engine_multi.cu (WAN 14B LingBot engine).
+ *
+ * Kairos 4B architecture:
+ *   D=2560, NH=20, HD=128, FFN=10240, NL=32
+ *   Hybrid attention: 24 quadratic + 8 GatedDeltaNet (every 4th layer)
+ *   SiLU activation (not GELU)
+ *   Affine cross_attn_norm on ALL layers
+ *   CA applied to ALL tokens (no guidance split)
+ *   CA residual is ungated (x += ca_out)
+ *   Modulation order: [scale_sa, shift_sa, gate_sa, scale_ffn, shift_ffn, gate_ffn]
+ *
+ * Stripped from WAN: camera injection, Ulysses, TPP, SA KV cache.
+ * Kept: FP8 SDPA, fused kernels, CUDA graphs, TP (dual-5090).
+ *
+ * forward() runs a RANGE of layers [start_layer, end_layer), skipping
+ * GatedDeltaNet layers (handled in Python).
+ */
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <cublasLt.h>
+#include <cuda_fp8.h>
+#include <cuda_bf16.h>
+#include <cudnn_frontend.h>
+#include <nccl.h>
+#include <vector>
+#include <unordered_map>
+#include <memory>
+#include <cstdio>
+#include <cstring>
+#include <algorithm>
+
+namespace fe = cudnn_frontend;
+namespace py = pybind11;
+
+// Embedded SageAttention3 entrypoints, compiled into this extension.
+std::vector<at::Tensor>
+mha_fwd(at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+        const at::Tensor &sfq, const at::Tensor &sfk, const at::Tensor &sfv,
+        const at::Tensor &delta_s, int unpadded_k,
+        c10::optional<at::Tensor> &out_,
+        const float softmax_scale, bool is_causal,
+        bool per_block_mean, bool is_bf16,
+        int window_size_left, int window_size_right);
+
+void scaled_fp4_quant(torch::Tensor const& input,
+                      torch::Tensor const& output,
+                      torch::Tensor const& output_sf,
+                      int tensor_layout);
+void scaled_fp4_quant_permute(torch::Tensor const& input,
+                              torch::Tensor const& output,
+                              torch::Tensor const& output_sf,
+                              int tensor_layout);
+void scaled_fp4_quant_trans(torch::Tensor const& input,
+                            torch::Tensor const& output,
+                            torch::Tensor const& output_sf,
+                            int tensor_layout);
+
+#define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { TORCH_CHECK(false, "CUDA ", __LINE__, ": ", cudaGetErrorString(e)); } } while(0)
+#define CKBL(x) do { cublasStatus_t s = (x); if (s != CUBLAS_STATUS_SUCCESS) { TORCH_CHECK(false, "cublasLt ", __LINE__, ": status=", (int)s); } } while(0)
+#define CKNCCL(x) do { ncclResult_t r = (x); if (r != ncclSuccess) { TORCH_CHECK(false, "NCCL ", __LINE__, ": ", ncclGetErrorString(r)); } } while(0)
+
+// ============================================================
+// CUDA kernels (architecture-agnostic)
+// ============================================================
+
+// Proper BF16 -> FP8 E4M3 conversion
+__device__ __forceinline__ unsigned char bf16_to_fp8_byte(__nv_bfloat16 v) {
+    __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(__bfloat162float(v));
+    return *reinterpret_cast<unsigned char*>(&fp8);
+}
+
+__device__ __forceinline__ float warp_reduce(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o);
+    return v;
+}
+
+// On-the-fly AdaLN LN kernel. 256 threads/block.
+// Launch with D*sizeof(__nv_bfloat16) smem for single-HBM-read staging.
+// Pass out=nullptr to skip bf16 writeback.
+__global__ void k_ln_adaln_ssts(
+    const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out,
+    __nv_fp8_e4m3* __restrict__ out_fp8,
+    const float* __restrict__ ssts_scale, const float* __restrict__ ssts_shift,
+    const float* __restrict__ temb_scale, const float* __restrict__ temb_shift,
+    int D, int temb_row_stride) {
+    extern __shared__ __nv_bfloat16 srow_ln_bf[];
+    __shared__ float sm[16];
+    int r = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
+    const __nv_bfloat16* xi = x + (size_t)r * D;
+    const float* tsc = temb_scale + (size_t)r * temb_row_stride;
+    const float* tsh = temb_shift + (size_t)r * temb_row_stride;
+    // Pass 1: HBM->SMEM + compute sum & sumsq
+    float s1 = 0, s2 = 0;
+    for (int i = t; i < D; i += 256) {
+        __nv_bfloat16 bv = xi[i];
+        srow_ln_bf[i] = bv;
+        float v = __bfloat162float(bv);
+        s1 += v; s2 += v * v;
+    }
+    s1 = warp_reduce(s1); s2 = warp_reduce(s2);
+    if (l == 0) { sm[w] = s1; sm[w + 8] = s2; }
+    __syncthreads();
+    if (t == 0) { float a = 0, b = 0; for (int i = 0; i < 8; i++) { a += sm[i]; b += sm[i + 8]; } sm[0] = a; sm[1] = b; }
+    __syncthreads();
+    float mean = sm[0] / D, rstd = rsqrtf(sm[1] / D - mean * mean + 1e-6f);
+    unsigned char* fi = (unsigned char*)(out_fp8 + (size_t)r * D);
+    // Pass 2: apply LN+AdaLN from SMEM
+    if (out) {
+        __nv_bfloat16* oi = out + (size_t)r * D;
+        for (int i = t; i < D; i += 256) {
+            float sc = ssts_scale[i] + tsc[i];
+            float sh = ssts_shift[i] + tsh[i];
+            float v = (__bfloat162float(srow_ln_bf[i]) - mean) * rstd;
+            __nv_bfloat16 bf = __float2bfloat16(v * (1.f + sc) + sh);
+            oi[i] = bf;
+            fi[i] = bf16_to_fp8_byte(bf);
+        }
+    } else {
+        for (int i = t; i < D; i += 256) {
+            float sc = ssts_scale[i] + tsc[i];
+            float sh = ssts_shift[i] + tsh[i];
+            float v = (__bfloat162float(srow_ln_bf[i]) - mean) * rstd;
+            __nv_bfloat16 bf = __float2bfloat16(v * (1.f + sc) + sh);
+            fi[i] = bf16_to_fp8_byte(bf);
+        }
+    }
+}
+
+// Gated residual: x += y * (ssts_gate + temb_gate)
+__global__ void k_gate_res_ssts(
+    __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ y,
+    const float* __restrict__ ssts_gate, const float* __restrict__ temb_gate,
+    int N, int D, int temb_row_stride) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    int total8 = (N * D) >> 3;
+    for (int i8 = tid; i8 < total8; i8 += stride) {
+        int base = i8 << 3;
+        int r = base / D, c = base - r * D;
+        uint4 xv = *reinterpret_cast<const uint4*>(x + base);
+        uint4 yv = *reinterpret_cast<const uint4*>(y + base);
+        const float* tg = temb_gate + (size_t)r * temb_row_stride + c;
+        const float* sg = ssts_gate + c;
+        __nv_bfloat16* xp = (__nv_bfloat16*)&xv;
+        __nv_bfloat16* yp = (__nv_bfloat16*)&yv;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            float g = sg[k] + tg[k];
+            float v = __bfloat162float(xp[k]) + __bfloat162float(yp[k]) * g;
+            xp[k] = __float2bfloat16(v);
+        }
+        *reinterpret_cast<uint4*>(x + base) = xv;
+    }
+}
+
+// Gated residual + FP8 output: x += y * (ssts_gate + temb_gate); also write fp8
+__global__ void k_gate_res_ssts_fp8(
+    __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ y,
+    const float* __restrict__ ssts_gate, const float* __restrict__ temb_gate,
+    __nv_fp8_e4m3* __restrict__ out_fp8,
+    int N, int D, int temb_row_stride) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    int total8 = (N * D) >> 3;
+    for (int i8 = tid; i8 < total8; i8 += stride) {
+        int base = i8 << 3;
+        int r = base / D, c = base - r * D;
+        uint4 xv = *reinterpret_cast<const uint4*>(x + base);
+        uint4 yv = *reinterpret_cast<const uint4*>(y + base);
+        const float* tg = temb_gate + (size_t)r * temb_row_stride + c;
+        const float* sg = ssts_gate + c;
+        __nv_bfloat16* xp = (__nv_bfloat16*)&xv;
+        __nv_bfloat16* yp = (__nv_bfloat16*)&yv;
+        unsigned char fp8[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            float g = sg[k] + tg[k];
+            float v = __bfloat162float(xp[k]) + __bfloat162float(yp[k]) * g;
+            __nv_bfloat16 bf = __float2bfloat16(v);
+            xp[k] = bf;
+            fp8[k] = bf16_to_fp8_byte(bf);
+        }
+        *reinterpret_cast<uint4*>(x + base) = xv;
+        *reinterpret_cast<uint2*>((unsigned char*)out_fp8 + base) = *reinterpret_cast<uint2*>(fp8);
+    }
+}
+
+// Fused gated residual + LayerNorm + AdaLN (Optimization 3)
+// Launch: <<<seq, 256, (D + 16) * sizeof(float)>>>
+__global__ void k_gate_res_ln_adaln_ssts(
+    __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ y,
+    const float* __restrict__ ssts_gate,
+    const float* __restrict__ temb_gate,
+    const float* __restrict__ ssts_scale,
+    const float* __restrict__ ssts_shift,
+    const float* __restrict__ temb_scale,
+    const float* __restrict__ temb_shift,
+    __nv_bfloat16* __restrict__ ln_out,
+    __nv_fp8_e4m3* __restrict__ ln_out_fp8,
+    int D, int temb_row_stride) {
+    extern __shared__ float smem[];
+    float* row = smem;
+    float* sm = smem + D;
+    int r = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
+    __nv_bfloat16* xi = x + (size_t)r * D;
+    const __nv_bfloat16* yi = y + (size_t)r * D;
+    int temb_off = r * temb_row_stride;
+    // Pass 1: gated residual + cache in SMEM + compute sum/sumsq for LN
+    float s1 = 0, s2 = 0;
+    for (int i = t; i < D; i += 256) {
+        float g = ssts_gate[i] + temb_gate[temb_off + i];
+        float v = __bfloat162float(xi[i]) + __bfloat162float(yi[i]) * g;
+        row[i] = v;
+        xi[i] = __float2bfloat16(v);
+        s1 += v; s2 += v * v;
+    }
+    s1 = warp_reduce(s1); s2 = warp_reduce(s2);
+    if (l == 0) { sm[w] = s1; sm[w + 8] = s2; }
+    __syncthreads();
+    if (t == 0) { float a = 0, b = 0; for (int i = 0; i < 8; i++) { a += sm[i]; b += sm[i + 8]; } sm[0] = a; sm[1] = b; }
+    __syncthreads();
+    float mean = sm[0] / D, rstd = rsqrtf(sm[1] / D - mean * mean + 1e-6f);
+    // Pass 2: LN + AdaLN + write bf16/fp8 outputs
+    __nv_bfloat16* oi = ln_out ? (ln_out + (size_t)r * D) : nullptr;
+    __nv_fp8_e4m3* fi = ln_out_fp8 + (size_t)r * D;
+    for (int i = t; i < D; i += 256) {
+        float v = (row[i] - mean) * rstd;
+        float sc = ssts_scale[i] + temb_scale[temb_off + i];
+        float sh = ssts_shift[i] + temb_shift[temb_off + i];
+        float out = v * (1.f + sc) + sh;
+        __nv_bfloat16 bf = __float2bfloat16(out);
+        if (oi) oi[i] = bf;
+        fi[i] = __nv_fp8_e4m3(__bfloat162float(bf));
+    }
+}
+
+// Affine LN (has weight + bias) -> BF16 + FP8 output. Used for cross_attn_norm.
+// Pass out=nullptr to skip bf16 writeback.
+__global__ void k_ln_affine(
+    const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out,
+    __nv_fp8_e4m3* __restrict__ out_fp8,
+    const float* __restrict__ w, const float* __restrict__ b, int D) {
+    __shared__ float sm[16];
+    int r = blockIdx.x, t = threadIdx.x, ww = t >> 5, l = t & 31;
+    const __nv_bfloat16* xi = x + (size_t)r * D;
+    float s1 = 0, s2 = 0;
+    for (int i = t; i < D; i += 256) { float v = __bfloat162float(xi[i]); s1 += v; s2 += v * v; }
+    s1 = warp_reduce(s1); s2 = warp_reduce(s2);
+    if (l == 0) { sm[ww] = s1; sm[ww + 8] = s2; }
+    __syncthreads();
+    if (t == 0) { float a = 0, c = 0; for (int i = 0; i < 8; i++) { a += sm[i]; c += sm[i + 8]; } sm[0] = a; sm[1] = c; }
+    __syncthreads();
+    float mean = sm[0] / D, rstd = rsqrtf(sm[1] / D - mean * mean + 1e-6f);
+    __nv_bfloat16* oi = out ? (out + (size_t)r * D) : nullptr;
+    unsigned char* fi = (unsigned char*)(out_fp8 + (size_t)r * D);
+    for (int i = t; i < D; i += 256) {
+        __nv_bfloat16 bf = __float2bfloat16((__bfloat162float(xi[i]) - mean) * rstd * w[i] + b[i]);
+        if (oi) oi[i] = bf;
+        fi[i] = bf16_to_fp8_byte(bf);
+    }
+}
+
+// Whole-D RMSNorm. Launch as <<<seq, 256>>>.
+__global__ void k_rmsnorm(
+    __nv_bfloat16* __restrict__ io, const float* __restrict__ w, int D) {
+    __shared__ float sm[8];
+    int r = blockIdx.x, t = threadIdx.x, ww = t >> 5, l = t & 31;
+    __nv_bfloat16* xi = io + (size_t)r * D;
+    float s = 0;
+    for (int i = t; i < D; i += 256) { float v = __bfloat162float(xi[i]); s += v * v; }
+    s = warp_reduce(s);
+    if (l == 0) sm[ww] = s;
+    __syncthreads();
+    if (t == 0) { float a = 0; for (int i = 0; i < 8; i++) a += sm[i]; sm[0] = a; }
+    __syncthreads();
+    float rstd = rsqrtf(sm[0] / D + 1e-6f);
+    for (int i = t; i < D; i += 256)
+        xi[i] = __float2bfloat16(__bfloat162float(xi[i]) * rstd * w[i]);
+}
+
+// Fused RMSNorm + RoPE. Launch as <<<seq, 256, D*sizeof(bf16)>>>.
+__global__ void k_rmsnorm_rope(
+    __nv_bfloat16* __restrict__ x, const float* __restrict__ w,
+    const float* __restrict__ freqs_cis, int nh, int hd) {
+    extern __shared__ __nv_bfloat16 srow_rr[];
+    int D = nh * hd;
+    __shared__ float sm[8];
+    int r = blockIdx.x, t = threadIdx.x, ww = t >> 5, l = t & 31;
+    __nv_bfloat16* xi = x + (size_t)r * D;
+    float s = 0;
+    for (int i = t; i < D; i += 256) {
+        __nv_bfloat16 bv = xi[i];
+        srow_rr[i] = bv;
+        float v = __bfloat162float(bv);
+        s += v * v;
+    }
+    s = warp_reduce(s);
+    if (l == 0) sm[ww] = s;
+    __syncthreads();
+    if (t == 0) { float a = 0; for (int i = 0; i < 8; i++) a += sm[i]; sm[0] = a; }
+    __syncthreads();
+    float rstd = rsqrtf(sm[0] / D + 1e-6f);
+    for (int i = t; i < D; i += 256) {
+        srow_rr[i] = __float2bfloat16(__bfloat162float(srow_rr[i]) * rstd * w[i]);
+    }
+    __syncthreads();
+    const float* fc = freqs_cis + (size_t)r * 2 * hd;
+    int half_hd = hd >> 1;
+    int pairs = D >> 1;
+    for (int i = t; i < pairs; i += 256) {
+        int h = i / half_hd;
+        int kk = i % half_hd;
+        int base = h * hd + (kk << 1);
+        float c = fc[kk << 1];
+        float sinv = fc[hd + (kk << 1) + 1];
+        float a = __bfloat162float(srow_rr[base]);
+        float b = __bfloat162float(srow_rr[base + 1]);
+        xi[base]     = __float2bfloat16(a * c - b * sinv);
+        xi[base + 1] = __float2bfloat16(a * sinv + b * c);
+    }
+}
+
+// Fused RMSNorm + RoPE + FP8 output. Writes BOTH bf16 and fp8.
+// Launch: <<<seq, 256, D * sizeof(bf16)>>>
+__global__ void k_rmsnorm_rope_fp8(
+    __nv_bfloat16* __restrict__ x,
+    __nv_fp8_e4m3* __restrict__ x_fp8,
+    const float* __restrict__ w,
+    const float* __restrict__ freqs_cis,
+    int nh, int hd) {
+    extern __shared__ __nv_bfloat16 srow[];
+    int D = nh * hd;
+    __shared__ float sm[8];
+    int r = blockIdx.x, t = threadIdx.x, ww = t >> 5, l = t & 31;
+    __nv_bfloat16* xi = x + (size_t)r * D;
+    __nv_fp8_e4m3* xi_fp8 = x_fp8 + (size_t)r * D;
+    float s = 0;
+    for (int i = t; i < D; i += 256) {
+        __nv_bfloat16 bv = xi[i];
+        srow[i] = bv;
+        float v = __bfloat162float(bv);
+        s += v * v;
+    }
+    s = warp_reduce(s);
+    if (l == 0) sm[ww] = s;
+    __syncthreads();
+    if (t == 0) { float a = 0; for (int i = 0; i < 8; i++) a += sm[i]; sm[0] = a; }
+    __syncthreads();
+    float rstd = rsqrtf(sm[0] / D + 1e-6f);
+    for (int i = t; i < D; i += 256) {
+        srow[i] = __float2bfloat16(__bfloat162float(srow[i]) * rstd * w[i]);
+    }
+    __syncthreads();
+    const float* fc = freqs_cis + (size_t)r * 2 * hd;
+    int half_hd = hd >> 1;
+    int pairs = D >> 1;
+    for (int i = t; i < pairs; i += 256) {
+        int h = i / half_hd;
+        int kk = i % half_hd;
+        int base = h * hd + (kk << 1);
+        float c = fc[kk << 1];
+        float sinv = fc[hd + (kk << 1) + 1];
+        float a = __bfloat162float(srow[base]);
+        float b = __bfloat162float(srow[base + 1]);
+        float out0 = a * c - b * sinv;
+        float out1 = a * sinv + b * c;
+        xi[base]     = __float2bfloat16(out0);
+        xi[base + 1] = __float2bfloat16(out1);
+        xi_fp8[base]     = __nv_fp8_e4m3(out0);
+        xi_fp8[base + 1] = __nv_fp8_e4m3(out1);
+    }
+}
+
+// Vectorized BF16 -> FP8 conversion
+__global__ void k_bf16_to_fp8(__nv_fp8_e4m3* out, const __nv_bfloat16* in, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    int n8 = n / 8;
+    const int4* in_v = reinterpret_cast<const int4*>(in);
+    uint2* out_v = reinterpret_cast<uint2*>(out);
+    for (int i = tid; i < n8; i += stride) {
+        int4 iv = in_v[i];
+        const __nv_bfloat16* bb = reinterpret_cast<const __nv_bfloat16*>(&iv);
+        unsigned char c[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            __nv_fp8_e4m3 f(__bfloat162float(bb[k]));
+            c[k] = *reinterpret_cast<unsigned char*>(&f);
+        }
+        uint2 ou;
+        ou.x = (uint32_t)c[0] | ((uint32_t)c[1] << 8) | ((uint32_t)c[2] << 16) | ((uint32_t)c[3] << 24);
+        ou.y = (uint32_t)c[4] | ((uint32_t)c[5] << 8) | ((uint32_t)c[6] << 16) | ((uint32_t)c[7] << 24);
+        out_v[i] = ou;
+    }
+    int start = n8 * 8;
+    for (int i = start + tid; i < n; i += stride) {
+        out[i] = __nv_fp8_e4m3(__bfloat162float(in[i]));
+    }
+}
+
+// Fused SiLU activation + BF16->FP8 conversion (for Kairos FFN activation)
+// Reads bf16 input, writes fp8 output only (bf16 input NOT written back).
+__global__ void k_silu_to_fp8(__nv_bfloat16* __restrict__ io,
+                               __nv_fp8_e4m3* __restrict__ out, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    int n8 = n >> 3;
+    for (int i8 = tid; i8 < n8; i8 += stride) {
+        int base = i8 << 3;
+        uint4 xv = *reinterpret_cast<const uint4*>(io + base);
+        const __nv_bfloat16* p = (const __nv_bfloat16*)&xv;
+        unsigned char fp8[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            float v = __bfloat162float(p[k]);
+            float s = v / (1.f + expf(-v));  // silu = x * sigmoid(x)
+            fp8[k] = bf16_to_fp8_byte(__float2bfloat16(s));
+        }
+        *reinterpret_cast<uint2*>((unsigned char*)out + base) = *reinterpret_cast<uint2*>(fp8);
+    }
+    // Tail
+    for (int i = (n8 << 3) + tid; i < n; i += stride) {
+        float v = __bfloat162float(io[i]);
+        float s = v / (1.f + expf(-v));
+        ((unsigned char*)out)[i] = bf16_to_fp8_byte(__float2bfloat16(s));
+    }
+}
+
+// In-place SiLU on BF16 buffer (for force_bf16_gemms debugging mode)
+__global__ void k_silu_bf16(__nv_bfloat16* io, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = __bfloat162float(io[i]);
+        v = v / (1.f + expf(-v));
+        io[i] = __float2bfloat16(v);
+    }
+}
+
+// Vectorized elementwise add in-place: x[i] += y[i]
+__global__ void k_add_vec(__nv_bfloat16* __restrict__ x,
+                          const __nv_bfloat16* __restrict__ y, int total) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    int total8 = total >> 3;
+    for (int i8 = tid; i8 < total8; i8 += stride) {
+        int base = i8 << 3;
+        uint4 xv = *reinterpret_cast<const uint4*>(x + base);
+        uint4 yv = *reinterpret_cast<const uint4*>(y + base);
+        __nv_bfloat16* xp = (__nv_bfloat16*)&xv;
+        __nv_bfloat16* yp = (__nv_bfloat16*)&yv;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            xp[k] = __float2bfloat16(__bfloat162float(xp[k]) + __bfloat162float(yp[k]));
+        }
+        *reinterpret_cast<uint4*>(x + base) = xv;
+    }
+    for (int i = (total8 << 3) + tid; i < total; i += stride) {
+        x[i] = __float2bfloat16(__bfloat162float(x[i]) + __bfloat162float(y[i]));
+    }
+}
+
+// Vectorized add bias in-place: x[r, :] += bias[:]
+__global__ void k_add_bias_vec(__nv_bfloat16* __restrict__ x,
+                                const __nv_bfloat16* __restrict__ bias,
+                                int N, int D) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    int total8 = (N * D) >> 3;
+    for (int i8 = tid; i8 < total8; i8 += stride) {
+        int base = i8 << 3;
+        int c = base - (base / D) * D;
+        uint4 xv = *reinterpret_cast<const uint4*>(x + base);
+        uint4 bv = *reinterpret_cast<const uint4*>(bias + c);
+        __nv_bfloat16* xp = (__nv_bfloat16*)&xv;
+        __nv_bfloat16* bp = (__nv_bfloat16*)&bv;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            xp[k] = __float2bfloat16(__bfloat162float(xp[k]) + __bfloat162float(bp[k]));
+        }
+        *reinterpret_cast<uint4*>(x + base) = xv;
+    }
+    for (int i = (total8 << 3) + tid; i < N * D; i += stride) {
+        int c = i - (i / D) * D;
+        x[i] = __float2bfloat16(__bfloat162float(x[i]) + __bfloat162float(bias[c]));
+    }
+}
+
+// Fused (bias + residual): x[r, c] += y[r, c] + bias[c]
+__global__ void k_add_bias_res(__nv_bfloat16* __restrict__ x,
+                                const __nv_bfloat16* __restrict__ y,
+                                const __nv_bfloat16* __restrict__ bias,
+                                int N, int D) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    int total8 = (N * D) >> 3;
+    for (int i8 = tid; i8 < total8; i8 += stride) {
+        int base = i8 << 3;
+        int c = base - (base / D) * D;
+        uint4 xv = *reinterpret_cast<const uint4*>(x + base);
+        uint4 yv = *reinterpret_cast<const uint4*>(y + base);
+        uint4 bv = *reinterpret_cast<const uint4*>(bias + c);
+        __nv_bfloat16* xp = (__nv_bfloat16*)&xv;
+        __nv_bfloat16* yp = (__nv_bfloat16*)&yv;
+        __nv_bfloat16* bp = (__nv_bfloat16*)&bv;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            xp[k] = __float2bfloat16(__bfloat162float(xp[k])
+                                    + __bfloat162float(yp[k])
+                                    + __bfloat162float(bp[k]));
+        }
+        *reinterpret_cast<uint4*>(x + base) = xv;
+    }
+}
+
+// TP RMSNorm phase 1: compute partial sum(x^2) per row -> [seq] floats
+__global__ void k_partial_sumsq(const __nv_bfloat16* __restrict__ x,
+                                 float* __restrict__ sum_sq_out, int Dpr) {
+    __shared__ float sm[8];
+    int r = blockIdx.x, t = threadIdx.x, ww = t >> 5, l = t & 31;
+    const __nv_bfloat16* xi = x + (size_t)r * Dpr;
+    float s = 0;
+    for (int i = t; i < Dpr; i += 256) { float v = __bfloat162float(xi[i]); s += v * v; }
+    s = warp_reduce(s);
+    if (l == 0) sm[ww] = s;
+    __syncthreads();
+    if (t == 0) { float a = 0; for (int i = 0; i < 8; i++) a += sm[i]; sum_sq_out[r] = a; }
+}
+
+// TP RMSNorm phase 2: apply rstd*w then RoPE. freqs_cis can be nullptr to skip RoPE.
+__global__ void k_apply_rmsnorm_rope(__nv_bfloat16* __restrict__ x,
+                                      const float* __restrict__ w,
+                                      const float* __restrict__ freqs_cis,
+                                      const float* __restrict__ sum_sq_global,
+                                      int full_D, int nh_pr, int hd) {
+    extern __shared__ __nv_bfloat16 srow_tp[];
+    int Dpr = nh_pr * hd;
+    int r = blockIdx.x, t = threadIdx.x;
+    __nv_bfloat16* xi = x + (size_t)r * Dpr;
+    float rstd = rsqrtf(sum_sq_global[r] / full_D + 1e-6f);
+    for (int i = t; i < Dpr; i += 256) {
+        srow_tp[i] = __float2bfloat16(__bfloat162float(xi[i]) * rstd * w[i]);
+    }
+    __syncthreads();
+    if (freqs_cis == nullptr) {
+        for (int i = t; i < Dpr; i += 256) xi[i] = srow_tp[i];
+        return;
+    }
+    const float* fc = freqs_cis + (size_t)r * 2 * hd;
+    int half_hd = hd >> 1;
+    int pairs = Dpr >> 1;
+    for (int i = t; i < pairs; i += 256) {
+        int h = i / half_hd;
+        int kk = i % half_hd;
+        int base = h * hd + (kk << 1);
+        float c = fc[kk << 1];
+        float sinv = fc[hd + (kk << 1) + 1];
+        float a = __bfloat162float(srow_tp[base]);
+        float b = __bfloat162float(srow_tp[base + 1]);
+        xi[base]     = __float2bfloat16(a * c - b * sinv);
+        xi[base + 1] = __float2bfloat16(a * sinv + b * c);
+    }
+}
+
+// TP fused RMSNorm + RoPE + FP8 output
+__global__ void k_apply_rmsnorm_rope_fp8(__nv_bfloat16* __restrict__ x,
+                                          __nv_fp8_e4m3* __restrict__ x_fp8,
+                                          const float* __restrict__ w,
+                                          const float* __restrict__ freqs_cis,
+                                          const float* __restrict__ sum_sq_global,
+                                          int full_D, int nh_pr, int hd) {
+    extern __shared__ __nv_bfloat16 srow_tp2[];
+    int Dpr = nh_pr * hd;
+    int r = blockIdx.x, t = threadIdx.x;
+    __nv_bfloat16* xi = x + (size_t)r * Dpr;
+    __nv_fp8_e4m3* xi_fp8 = x_fp8 + (size_t)r * Dpr;
+    float rstd = rsqrtf(sum_sq_global[r] / full_D + 1e-6f);
+    for (int i = t; i < Dpr; i += 256) {
+        srow_tp2[i] = __float2bfloat16(__bfloat162float(xi[i]) * rstd * w[i]);
+    }
+    __syncthreads();
+    if (freqs_cis == nullptr) {
+        for (int i = t; i < Dpr; i += 256) {
+            float v = __bfloat162float(srow_tp2[i]);
+            xi[i] = srow_tp2[i];
+            xi_fp8[i] = __nv_fp8_e4m3(v);
+        }
+        return;
+    }
+    const float* fc = freqs_cis + (size_t)r * 2 * hd;
+    int half_hd = hd >> 1;
+    int pairs = Dpr >> 1;
+    for (int i = t; i < pairs; i += 256) {
+        int h = i / half_hd;
+        int kk = i % half_hd;
+        int base = h * hd + (kk << 1);
+        float c = fc[kk << 1];
+        float sinv = fc[hd + (kk << 1) + 1];
+        float a = __bfloat162float(srow_tp2[base]);
+        float b = __bfloat162float(srow_tp2[base + 1]);
+        float out0 = a * c - b * sinv;
+        float out1 = a * sinv + b * c;
+        xi[base]     = __float2bfloat16(out0);
+        xi[base + 1] = __float2bfloat16(out1);
+        xi_fp8[base]     = __nv_fp8_e4m3(out0);
+        xi_fp8[base + 1] = __nv_fp8_e4m3(out1);
+    }
+}
+
+// ============================================================
+// GatedDeltaNet (GDN) CUDA kernels
+// ============================================================
+
+// Causal depthwise conv1d + SiLU. Reads from in[], writes to out[].
+// Weight layout: [C, 1, K] where K=kernel_size (4 for Kairos GDN).
+// Input/output layout: [T, C] bf16.
+__global__ void k_causal_dw_conv_silu(
+    const __nv_bfloat16* __restrict__ in,
+    __nv_bfloat16* __restrict__ out,
+    const float* __restrict__ w,  // [C, K] float32
+    int T, int C, int K) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= C * T) return;
+    int c = idx % C;
+    int t = idx / C;
+    float acc = 0;
+    for (int k = 0; k < K; k++) {
+        int src_t = t - (K - 1) + k;
+        if (src_t >= 0) {
+            acc += __bfloat162float(in[src_t * C + c]) * w[c * K + k];
+        }
+    }
+    float s = acc / (1.f + expf(-acc));  // SiLU (stock ShortConvolution uses activation='silu')
+    out[t * C + c] = __float2bfloat16(s);
+}
+
+__global__ void k_gdn_compute_gates(
+    const __nv_bfloat16* __restrict__ a_proj,  // [T, NH]
+    const __nv_bfloat16* __restrict__ b_proj,  // [T, NH]
+    const float* __restrict__ A_log,           // [NH]
+    const float* __restrict__ dt_bias,         // [NH]
+    float* __restrict__ g_out,                 // [T, NH]
+    float* __restrict__ beta_out,              // [T, NH]
+    int T, int NH) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= T * NH) return;
+    int h = idx % NH;
+    float a_val = __bfloat162float(a_proj[idx]) + dt_bias[h];
+    float b_val = __bfloat162float(b_proj[idx]);
+    // beta = sigmoid(b)
+    beta_out[idx] = 1.f / (1.f + expf(-b_val));
+    // g = -exp(A_log) * softplus(a + dt_bias)
+    float sp = (a_val > 20.f) ? a_val : logf(1.f + expf(a_val));  // softplus
+    g_out[idx] = -expf(A_log[h]) * sp;
+}
+
+// Pre-normalize Q and K with L2 norm + scale, in-place.
+// q[t,h,k] = q[t,h,k] / ||q[t,h,:]|| * scale
+// k[t,h,k] = k[t,h,k] / ||k[t,h,:]||
+// Grid: (T, NH), Block: 256 threads (reduce over K=256)
+__global__ void k_gdn_l2norm_scale(
+    __nv_bfloat16* __restrict__ q,   // [T, NH, K] in-place
+    __nv_bfloat16* __restrict__ k,   // [T, NH, K] in-place
+    int K, float scale) {
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    int tid = threadIdx.x;
+    size_t base = ((size_t)t * gridDim.y + h) * K;
+
+    // Compute L2 norms (parallel reduce over K)
+    float q_sq = 0, k_sq = 0;
+    for (int i = tid; i < K; i += blockDim.x) {
+        float qv = __bfloat162float(q[base + i]);
+        float kv = __bfloat162float(k[base + i]);
+        q_sq += qv * qv;
+        k_sq += kv * kv;
+    }
+    // Warp reduce
+    for (int off = 16; off > 0; off >>= 1) {
+        q_sq += __shfl_down_sync(0xffffffff, q_sq, off);
+        k_sq += __shfl_down_sync(0xffffffff, k_sq, off);
+    }
+    __shared__ float sm[16];
+    int wid = tid >> 5, lane = tid & 31;
+    if (lane == 0) { sm[wid] = q_sq; sm[8 + wid] = k_sq; }
+    __syncthreads();
+    if (tid == 0) {
+        float sq = 0, sk = 0;
+        for (int i = 0; i < (blockDim.x + 31) / 32; i++) { sq += sm[i]; sk += sm[8 + i]; }
+        sm[0] = sq; sm[1] = sk;
+    }
+    __syncthreads();
+    float q_sc = rsqrtf(sm[0] + 1e-6f) * scale;
+    float k_sc = rsqrtf(sm[1] + 1e-6f);
+
+    // Apply in-place
+    for (int i = tid; i < K; i += blockDim.x) {
+        q[base + i] = __float2bfloat16(__bfloat162float(q[base + i]) * q_sc);
+        k[base + i] = __float2bfloat16(__bfloat162float(k[base + i]) * k_sc);
+    }
+}
+
+// Persistent GDN recurrent kernel — Triton-style tile scheduling.
+//
+// Instead of 1 block per (V_tile, head), launches NUM_SMS * warps_per_sm
+// persistent blocks. Each block loops through multiple (V_tile, head) pairs
+// via an atomic work counter. This keeps warps resident on SMs, giving:
+//  - Better L1 cache reuse (same SM processes consecutive tokens for same head)
+//  - Higher effective occupancy (all SMs fully loaded)
+//  - Temporal locality: q/k/v data for nearby tokens stays in L1
+//
+// Q and K are pre-normalized. No L2 norm in inner loop.
+//
+// Grid: dim3(N_PERSISTENT_BLOCKS), Block: 32
+#define GDN_BV 8
+#define GDN_BK 8
+// Global atomic counter for persistent work distribution
+static __device__ int g_gdn_work_counter;
+
+__global__ void __launch_bounds__(32) k_gdn_recurrent(
+    const __nv_bfloat16* __restrict__ q,   // [T, NH, K]
+    const __nv_bfloat16* __restrict__ k,   // [T, NH, K]
+    const __nv_bfloat16* __restrict__ v,   // [T, NH, V]
+    const float* __restrict__ g,           // [T, NH]
+    const float* __restrict__ beta,        // [T, NH]
+    __nv_bfloat16* __restrict__ o,         // [T, NH, V]
+    float* __restrict__ state,             // [NH, K, V]
+    int T, int NH, int K, int V, float scale,
+    int total_tiles) {                     // NH * (V/BV)
+    int lane = threadIdx.x;  // 0..31
+    int k_off = lane * GDN_BK;
+
+    // Persistent work loop: each block grabs the next (V_tile, head) pair
+    while (true) {
+        // Atomically grab next tile
+        int tile_id;
+        if (lane == 0) tile_id = atomicAdd(&g_gdn_work_counter, 1);
+        tile_id = __shfl_sync(0xffffffff, tile_id, 0);
+        if (tile_id >= total_tiles) break;
+
+        // Decode tile_id → (head, V_tile)
+        int NV = V / GDN_BV;
+        int h = tile_id / NV;
+        int bv = tile_id % NV;
+        int v_off = bv * GDN_BV;
+
+        // Load state for this (head, V_tile)
+        float hr[GDN_BK][GDN_BV];
+        float* st = state + (size_t)h * K * V;
+        #pragma unroll
+        for (int ki = 0; ki < GDN_BK; ki++)
+            #pragma unroll
+            for (int vi = 0; vi < GDN_BV; vi++)
+                hr[ki][vi] = st[(size_t)(k_off + ki) * V + v_off + vi];
+
+        // Process ALL T tokens for this tile
+        for (int t = 0; t < T; t++) {
+            size_t qk_base = ((size_t)t * NH + h) * K;
+            size_t v_base = ((size_t)t * NH + h) * V;
+
+            // Load q, k, v for this token
+            float my_q[GDN_BK], my_k[GDN_BK];
+            #pragma unroll
+            for (int ki = 0; ki < GDN_BK; ki++) {
+                my_q[ki] = __bfloat162float(q[qk_base + k_off + ki]);
+                my_k[ki] = __bfloat162float(k[qk_base + k_off + ki]);
+            }
+            float gt = g[(size_t)t * NH + h];
+            float bt = beta[(size_t)t * NH + h];
+
+            // Decay
+            float decay = expf(gt);
+            #pragma unroll
+            for (int ki = 0; ki < GDN_BK; ki++)
+                #pragma unroll
+                for (int vi = 0; vi < GDN_BV; vi++)
+                    hr[ki][vi] *= decay;
+
+            // h@k reduction
+            float hk[GDN_BV];
+            #pragma unroll
+            for (int vi = 0; vi < GDN_BV; vi++) {
+                float acc = 0;
+                #pragma unroll
+                for (int ki = 0; ki < GDN_BK; ki++)
+                    acc += hr[ki][vi] * my_k[ki];
+                hk[vi] = acc;
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                #pragma unroll
+                for (int vi = 0; vi < GDN_BV; vi++)
+                    hk[vi] += __shfl_down_sync(0xffffffff, hk[vi], off);
+            #pragma unroll
+            for (int vi = 0; vi < GDN_BV; vi++)
+                hk[vi] = __shfl_sync(0xffffffff, hk[vi], 0);
+
+            // Delta rule + state update
+            float v_vals[GDN_BV];
+            #pragma unroll
+            for (int vi = 0; vi < GDN_BV; vi++)
+                v_vals[vi] = __bfloat162float(v[v_base + v_off + vi]);
+            #pragma unroll
+            for (int vi = 0; vi < GDN_BV; vi++) {
+                float vn = bt * (v_vals[vi] - hk[vi]);
+                #pragma unroll
+                for (int ki = 0; ki < GDN_BK; ki++)
+                    hr[ki][vi] += my_k[ki] * vn;
+            }
+
+            // Output
+            float ov[GDN_BV];
+            #pragma unroll
+            for (int vi = 0; vi < GDN_BV; vi++) {
+                float acc = 0;
+                #pragma unroll
+                for (int ki = 0; ki < GDN_BK; ki++)
+                    acc += hr[ki][vi] * my_q[ki];
+                ov[vi] = acc;
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                #pragma unroll
+                for (int vi = 0; vi < GDN_BV; vi++)
+                    ov[vi] += __shfl_down_sync(0xffffffff, ov[vi], off);
+            if (lane == 0) {
+                size_t o_base = ((size_t)t * NH + h) * V;
+                #pragma unroll
+                for (int vi = 0; vi < GDN_BV; vi++)
+                    o[o_base + v_off + vi] = __float2bfloat16(ov[vi]);
+            }
+        }
+
+        // Store final state
+        #pragma unroll
+        for (int ki = 0; ki < GDN_BK; ki++)
+            #pragma unroll
+            for (int vi = 0; vi < GDN_BV; vi++)
+                st[(size_t)(k_off + ki) * V + v_off + vi] = hr[ki][vi];
+    }
+}
+
+// GDN output norm + gate: out[t,v] = rmsnorm(recurrent_out, weight) * silu(gate[t,v])
+// recurrent_out is [T, NH, Vhd], gate is [T, NH*Vhd], weight is [Vhd]
+// Output is [T, NH*Vhd] bf16.
+__global__ void k_gdn_rmsnorm_silu_gate(
+    const __nv_bfloat16* __restrict__ rec_out,  // [T, NH, Vhd]
+    const __nv_bfloat16* __restrict__ gate,      // [T, NH*Vhd]
+    const float* __restrict__ weight,             // [Vhd]
+    __nv_bfloat16* __restrict__ out,             // [T, NH*Vhd]
+    int T, int NH, int Vhd) {
+    // One block per (t, h) pair. 256 threads reduce over Vhd.
+    int th = blockIdx.x;
+    if (th >= T * NH) return;
+    int t = th / NH, h = th % NH;
+    int tid = threadIdx.x;
+    int total_v = NH * Vhd;
+
+    const __nv_bfloat16* ri = rec_out + (size_t)th * Vhd;
+    const __nv_bfloat16* gi = gate + (size_t)t * total_v + (size_t)h * Vhd;
+    __nv_bfloat16* oi = out + (size_t)t * total_v + (size_t)h * Vhd;
+
+    // Compute sum of squares for RMSNorm
+    __shared__ float sm[8];
+    float ss = 0;
+    for (int i = tid; i < Vhd; i += 256) {
+        float v = __bfloat162float(ri[i]);
+        ss += v * v;
+    }
+    // Warp reduce
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xffffffff, ss, off);
+    int wid = tid >> 5, lane = tid & 31;
+    if (lane == 0) sm[wid] = ss;
+    __syncthreads();
+    if (tid == 0) { float a = 0; for (int i = 0; i < 8; i++) a += sm[i]; sm[0] = a; }
+    __syncthreads();
+    float rstd = rsqrtf(sm[0] / Vhd + 1e-6f);
+
+    // Apply: out = (rec * rstd * weight) * silu(gate)
+    for (int i = tid; i < Vhd; i += 256) {
+        float rv = __bfloat162float(ri[i]) * rstd * weight[i];
+        float gv = __bfloat162float(gi[i]);
+        float sg = gv / (1.f + expf(-gv));  // silu(gate)
+        oi[i] = __float2bfloat16(rv * sg);
+    }
+}
+
+// ============================================================
+// Chunk-parallel GatedDeltaNet kernels (included from separate files)
+// ============================================================
+#include "gdn_chunk.cuh"
+#include "gdn_chunk_h.cuh"
+#include "gdn_chunk_o.cuh"
+#include "gdn_chunk_h_simple.cuh"
+
+// ============================================================
+// Batched strided BF16 GEMM for cuBLASLt chunk GDN
+// ============================================================
+// Computes D = alpha * op(A) @ op(B) + beta * C for each batch element.
+// Supports flexible transpose modes via opA/opB parameters.
+struct BatchedBF16Gemm {
+    cublasLtMatmulDesc_t desc = nullptr;
+    cublasLtMatrixLayout_t Ad = nullptr, Bd = nullptr, Cd = nullptr, Dd = nullptr;
+    cublasLtMatmulHeuristicResult_t heur;
+
+    void setup(cublasLtHandle_t h, int M, int N, int K,
+               int batch, long long strideA, long long strideB, long long strideC,
+               void* ws, size_t wss,
+               cublasOperation_t opA = CUBLAS_OP_T,
+               cublasOperation_t opB = CUBLAS_OP_N) {
+        CKBL(cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
+
+        int ldA, rowA, colA;
+        if (opA == CUBLAS_OP_T) { ldA = K; rowA = K; colA = N; }
+        else                    { ldA = N; rowA = N; colA = K; }
+
+        int ldB, rowB, colB;
+        if (opB == CUBLAS_OP_T) { ldB = M; rowB = M; colB = K; }
+        else                    { ldB = K; rowB = K; colB = M; }
+
+        CKBL(cublasLtMatrixLayoutCreate(&Ad, CUDA_R_16BF, rowA, colA, ldA));
+        CKBL(cublasLtMatrixLayoutCreate(&Bd, CUDA_R_16BF, rowB, colB, ldB));
+        CKBL(cublasLtMatrixLayoutCreate(&Cd, CUDA_R_16BF, N, M, N));
+        CKBL(cublasLtMatrixLayoutCreate(&Dd, CUDA_R_16BF, N, M, N));
+
+        CKBL(cublasLtMatrixLayoutSetAttribute(Ad, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch, sizeof(batch)));
+        CKBL(cublasLtMatrixLayoutSetAttribute(Bd, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch, sizeof(batch)));
+        CKBL(cublasLtMatrixLayoutSetAttribute(Cd, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch, sizeof(batch)));
+        CKBL(cublasLtMatrixLayoutSetAttribute(Dd, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch, sizeof(batch)));
+        CKBL(cublasLtMatrixLayoutSetAttribute(Ad, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideA, sizeof(strideA)));
+        CKBL(cublasLtMatrixLayoutSetAttribute(Bd, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideB, sizeof(strideB)));
+        CKBL(cublasLtMatrixLayoutSetAttribute(Cd, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideC, sizeof(strideC)));
+        CKBL(cublasLtMatrixLayoutSetAttribute(Dd, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideC, sizeof(strideC)));
+
+        cublasLtMatmulPreference_t pref;
+        CKBL(cublasLtMatmulPreferenceCreate(&pref));
+        size_t mws = 32 * 1024 * 1024;
+        CKBL(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &mws, sizeof(mws)));
+        int ret = 0;
+        CKBL(cublasLtMatmulAlgoGetHeuristic(h, desc, Ad, Bd, Cd, Dd, pref, 1, &heur, &ret));
+        TORCH_CHECK(ret > 0, "BatchedBF16Gemm: no algo for M=", M, " N=", N, " K=", K, " batch=", batch);
+        CKBL(cublasLtMatmulPreferenceDestroy(pref));
+    }
+
+    void run(cublasLtHandle_t h, void* A, void* B, void* D, void* ws, size_t wss,
+             float alpha, float beta, cudaStream_t st) {
+        CKBL(cublasLtMatmul(h, desc, &alpha, A, Ad, B, Bd, &beta, D, Cd, D, Dd,
+                            &heur.algo, ws, wss, st));
+    }
+
+    void destroy() {
+        if (Dd) cublasLtMatrixLayoutDestroy(Dd);
+        if (Cd) cublasLtMatrixLayoutDestroy(Cd);
+        if (Bd) cublasLtMatrixLayoutDestroy(Bd);
+        if (Ad) cublasLtMatrixLayoutDestroy(Ad);
+        if (desc) cublasLtMatmulDescDestroy(desc);
+        desc = nullptr; Ad = Bd = Cd = Dd = nullptr;
+    }
+};
+
+// ============================================================
+// cuBLASLt chunk GDN: custom kernels for phases 2 and 3
+// ============================================================
+
+// Phase 2a kernel: Apply gating/beta/norm to A_raw (K@K^T) and solve A_inv.
+// Also computes coeff[j] = beta[j] * exp(gcum[j]) * krnorm[j] for w computation,
+// and stores gcum and beta for later use.
+//
+// Grid: dim3(NC, NH), Block: 64 threads (one per token in chunk)
+// SMEM: BT*BT*4 (s_A) + BT*3*4 (gcum, beta, krnorm) = ~17 KB
+__global__ void __launch_bounds__(64)
+k_gdn_chunk_gate_solve(
+    const __nv_bfloat16* __restrict__ k_in,      // [T, NH, K]
+    const float*         __restrict__ g_in,      // [T, NH]
+    const float*         __restrict__ beta_in,   // [T, NH]
+    __nv_bfloat16*       __restrict__ kkt_inout, // [NC*NH, BT, BT] bf16 — gated A_inv output
+    float*               __restrict__ gcum_out,  // [NC, NH, BT]
+    float*               __restrict__ coeff_out, // [NC*NH, BT] — beta*exp(gcum)*krnorm per token
+    float*               __restrict__ beta_out,  // [NC*NH, BT] — beta per token (for u computation)
+    int T, int NH, int K)
+{
+    const int BT = GDN_CHUNK_BT;  // 64
+    const int chunk = blockIdx.x;
+    const int head  = blockIdx.y;
+    const int tid   = threadIdx.x;
+    const int t_base = chunk * BT;
+    const int chunk_len = min(BT, T - t_base);
+    const int batch_idx = chunk * NH + head;
+
+    extern __shared__ char _smem_gs[];
+    char* sp = _smem_gs;
+    float* s_A      = (float*)sp;  sp += BT * BT * sizeof(float);
+    float* s_gcum   = (float*)sp;  sp += BT * sizeof(float);
+    float* s_beta   = (float*)sp;  sp += BT * sizeof(float);
+    float* s_krnorm = (float*)sp;  sp += BT * sizeof(float);
+
+    // Load g, beta
+    float my_g = 0.0f, my_beta = 0.0f;
+    if (tid < chunk_len) {
+        int tg = t_base + tid;
+        my_g    = g_in[(size_t)tg * NH + head];
+        my_beta = beta_in[(size_t)tg * NH + head];
+    }
+    s_gcum[tid] = (tid < chunk_len) ? my_g : 0.0f;
+    s_beta[tid] = (tid < chunk_len) ? my_beta : 0.0f;
+    __syncthreads();
+
+    // Prefix sum of gates
+    if (tid == 0) _chunk_prefix_sum(s_gcum, chunk_len);
+    __syncthreads();
+
+    // K L2 norm
+    float k_sq = 0.0f;
+    if (tid < chunk_len) {
+        int tg = t_base + tid;
+        for (int kk = 0; kk < K; kk++) {
+            float val = __bfloat162float(k_in[((size_t)tg * NH + head) * K + kk]);
+            k_sq += val * val;
+        }
+    }
+    s_krnorm[tid] = (tid < chunk_len) ? rsqrtf(k_sq + 1e-6f) : 0.0f;
+    __syncthreads();
+
+    // Store gcum, coeff, beta to global
+    {
+        size_t gcum_base = ((size_t)chunk * NH + head) * BT;
+        gcum_out[gcum_base + tid] = s_gcum[tid];
+    }
+    {
+        size_t c_base = (size_t)batch_idx * BT;
+        coeff_out[c_base + tid] = (tid < chunk_len) ?
+            s_beta[tid] * expf(s_gcum[tid]) * s_krnorm[tid] : 0.0f;
+        beta_out[c_base + tid] = s_beta[tid];
+    }
+
+    // Load A_raw from kkt_inout (bf16) into s_A (fp32) and apply gating
+    {
+        __nv_bfloat16* A_bf16 = kkt_inout + (size_t)batch_idx * BT * BT;
+        // A_raw[i,j] is the raw K@K^T dot product (from cuBLASLt phase 1)
+        // Apply: A[i,j] = beta[i] * exp(gcum[i]-gcum[j]) * krnorm[i] * krnorm[j] * A_raw[i,j]  for j < i
+        // and A[i,j] = 0 for j >= i
+        if (tid < chunk_len) {
+            float my_gcum = s_gcum[tid];
+            float my_beta_val = s_beta[tid];
+            float my_knorm = s_krnorm[tid];
+            for (int j = 0; j < tid; j++) {
+                float raw = __bfloat162float(A_bf16[tid * BT + j]);
+                s_A[tid * BT + j] = my_beta_val * expf(my_gcum - s_gcum[j])
+                                   * my_knorm * s_krnorm[j] * raw;
+            }
+        }
+        // Zero out diagonal and upper triangular
+        for (int j = tid; j < BT; j++)
+            s_A[tid * BT + j] = 0.0f;
+    }
+    __syncthreads();
+
+    // Forward substitution: (I - A)^{-1}
+    if (tid == 0) {
+        float A_row[GDN_CHUNK_BT];
+        for (int i = 0; i < chunk_len; i++) {
+            for (int j = 0; j < i; j++) A_row[j] = s_A[i * BT + j];
+            s_A[i * BT + i] = 1.0f;
+            for (int j = 0; j < i; j++) {
+                float acc = 0.0f;
+                for (int kk = j; kk < i; kk++)
+                    acc += A_row[kk] * s_A[kk * BT + j];
+                s_A[i * BT + j] = acc;
+            }
+        }
+    }
+    __syncthreads();
+
+    // Write A_inv back to kkt_inout as bf16 for subsequent batched GEMMs
+    {
+        __nv_bfloat16* A_bf16 = kkt_inout + (size_t)batch_idx * BT * BT;
+        for (int j = 0; j < BT; j++)
+            A_bf16[tid * BT + j] = __float2bfloat16(s_A[tid * BT + j]);
+    }
+}
+
+// Phase 2b kernel: Prepare scaled K for w GEMM.
+// Writes: scaled_K[batch, BT, K] bf16 = K_normed[t,h,k] * coeff[t] (per-token scalar)
+// where coeff[t] = beta[t] * exp(gcum[t]) * krnorm[t].
+// Also writes: scaled_V[batch, BT, V] bf16 = V[t,h,v] * beta[t].
+//
+// Grid: dim3(NC, NH), Block: 256 threads
+__global__ void k_gdn_chunk_scale_kv(
+    const __nv_bfloat16* __restrict__ k_in,   // [T, NH, K]
+    const __nv_bfloat16* __restrict__ v_in,   // [T, NH, V]
+    const float*         __restrict__ coeff,  // [NC*NH, BT] — beta*exp(gcum)*krnorm
+    const float*         __restrict__ beta,   // [NC*NH, BT]
+    __nv_bfloat16*       __restrict__ sk_out, // [NC*NH, BT, K] — scaled K_normed
+    __nv_bfloat16*       __restrict__ sv_out, // [NC*NH, BT, V] — scaled V
+    int T, int NH, int K, int V)
+{
+    const int BT = GDN_CHUNK_BT;
+    const int chunk = blockIdx.x;
+    const int head  = blockIdx.y;
+    const int tid   = threadIdx.x;
+    const int t_base = chunk * BT;
+    const int chunk_len = min(BT, T - t_base);
+    const int batch_idx = chunk * NH + head;
+
+    // Process K: each thread handles multiple (token, k) pairs
+    size_t sk_base = (size_t)batch_idx * BT * K;
+    for (int idx = tid; idx < BT * K; idx += blockDim.x) {
+        int i = idx / K;
+        int kk = idx % K;
+        if (i < chunk_len) {
+            int tg = t_base + i;
+            float c = coeff[(size_t)batch_idx * BT + i];
+            float val = __bfloat162float(k_in[((size_t)tg * NH + head) * K + kk]);
+            sk_out[sk_base + idx] = __float2bfloat16(val * c);
+        } else {
+            sk_out[sk_base + idx] = __float2bfloat16(0.0f);
+        }
+    }
+
+    // Process V: each thread handles multiple (token, v) pairs
+    size_t sv_base = (size_t)batch_idx * BT * V;
+    for (int idx = tid; idx < BT * V; idx += blockDim.x) {
+        int i = idx / V;
+        int vv = idx % V;
+        if (i < chunk_len) {
+            int tg = t_base + i;
+            float b = beta[(size_t)batch_idx * BT + i];
+            float val = __bfloat162float(v_in[((size_t)tg * NH + head) * V + vv]);
+            sv_out[sv_base + idx] = __float2bfloat16(val * b);
+        } else {
+            sv_out[sv_base + idx] = __float2bfloat16(0.0f);
+        }
+    }
+}
+
+// Phase 3 helper kernel: State propagation step for one chunk.
+// Computes v_new = u_bf16 - w@h_correction (both bf16), gates it,
+// computes output = scale * Q_normed @ h, updates h.
+//
+// This is the same as k_gdn_chunk_state_output but for a SINGLE chunk,
+// and reads w/u from bf16 buffers (cuBLASLt output) instead of fp32.
+// Also, the w@h and output Q@h products are pre-computed by cuBLASLt,
+// so this kernel only needs to do the gating, state update, and output write.
+//
+// Actually, we keep the warp-register-tiled approach for the sequential state
+// loop since it's already fast (the w@h product involves state that changes
+// per-token within the chunk). cuBLASLt can't help here because of the
+// sequential dependency. So we keep the existing k_gdn_chunk_state_output
+// kernel for phase 3. The big win is phases 1-2 (prepare) being much faster.
+
+// ============================================================
+// gdn_cublas_chunk_forward: cuBLASLt-accelerated chunk GDN
+// ============================================================
+// Replaces k_gdn_recurrent with a 4-phase chunk algorithm:
+//   Phase 1: K@K^T via cuBLASLt batched GEMM (parallel, ~0.16ms)
+//   Phase 2: Gating + A_inv solve + scale K/V (custom kernels, ~1ms)
+//   Phase 3: A_inv @ scaled_K → w, A_inv @ scaled_V → u via cuBLASLt (~1.5ms)
+//   Phase 4: Sequential state propagation (existing warp kernel, ~2.3ms)
+// Total: ~5ms vs 11ms for fused recurrent, vs 8.2ms for pure-custom prepare
+//
+// Scratch buffers (bf16, allocated in engine_init):
+//   b_gdn_kkt_bf16:  [NC*NH, BT, BT] bf16 — K@K^T then A_inv
+//   b_gdn_sk_bf16:   [NC*NH, BT, K]  bf16 — scaled K_normed
+//   b_gdn_sv_bf16:   [NC*NH, BT, V]  bf16 — scaled V
+//   b_gdn_w_bf16:    [NC*NH, BT, K]  bf16 — w output from A_inv @ scaled_K
+//   b_gdn_u_bf16:    [NC*NH, BT, V]  bf16 — u output from A_inv @ scaled_V
+//   b_gdn_coeff:     [NC*NH, BT]     f32  — beta*exp(gcum)*krnorm
+//   b_gdn_beta_f32:  [NC*NH, BT]     f32  — beta per token
+
+// Static scratch buffers (allocated in engine_init, declared near other GDN buffers)
+static __nv_bfloat16 *b_gdn_kkt_bf16 = nullptr;   // [NC*NH, BT, BT]
+static __nv_bfloat16 *b_gdn_sk_bf16  = nullptr;   // [NC*NH, BT, K]
+static __nv_bfloat16 *b_gdn_sv_bf16  = nullptr;   // [NC*NH, BT, V]
+static __nv_bfloat16 *b_gdn_w_bf16   = nullptr;   // [NC*NH, BT, K]
+static __nv_bfloat16 *b_gdn_u_bf16   = nullptr;   // [NC*NH, BT, V]
+static float         *b_gdn_coeff    = nullptr;    // [NC*NH, BT]
+static float         *b_gdn_beta_f32 = nullptr;    // [NC*NH, BT]
+static __nv_bfloat16 *b_gdn_hout    = nullptr;     // [(NC+1)*NH, K, V] state snapshots bf16
+
+// Per-seq cuBLASLt descriptors for chunk GDN batched GEMMs
+struct ChunkGdnGemms {
+    BatchedBF16Gemm kkt;     // K @ K^T: [batch, BT, K] @ [batch, K, BT] → [batch, BT, BT]
+    BatchedBF16Gemm ainv_w;  // A_inv @ scaled_K: [batch, BT, BT] @ [batch, BT, K] → [batch, BT, K]
+    BatchedBF16Gemm ainv_u;  // A_inv @ scaled_V: [batch, BT, BT] @ [batch, BT, V] → [batch, BT, V]
+    bool built = false;
+
+    void build(cublasLtHandle_t h, int seq, int NH, int K, int V, void* ws, size_t wss) {
+        const int BT = GDN_CHUNK_BT;
+        int NC = (seq + BT - 1) / BT;
+        int batch = NC * NH;
+
+        // K@K^T: row-major [BT, K] @ [BT, K]^T → [BT, BT]
+        // In cuBLAS col-major: C[BT,BT] = A[K,BT]^T @ B[K,BT], TRANSA=T TRANSB=N
+        // But we want K @ K^T. In col-major, K[BT,K] stored row-major is K^T[K,BT] col-major.
+        // So K@K^T (row) = K_col^T @ K_col = C[BT,BT] with A=K_col[K,BT], B=K_col[K,BT], TRANSA=T, TRANSB=N.
+        kkt.setup(h, BT, BT, K, batch,
+                  (long long)BT * K, (long long)BT * K, (long long)BT * BT,
+                  ws, wss, CUBLAS_OP_T, CUBLAS_OP_N);
+
+        // A_inv @ scaled_K: row-major [BT, BT] @ [BT, K] → [BT, K]
+        // Col-major: C[K,BT] = A_col[BT,BT]^T @ B_col[K,BT]... no.
+        // Row-major A[BT,BT] @ B[BT,K] → C[BT,K].
+        // In col-major: A_row[BT,BT] = A_col^T[BT,BT], B_row[BT,K] = B_col^T[K,BT].
+        // C_row[BT,K] = A_row @ B_row = A_col^T @ B_col^T = (B_col @ A_col)^T.
+        // cuBLAS: D_col[K,BT] = B_col[K,BT] @ A_col[BT,BT] where TRANSA=N, TRANSB=N.
+        // But that gives us D_col which is C_row transposed... hmm.
+        //
+        // Simpler: use the identity C_row = (B_col @ A_col)^T.
+        // We want C_row stored in row-major → same as C_col^T stored contiguously.
+        // cuBLAS D = alpha * opA(A) @ opB(B). We want D = C_col = C_row^T.
+        // C_row = A_row @ B_row. C_col = C_row^T = B_row^T @ A_row^T = B_col @ A_col.
+        // So: D[K,BT] = B_col[K,BT] @ A_col[BT,BT]. opA=N, opB=N.
+        // This means: A_ptr = B_col (scaled_K in row-major = stored as is),
+        //             B_ptr = A_col (A_inv in row-major = stored as is).
+        // The "A" in cuBLAS is scaled_K[K,BT] (col-major view of row-major [BT,K]),
+        // the "B" in cuBLAS is A_inv[BT,BT] (col-major view of row-major [BT,BT]).
+        // D[K,BT] col-major = C[BT,K] row-major. Leading dim of D is K.
+        //
+        // M=BT, N=K (output is [BT,K] row-major = [K,BT] col-major)
+        // Actually let me re-derive. cuBLAS sees everything col-major.
+        // We store A_inv as row-major [BT,BT]. Col-major interpretation: [BT,BT]^T.
+        // We store scaled_K as row-major [BT,K]. Col-major interpretation: [K,BT]^T... no.
+        // Row-major [R,C] with ld=C is the same bits as col-major [C,R] with ld=C.
+        //
+        // So A_inv row[BT,BT] ld=BT  ↔  col[BT,BT] ld=BT (symmetric shape, but it's transposed!)
+        // scaled_K row[BT,K] ld=K    ↔  col[K,BT] ld=K
+        // w_out row[BT,K] ld=K       ↔  col[K,BT] ld=K
+        //
+        // We want w = A_inv_row @ sk_row = (A_inv_col)^T @ (sk_col)^T
+        // Using cuBLAS: D = opA(A) @ opB(B) where A,B,D are col-major.
+        // Set opA=N on sk_col[K,BT] and opB=T on ainv_col[BT,BT]:
+        //   D[K,BT] = sk_col[K,BT] @ (ainv_col[BT,BT])^T
+        //   = sk_col @ ainv_col^T
+        // In row-major this is D_row[BT,K] = (sk_col @ ainv_col^T)^T_row... complicated.
+        //
+        // Easiest approach: use the row-major trick.
+        // For row-major C = A @ B with dims [M,K_inner] @ [K_inner,N]:
+        //   cuBLAS: D_col[N,M] = B_col[N,K_inner]^? @ A_col[K_inner,M]^?
+        //   With everything stored row-major:
+        //   B_row[K_inner,N] ↔ B_col[N,K_inner], A_row[M,K_inner] ↔ A_col[K_inner,M]
+        //   D = B_col @ A_col = [N,K_inner] @ [K_inner,M] → [N,M] col → [M,N] row ✓
+        //   So: opA=N, opB=N, first_ptr=B_row, second_ptr=A_row,
+        //   cuBLAS M_cublas=N, N_cublas=M, K_cublas=K_inner.
+        //
+        // For A_inv[BT,BT] @ sk[BT,K] → w[BT,K]:
+        //   "A_row" = A_inv[BT,BT], "B_row" = sk[BT,K], M=BT, K_inner=BT, N=K
+        //   cuBLAS: ptr_A=sk, ptr_B=A_inv, M_cb=K, N_cb=BT, K_cb=BT, opA=N, opB=N
+        ainv_w.setup(h, K, BT, BT, batch,
+                     (long long)BT * K, (long long)BT * BT, (long long)BT * K,
+                     ws, wss, CUBLAS_OP_N, CUBLAS_OP_N);
+        // ptr_A = sk, ptr_B = ainv → D = w  (row-major [BT,K])
+
+        // Similarly for A_inv[BT,BT] @ sv[BT,V] → u[BT,V]:
+        //   cuBLAS: ptr_A=sv, ptr_B=A_inv, M_cb=V, N_cb=BT, K_cb=BT, opA=N, opB=N
+        ainv_u.setup(h, V, BT, BT, batch,
+                     (long long)BT * V, (long long)BT * BT, (long long)BT * V,
+                     ws, wss, CUBLAS_OP_N, CUBLAS_OP_N);
+
+        built = true;
+    }
+};
+// g_chunk_gdn_gemms, get_chunk_gdn_gemms, and gdn_cublas_chunk_forward
+// are defined later (after globals) since they reference g_ltH, g_gemm_ws, etc.
+
+// ============================================================
+// FP8 GEMM descriptor (one per shape)
+// ============================================================
+struct FP8Gemm {
+    cublasLtMatmulDesc_t desc = nullptr;
+    cublasLtMatrixLayout_t Ad = nullptr, Bd = nullptr, Cd = nullptr, Dd = nullptr;
+    cublasLtMatmulHeuristicResult_t heur;
+    bool has_bias_epi = false;
+
+    void setup(cublasLtHandle_t h, int M, int N, int K, float* sA, float* sB,
+               void* ws, size_t wss, int epi = 0) {
+        CKBL(cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        cublasOperation_t opT = CUBLAS_OP_T, opN = CUBLAS_OP_N;
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT)));
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)));
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &sA, sizeof(sA)));
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sB, sizeof(sB)));
+        cublasLtMatmulMatrixScale_t sm_scalar = CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &sm_scalar, sizeof(sm_scalar)));
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &sm_scalar, sizeof(sm_scalar)));
+        if (epi > 0) {
+            has_bias_epi = true;
+            cublasLtEpilogue_t e = (epi == 2) ? CUBLASLT_EPILOGUE_GELU_BIAS : CUBLASLT_EPILOGUE_BIAS;
+            CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &e, sizeof(e)));
+            cudaDataType_t bt = CUDA_R_16BF;
+            CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bt, sizeof(bt)));
+        }
+        CKBL(cublasLtMatrixLayoutCreate(&Ad, CUDA_R_8F_E4M3, K, N, K));
+        CKBL(cublasLtMatrixLayoutCreate(&Bd, CUDA_R_8F_E4M3, K, M, K));
+        CKBL(cublasLtMatrixLayoutCreate(&Cd, CUDA_R_16BF, N, M, N));
+        CKBL(cublasLtMatrixLayoutCreate(&Dd, CUDA_R_16BF, N, M, N));
+        cublasLtMatmulPreference_t pref; CKBL(cublasLtMatmulPreferenceCreate(&pref));
+        size_t mws = 32 * 1024 * 1024;
+        CKBL(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &mws, sizeof(mws)));
+        int ret = 0; CKBL(cublasLtMatmulAlgoGetHeuristic(h, desc, Ad, Bd, Cd, Dd, pref, 1, &heur, &ret));
+        TORCH_CHECK(ret > 0, "no algo for [", M, ",", N, ",", K, "] epi=", epi);
+        cublasLtMatmulPreferenceDestroy(pref);
+    }
+
+    void run(cublasLtHandle_t h, void* wt_fp8, void* act_fp8, void* out,
+             void* ws, size_t wss, float alpha, float beta, cudaStream_t st,
+             const void* bias = nullptr, void* c_ptr = nullptr) {
+        if (has_bias_epi && bias) {
+            CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+        }
+        void* c = c_ptr ? c_ptr : out;
+        CKBL(cublasLtMatmul(h, desc, &alpha, wt_fp8, Ad, act_fp8, Bd, &beta,
+                            c, Cd, out, Dd, &heur.algo, ws, wss, st));
+    }
+};
+
+// BF16 x BF16 GEMM (for ENGINE_BF16_ATTN=1 mode)
+struct BF16Gemm {
+    cublasLtMatmulDesc_t desc = nullptr;
+    cublasLtMatrixLayout_t Ad = nullptr, Bd = nullptr, Cd = nullptr, Dd = nullptr;
+    cublasLtMatmulHeuristicResult_t heur;
+    bool has_bias_epi = false;
+
+    void setup(cublasLtHandle_t h, int M, int N, int K,
+               void* ws, size_t wss, int epi = 0) {
+        CKBL(cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        cublasOperation_t opT = CUBLAS_OP_T, opN = CUBLAS_OP_N;
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT)));
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)));
+        if (epi > 0) {
+            has_bias_epi = true;
+            cublasLtEpilogue_t e = (epi == 2) ? CUBLASLT_EPILOGUE_GELU_BIAS : CUBLASLT_EPILOGUE_BIAS;
+            CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &e, sizeof(e)));
+            cudaDataType_t bt = CUDA_R_16BF;
+            CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bt, sizeof(bt)));
+        }
+        CKBL(cublasLtMatrixLayoutCreate(&Ad, CUDA_R_16BF, K, N, K));
+        CKBL(cublasLtMatrixLayoutCreate(&Bd, CUDA_R_16BF, K, M, K));
+        CKBL(cublasLtMatrixLayoutCreate(&Cd, CUDA_R_16BF, N, M, N));
+        CKBL(cublasLtMatrixLayoutCreate(&Dd, CUDA_R_16BF, N, M, N));
+        cublasLtMatmulPreference_t pref; CKBL(cublasLtMatmulPreferenceCreate(&pref));
+        size_t mws = 32 * 1024 * 1024;
+        CKBL(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &mws, sizeof(mws)));
+        int nres = 0;
+        CKBL(cublasLtMatmulAlgoGetHeuristic(h, desc, Ad, Bd, Cd, Dd, pref, 1, &heur, &nres));
+        TORCH_CHECK(nres > 0, "BF16Gemm: no heuristic for M=", M, " N=", N, " K=", K);
+        CKBL(cublasLtMatmulPreferenceDestroy(pref));
+    }
+
+    void run(cublasLtHandle_t h, void* wt_bf16, void* act_bf16, void* out,
+             void* ws, size_t wss, float alpha, float beta, cudaStream_t st,
+             const void* bias = nullptr) {
+        if (has_bias_epi && bias) {
+            CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+        }
+        CKBL(cublasLtMatmul(h, desc, &alpha, wt_bf16, Ad, act_bf16, Bd, &beta,
+                            out, Cd, out, Dd, &heur.algo, ws, wss, st));
+    }
+};
+
+// ============================================================
+// cuDNN SDPA (BF16, BSHD layout via custom strides)
+// ============================================================
+enum UIDS : int64_t { Q_UID = 1, K_UID = 2, V_UID = 3, O_UID = 4 };
+struct CudnnSDPA {
+    std::shared_ptr<fe::graph::Graph> graph;
+    int64_t ws_size = 0; void* d_ws = nullptr;
+
+    void build(cudnnHandle_t h, int64_t nh, int64_t sq, int64_t sk, int64_t hd, float sc) {
+        graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::BFLOAT16)
+             .set_intermediate_data_type(fe::DataType_t::FLOAT)
+             .set_compute_data_type(fe::DataType_t::FLOAT);
+        auto Q = graph->tensor(fe::graph::Tensor_attributes().set_name("Q").set_uid(Q_UID)
+            .set_dim({1, nh, sq, hd}).set_stride({sq*nh*hd, hd, nh*hd, 1}));
+        auto K = graph->tensor(fe::graph::Tensor_attributes().set_name("K").set_uid(K_UID)
+            .set_dim({1, nh, sk, hd}).set_stride({sk*nh*hd, hd, nh*hd, 1}));
+        auto V = graph->tensor(fe::graph::Tensor_attributes().set_name("V").set_uid(V_UID)
+            .set_dim({1, nh, sk, hd}).set_stride({sk*nh*hd, hd, nh*hd, 1}));
+        auto [O, S] = graph->sdpa(Q, K, V,
+            fe::graph::SDPA_attributes().set_name("sdpa").set_attn_scale(sc));
+        O->set_output(true).set_dim({1, nh, sq, hd}).set_stride({sq*nh*hd, hd, nh*hd, 1}).set_uid(O_UID);
+        auto st = graph->build(h, {fe::HeurMode_t::B, fe::HeurMode_t::A});
+        TORCH_CHECK(st.is_good(), "cuDNN SDPA build: ", st.get_message());
+        (void)graph->get_workspace_size(ws_size);
+        if (ws_size > 0) CK(cudaMalloc(&d_ws, ws_size));
+    }
+
+    void run(cudnnHandle_t h, void* q, void* k, void* v, void* o, cudaStream_t s) {
+        cudnnSetStream(h, s);
+        std::unordered_map<int64_t, void*> p = {{Q_UID, q}, {K_UID, k}, {V_UID, v}, {O_UID, o}};
+        graph->execute(h, p, d_ws);
+    }
+};
+
+// ============================================================
+// FP8 SDPA graph (Q/K/V/O all FP8_E4M3)
+// ============================================================
+enum UIDS_FP8 : int64_t {
+    Q_UID_FP8 = 11, K_UID_FP8 = 12, V_UID_FP8 = 13, O_UID_FP8 = 14,
+    DQ_UID = 21, DK_UID = 22, DV_UID = 23, DS_UID = 24,
+    SS_UID = 25, SO_UID = 26, AS_UID = 27, AO_UID = 28,
+};
+struct CudnnSDPA_FP8 {
+    std::shared_ptr<fe::graph::Graph> graph;
+    int64_t ws_size = 0; void* d_ws = nullptr;
+
+    void build(cudnnHandle_t h, int64_t nh, int64_t sq, int64_t sk, int64_t hd, float sc) {
+        graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::FP8_E4M3)
+             .set_intermediate_data_type(fe::DataType_t::FLOAT)
+             .set_compute_data_type(fe::DataType_t::FLOAT);
+        auto Q = graph->tensor(fe::graph::Tensor_attributes().set_name("Q").set_uid(Q_UID_FP8)
+            .set_dim({1, nh, sq, hd}).set_stride({sq*nh*hd, hd, nh*hd, 1}));
+        auto K = graph->tensor(fe::graph::Tensor_attributes().set_name("K").set_uid(K_UID_FP8)
+            .set_dim({1, nh, sk, hd}).set_stride({sk*nh*hd, hd, nh*hd, 1}));
+        auto V = graph->tensor(fe::graph::Tensor_attributes().set_name("V").set_uid(V_UID_FP8)
+            .set_dim({1, nh, sk, hd}).set_stride({sk*nh*hd, hd, nh*hd, 1}));
+        auto mk_scale = [&](const char* n, int64_t uid) {
+            return graph->tensor(fe::graph::Tensor_attributes()
+                .set_name(n).set_uid(uid)
+                .set_dim({1,1,1,1}).set_stride({1,1,1,1})
+                .set_data_type(fe::DataType_t::FLOAT));
+        };
+        auto descale_q = mk_scale("Descale_Q", DQ_UID);
+        auto descale_k = mk_scale("Descale_K", DK_UID);
+        auto descale_v = mk_scale("Descale_V", DV_UID);
+        auto descale_s = mk_scale("Descale_S", DS_UID);
+        auto scale_s   = mk_scale("Scale_S",   SS_UID);
+        auto scale_o   = mk_scale("Scale_O",   SO_UID);
+        auto sdpa_opts = fe::graph::SDPA_fp8_attributes()
+            .set_name("sdpa_fp8")
+            .set_generate_stats(false)
+            .set_causal_mask(false)
+            .set_attn_scale(sc);
+        auto [O, Stats, Amax_S, Amax_O] = graph->sdpa_fp8(
+            Q, K, V, descale_q, descale_k, descale_v, descale_s, scale_s, scale_o, sdpa_opts);
+        O->set_output(true).set_dim({1, nh, sq, hd}).set_stride({sq*nh*hd, hd, nh*hd, 1}).set_uid(O_UID_FP8);
+        Amax_S->set_output(true).set_dim({1,1,1,1}).set_stride({1,1,1,1}).set_data_type(fe::DataType_t::FLOAT).set_uid(AS_UID);
+        Amax_O->set_output(true).set_dim({1,1,1,1}).set_stride({1,1,1,1}).set_data_type(fe::DataType_t::FLOAT).set_uid(AO_UID);
+        auto st = graph->validate();
+        TORCH_CHECK(st.is_good(), "cuDNN FP8 SDPA validate: ", st.get_message());
+        st = graph->build_operation_graph(h);
+        TORCH_CHECK(st.is_good(), "cuDNN FP8 SDPA build_operation_graph: ", st.get_message());
+        auto plans = graph->create_execution_plans({fe::HeurMode_t::A});
+        TORCH_CHECK(plans.is_good(), "cuDNN FP8 SDPA create_execution_plans: ", plans.get_message());
+        st = graph->check_support(h);
+        TORCH_CHECK(st.is_good(), "cuDNN FP8 SDPA check_support: ", st.get_message());
+        st = graph->build_plans(h);
+        TORCH_CHECK(st.is_good(), "cuDNN FP8 SDPA build_plans: ", st.get_message());
+        (void)graph->get_workspace_size(ws_size);
+        if (ws_size > 0) CK(cudaMalloc(&d_ws, ws_size));
+    }
+
+    void run(cudnnHandle_t h, void* q_fp8, void* k_fp8, void* v_fp8, void* o_fp8,
+             void* dq, void* dk, void* dv, void* ds, void* ss, void* so,
+             void* amax_s, void* amax_o, cudaStream_t s) {
+        cudnnSetStream(h, s);
+        std::unordered_map<int64_t, void*> p = {
+            {Q_UID_FP8, q_fp8}, {K_UID_FP8, k_fp8}, {V_UID_FP8, v_fp8}, {O_UID_FP8, o_fp8},
+            {DQ_UID, dq}, {DK_UID, dk}, {DV_UID, dv}, {DS_UID, ds},
+            {SS_UID, ss}, {SO_UID, so}, {AS_UID, amax_s}, {AO_UID, amax_o},
+        };
+        graph->execute(h, p, d_ws);
+    }
+};
+
+// ============================================================
+// Per-layer state
+// ============================================================
+struct Layer {
+    // FP8 weights (device memory, owned)
+    void *sq_w8 = nullptr, *sk_w8 = nullptr, *sv_w8 = nullptr, *so_w8 = nullptr;
+    void *cq_w8 = nullptr, *ck_w8 = nullptr, *cv_w8 = nullptr, *co_w8 = nullptr;
+    void *f1_w8 = nullptr, *f2_w8 = nullptr;
+    // BF16 bias pointers (persistent copies)
+    __nv_bfloat16 *sqb = nullptr, *skb = nullptr, *svb = nullptr, *sob = nullptr;
+    __nv_bfloat16 *cqb = nullptr, *ckb = nullptr, *cvb = nullptr, *cob = nullptr;
+    __nv_bfloat16 *f1b = nullptr, *f2b = nullptr;
+    // Float32 norm weights (persistent copies)
+    float *rms_q = nullptr, *rms_k = nullptr;
+    float *ca_rms_q = nullptr, *ca_rms_k = nullptr;
+    float *n2w = nullptr, *n2b = nullptr;  // cross_attn_norm weight+bias (always present in Kairos)
+    float *sst = nullptr;                   // modulation data
+    bool has_norm2 = false;
+    int ffn_dim = 0;
+    int ca_k_dim = 0;
+
+    // ---- BF16 weight copies (for force_bf16_gemms debugging mode) ----
+    __nv_bfloat16 *sq_w16=nullptr, *sk_w16=nullptr, *sv_w16=nullptr, *so_w16=nullptr;
+    __nv_bfloat16 *cq_w16=nullptr, *ck_w16=nullptr, *cv_w16=nullptr, *co_w16=nullptr;
+    __nv_bfloat16 *f1_w16=nullptr, *f2_w16=nullptr;
+    // GDN BF16 weights (q/k/v/g/o only — a/b already have bf16)
+    __nv_bfloat16 *gdn_q_w16=nullptr, *gdn_k_w16=nullptr, *gdn_v_w16=nullptr;
+    __nv_bfloat16 *gdn_g_w16=nullptr, *gdn_o_w16=nullptr;
+
+    // ---- GatedDeltaNet (GDN) weights (for linear attention layers) ----
+    bool is_gdn = false;
+    // Projection weights (FP8)
+    void *gdn_q_w8 = nullptr, *gdn_k_w8 = nullptr, *gdn_v_w8 = nullptr;
+    void *gdn_a_w8 = nullptr, *gdn_b_w8 = nullptr;  // FP8 (unused, kept for compat)
+    __nv_bfloat16 *gdn_a_w_bf16 = nullptr, *gdn_b_w_bf16 = nullptr;  // BF16 for small GEMMs
+    void *gdn_g_w8 = nullptr, *gdn_o_w8 = nullptr;
+    // Projection biases (BF16, nullptr if no bias)
+    __nv_bfloat16 *gdn_qb = nullptr, *gdn_kb = nullptr, *gdn_vb = nullptr;
+    __nv_bfloat16 *gdn_ab = nullptr, *gdn_bb = nullptr;
+    __nv_bfloat16 *gdn_gb = nullptr, *gdn_ob = nullptr;
+    // Short conv weights: [channels, kernel_size] float32
+    float *gdn_conv_q_w = nullptr, *gdn_conv_k_w = nullptr, *gdn_conv_v_w = nullptr;
+    // Gate parameters
+    float *gdn_A_log = nullptr;   // [NH] float32
+    float *gdn_dt_bias = nullptr; // [NH] float32
+    // Output norm weight
+    float *gdn_o_norm_w = nullptr; // [head_v_dim] float32
+    // Dimensions
+    int gdn_key_dim = 0, gdn_value_dim = 0;
+    int gdn_head_k = 0, gdn_head_v = 0;
+};
+
+// ============================================================
+// Global engine state
+// ============================================================
+static cublasLtHandle_t g_ltH = nullptr;
+static cudnnHandle_t g_cudnnH = nullptr;
+static float *g_scaleA = nullptr, *g_scaleB = nullptr;
+static void *g_gemm_ws = nullptr;
+static int g_D, g_NH, g_HD, g_NL, g_FFN, g_CA_K_DIM, g_nsm;
+static int g_max_seq = 0, g_ctx = 0;
+static int g_actual_ctx = 0;  // actual encoder token count (may be < g_ctx)
+static bool g_ready = false;
+
+// FP8 SDPA feature flag
+static bool g_fp8_sdpa_enabled = false;
+
+// BF16 attention mode flag
+static bool g_bf16_attn = false;
+struct BF16AttnWeights {
+    __nv_bfloat16 *sq_w = nullptr, *sk_w = nullptr, *sv_w = nullptr, *so_w = nullptr;
+    __nv_bfloat16 *cq_w = nullptr, *ck_w = nullptr, *cv_w = nullptr, *co_w = nullptr;
+};
+static std::vector<BF16AttnWeights> g_bf16_attn_weights;
+
+// Force ALL GEMMs to BF16 (for correctness debugging — slower but no FP8 quantization)
+static bool g_force_bf16_gemms = false;
+void set_force_bf16_gemms(bool v) { g_force_bf16_gemms = v; }
+
+// Tensor-parallel state
+static int g_tp_rank = 0, g_tp_world = 1;
+static ncclComm_t g_nccl_comm = nullptr;
+static int g_D_per_rank = 0;
+static int g_NH_per_rank = 0;
+static int g_FFN_per_rank = 0;
+
+// Per-layer data
+static std::vector<Layer> g_layers;
+
+// Profile mode: 0=all, 1=gemms only, 2=ewise only, 3=sdpa only, 4=no sdpa, 5=no gemm, 6=no ewise
+static int g_profile_mode = 0;
+void set_profile_mode(int64_t m) { g_profile_mode = (int)m; }
+
+enum class SdpaBackend {
+    CudnnBf16 = 0,
+    TorchBf16 = 1,
+    SageAttn3Py = 2,
+    SageAttn3Cpp = 3,
+};
+
+static SdpaBackend g_sdpa_backend = SdpaBackend::CudnnBf16;
+static bool g_use_torch_sdpa = false;
+
+static const char* sdpa_backend_name(SdpaBackend backend) {
+    switch (backend) {
+        case SdpaBackend::CudnnBf16: return "cudnn";
+        case SdpaBackend::TorchBf16: return "torch";
+        case SdpaBackend::SageAttn3Py: return "sage3_py";
+        case SdpaBackend::SageAttn3Cpp: return "sage3_cpp";
+    }
+    return "unknown";
+}
+
+void set_torch_sdpa(bool v) {
+    g_use_torch_sdpa = v;
+    if (v) {
+        g_sdpa_backend = SdpaBackend::TorchBf16;
+    } else if (g_sdpa_backend == SdpaBackend::TorchBf16) {
+        g_sdpa_backend = SdpaBackend::CudnnBf16;
+    }
+}
+
+void set_sdpa_backend(const std::string& name) {
+    if (name == "cudnn" || name == "default") {
+        g_sdpa_backend = SdpaBackend::CudnnBf16;
+    } else if (name == "torch") {
+        g_sdpa_backend = SdpaBackend::TorchBf16;
+    } else if (name == "sage3_py") {
+        g_sdpa_backend = SdpaBackend::SageAttn3Py;
+    } else if (name == "sage3_cpp") {
+        g_sdpa_backend = SdpaBackend::SageAttn3Cpp;
+    } else {
+        TORCH_CHECK(false, "Unknown SDPA backend: ", name,
+                    " (expected cudnn, torch, sage3_py, or sage3_cpp)");
+    }
+    g_use_torch_sdpa = (g_sdpa_backend == SdpaBackend::TorchBf16);
+}
+
+std::string get_sdpa_backend() {
+    return sdpa_backend_name(g_sdpa_backend);
+}
+
+// Skip all CA operations — let Python handle cross-attention
+static bool g_skip_ca = false;
+void set_skip_ca(bool v) { g_skip_ca = v; }
+
+// Helper: run PyTorch SDPA on raw bf16 buffers
+// Q/K/V layout: [seq, nh*hd] contiguous (seq-major, heads interleaved)
+static void torch_sdpa_bf16(void* q_ptr, void* k_ptr, void* v_ptr, void* o_ptr,
+                            int sq, int sk, int nh, int hd, float scale,
+                            cudaStream_t stream) {
+    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    // Wrap raw pointers as [1, seq, nh, hd] then transpose to [1, nh, seq, hd]
+    auto Q = torch::from_blob(q_ptr, {1, sq, nh, hd}, opts).permute({0, 2, 1, 3});
+    auto K = torch::from_blob(k_ptr, {1, sk, nh, hd}, opts).permute({0, 2, 1, 3});
+    auto V = torch::from_blob(v_ptr, {1, sk, nh, hd}, opts).permute({0, 2, 1, 3});
+    // at::scaled_dot_product_attention expects [B, NH, S, HD] contiguous
+    Q = Q.contiguous();
+    K = K.contiguous();
+    V = V.contiguous();
+    auto O = at::scaled_dot_product_attention(Q, K, V,
+        /*attn_mask=*/{}, /*dropout_p=*/0.0, /*is_causal=*/false, /*scale=*/scale);
+    // O is [1, nh, sq, hd], need to write back as [sq, nh*hd]
+    auto O_out = O.permute({0, 2, 1, 3}).contiguous().view({sq, nh * hd});
+    // Copy to output buffer
+    CK(cudaMemcpyAsync(o_ptr, O_out.data_ptr(), (size_t)sq * nh * hd * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToDevice, stream));
+}
+
+static at::Tensor wrap_seqmajor_bf16(void* ptr, int seq, int nh, int hd) {
+    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    return torch::from_blob(ptr, {1, seq, nh, hd}, opts).permute({0, 2, 1, 3}).contiguous();
+}
+
+static void copy_bhsd_to_seqmajor_bf16(const at::Tensor& o_bhsd, void* o_ptr,
+                                       int sq, int nh, int hd, cudaStream_t stream) {
+    auto o_out = o_bhsd.permute({0, 2, 1, 3}).contiguous().view({sq, nh * hd});
+    CK(cudaMemcpyAsync(o_ptr, o_out.data_ptr(), (size_t)sq * nh * hd * sizeof(__nv_bfloat16),
+                       cudaMemcpyDeviceToDevice, stream));
+}
+
+static void sageattn3_py_bf16(void* q_ptr, void* k_ptr, void* v_ptr, void* o_ptr,
+                              int sq, int sk, int nh, int hd, cudaStream_t stream) {
+    py::gil_scoped_acquire gil;
+    static py::object* sage3_fn = nullptr;
+    if (sage3_fn == nullptr) {
+        sage3_fn = new py::object(py::module_::import("sageattn3.api").attr("sageattn3_blackwell"));
+    }
+
+    auto Q = wrap_seqmajor_bf16(q_ptr, sq, nh, hd);
+    auto K = wrap_seqmajor_bf16(k_ptr, sk, nh, hd);
+    auto V = wrap_seqmajor_bf16(v_ptr, sk, nh, hd);
+    auto O = (*sage3_fn)(Q, K, V).cast<at::Tensor>();
+    copy_bhsd_to_seqmajor_bf16(O.narrow(2, 0, sq).contiguous(), o_ptr, sq, nh, hd, stream);
+}
+
+static at::Tensor pad_seq_to_128(const at::Tensor& x) {
+    int64_t seq = x.size(2);
+    int64_t pad = (128 - (seq % 128)) % 128;
+    if (pad == 0) {
+        return x.contiguous();
+    }
+    auto out = torch::zeros({x.size(0), x.size(1), seq + pad, x.size(3)}, x.options());
+    out.narrow(2, 0, seq).copy_(x);
+    return out;
+}
+
+static void sageattn3_cpp_bf16(void* q_ptr, void* k_ptr, void* v_ptr, void* o_ptr,
+                               int sq, int sk, int nh, int hd, cudaStream_t stream) {
+    auto Q = wrap_seqmajor_bf16(q_ptr, sq, nh, hd);
+    auto K = wrap_seqmajor_bf16(k_ptr, sk, nh, hd);
+    auto V = wrap_seqmajor_bf16(v_ptr, sk, nh, hd);
+
+    auto k_mean = at::mean(K, std::vector<int64_t>{2}, true).to(K.scalar_type());
+    auto K_centered = (K - k_mean).contiguous();
+
+    auto Q_padded = pad_seq_to_128(Q);
+    auto K_padded = pad_seq_to_128(K_centered);
+    auto V_padded = pad_seq_to_128(V);
+    int64_t q_padded = Q_padded.size(2);
+    int64_t q_groups = q_padded / 128;
+
+    auto Q_grouped = Q_padded.reshape({1, nh, q_groups, 128, hd});
+    auto qm = at::mean(Q_grouped, std::vector<int64_t>{3}, false).to(Q_padded.scalar_type()).contiguous();
+    auto Q_centered = (Q_grouped - qm.unsqueeze(3)).contiguous().reshape({1, nh, q_padded, hd});
+    auto delta_s = at::matmul(qm, K_padded.transpose(-2, -1)).to(torch::kFloat32).contiguous();
+
+    auto byte_opts = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+    auto fp8_opts = torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA);
+
+    auto q_packed = torch::empty({1, nh, q_padded, hd / 2}, byte_opts);
+    auto k_packed = torch::empty({1, nh, K_padded.size(2), hd / 2}, byte_opts);
+    auto v_packed = torch::empty({1, nh, hd, V_padded.size(2) / 2}, byte_opts);
+    auto q_sf = torch::empty({1, nh, q_padded, hd / 16}, fp8_opts);
+    auto k_sf = torch::empty({1, nh, K_padded.size(2), hd / 16}, fp8_opts);
+    auto v_sf = torch::empty({1, nh, hd, V_padded.size(2) / 16}, fp8_opts);
+
+    scaled_fp4_quant(Q_centered, q_packed, q_sf, 1);
+    scaled_fp4_quant_permute(K_padded, k_packed, k_sf, 1);
+    scaled_fp4_quant_trans(V_padded, v_packed, v_sf, 1);
+
+    float softmax_scale = 1.0f / sqrtf((float)hd);
+    c10::optional<at::Tensor> out_opt = c10::nullopt;
+    auto out_seq = mha_fwd(
+        q_packed, k_packed, v_packed,
+        q_sf, k_sf, v_sf,
+        delta_s, sk, out_opt,
+        softmax_scale, false, true, true, -1, -1);
+    auto O = out_seq[0];
+    copy_bhsd_to_seqmajor_bf16(O.narrow(2, 0, sq).contiguous(), o_ptr, sq, nh, hd, stream);
+}
+#define DO_GEMM  (g_profile_mode == 0 || g_profile_mode == 1 || g_profile_mode == 4 || g_profile_mode == 6)
+#define DO_EWISE (g_profile_mode == 0 || g_profile_mode == 2 || g_profile_mode == 4 || g_profile_mode == 5)
+#define DO_SDPA  (g_profile_mode == 0 || g_profile_mode == 3 || g_profile_mode == 5 || g_profile_mode == 6)
+
+// Pre-allocated activation buffers
+static __nv_bfloat16 *b_norm, *b_q, *b_k, *b_v, *b_attn, *b_sa_out;
+static __nv_bfloat16 *b_ca_norm, *b_ca_q, *b_ca_k, *b_ca_v, *b_ca_out;
+static __nv_bfloat16 *b_ffn_norm, *b_ffn_mid, *b_ffn_out;
+static __nv_fp8_e4m3 *b_norm_fp8, *b_ca_norm_fp8, *b_ffn_norm_fp8;
+static __nv_fp8_e4m3 *b_sa_out_fp8, *b_ca_out_fp8, *b_ffn_mid_fp8;
+static __nv_fp8_e4m3 *b_enc_fp8;
+
+// FP8 SDPA buffers
+static __nv_fp8_e4m3 *b_q_fp8_attn = nullptr, *b_k_fp8_attn = nullptr, *b_v_fp8_attn = nullptr;
+static float *g_fp8_sdpa_descale_q = nullptr, *g_fp8_sdpa_descale_k = nullptr;
+static float *g_fp8_sdpa_descale_v = nullptr, *g_fp8_sdpa_descale_s = nullptr;
+static float *g_fp8_sdpa_scale_s = nullptr,   *g_fp8_sdpa_scale_o = nullptr;
+static float *g_fp8_sdpa_amax_s = nullptr,    *g_fp8_sdpa_amax_o = nullptr;
+
+// CA K/V output cache
+static __nv_bfloat16 *b_ca_k_cache = nullptr;
+static __nv_bfloat16 *b_ca_v_cache = nullptr;
+static bool g_ca_kv_cache_valid = false;
+
+// TP scratch buffers
+static float *b_tp_sumsq_qk = nullptr;
+static float *b_tp_sumsq_cq = nullptr;
+static float *b_tp_sumsq_ck = nullptr;
+
+// GDN (GatedDeltaNet) buffers
+static int g_gdn_key_dim = 0, g_gdn_value_dim = 0;
+static int g_gdn_head_k = 0, g_gdn_head_v = 0;
+static int g_gdn_conv_k = 4;  // conv kernel size
+static __nv_bfloat16 *b_gdn_q = nullptr, *b_gdn_k = nullptr;
+static __nv_bfloat16 *b_gdn_v = nullptr, *b_gdn_g = nullptr;
+static __nv_bfloat16 *b_gdn_a = nullptr, *b_gdn_b = nullptr;
+static __nv_bfloat16 *b_gdn_out = nullptr;
+static __nv_bfloat16 *b_gdn_conv_scratch = nullptr;
+static __nv_fp8_e4m3 *b_gdn_out_fp8 = nullptr;
+static float *b_gdn_gates_g = nullptr, *b_gdn_gates_beta = nullptr;
+static float *b_gdn_state = nullptr;  // [NL_GDN * NH * K * V]
+static int g_n_gdn_layers = 0;
+static bool g_gdn_use_cublas_chunk = false; // Recurrent (1.27x). Chunk correct but needs MMA fwd_o to beat recurrent.
+static std::vector<int> g_gdn_layer_indices;  // which layers are GDN
+// Chunk algorithm scratch buffers (allocated in engine_init)
+static float *b_gdn_chunk_w = nullptr;     // [NC, NH, BT, K]
+static float *b_gdn_chunk_u = nullptr;     // [NC, NH, BT, V]
+static float *b_gdn_chunk_gcum = nullptr;  // [NC, NH, BT]
+
+// Graph-internal input buffers
+static __nv_bfloat16 *g_x_buf = nullptr, *g_enc_buf = nullptr;
+static float *g_temb_buf = nullptr, *g_ssts_buf = nullptr;
+static bool g_use_graph = false;
+static cudaStream_t g_graph_stream = nullptr;
+static std::unordered_map<int, cudaGraphExec_t> g_graphs_by_seq;
+static std::unordered_map<int, int> g_graph_temb_rows;
+
+// ============================================================
+// cuBLASLt chunk GDN: helper functions (need globals above)
+// ============================================================
+static std::unordered_map<int, ChunkGdnGemms> g_chunk_gdn_gemms;
+
+static ChunkGdnGemms* get_chunk_gdn_gemms(int seq) {
+    auto it = g_chunk_gdn_gemms.find(seq);
+    if (it != g_chunk_gdn_gemms.end()) return &it->second;
+    auto& cg = g_chunk_gdn_gemms[seq];
+    int NHpr = g_NH_per_rank;
+    cg.build(g_ltH, seq, NHpr, g_gdn_head_k, g_gdn_head_v,
+             g_gemm_ws, 32 * 1024 * 1024);
+    return &cg;
+}
+
+static void gdn_cublas_chunk_forward(
+    __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* v,
+    float* g, float* beta,
+    __nv_bfloat16* o, float* state,
+    float* w_buf, float* u_buf, float* gcum_buf,
+    int T, int NH, int K, int V, float scale,
+    cudaStream_t stream)
+{
+    const int BT = GDN_CHUNK_BT;
+    int NC = (T + BT - 1) / BT;
+
+    // Save inputs for debugging (first call only)
+    static bool _dbg_saved = false;
+    if (!_dbg_saved) {
+        _dbg_saved = true;
+        CK(cudaStreamSynchronize(stream));
+        size_t qk_n = (size_t)T * NH * K, v_n = (size_t)T * NH * V, g_n = (size_t)T * NH;
+        auto opts16 = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+        auto opts32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+        // Save as raw binary: q(bf16), k(bf16), v(bf16), g(f32), beta(f32)
+        auto q_cpu = torch::from_blob(q, {(long)qk_n}, opts16).clone().cpu();
+        auto k_cpu = torch::from_blob(k, {(long)qk_n}, opts16).clone().cpu();
+        auto v_cpu = torch::from_blob(v, {(long)v_n}, opts16).clone().cpu();
+        auto g_cpu = torch::from_blob(g, {(long)g_n}, opts32).clone().cpu();
+        auto b_cpu = torch::from_blob(beta, {(long)g_n}, opts32).clone().cpu();
+        FILE* fp = fopen("/tmp/_gdn_inputs.bin", "wb");
+        fwrite(q_cpu.data_ptr(), 2, qk_n, fp);
+        fwrite(k_cpu.data_ptr(), 2, qk_n, fp);
+        fwrite(v_cpu.data_ptr(), 2, v_n, fp);
+        fwrite(g_cpu.data_ptr(), 4, g_n, fp);
+        fwrite(b_cpu.data_ptr(), 4, g_n, fp);
+        fclose(fp);
+        printf("  [DBG] Saved chunk inputs T=%d NH=%d K=%d V=%d scale=%.6f\n", T, NH, K, V, scale);
+    }
+
+    // 3-kernel chunk pipeline: prepare → chunk_h_simple → chunk_fwd_o
+    // Phase 0: L2-normalize Q and K
+    k_gdn_l2norm_scale<<<dim3(T, NH), 256, 0, stream>>>(q, k, K, scale);
+
+    // Debug: trace data flow
+
+    // Phase 1: Prepare w, u, gcum (K already L2-normalized, krnorm≈1)
+    {
+        size_t smem = gdn_chunk_prepare_smem(K, V);
+        if (smem > 48 * 1024)
+            cudaFuncSetAttribute(k_gdn_chunk_prepare,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        k_gdn_chunk_prepare<<<dim3(NC, NH), 64, smem, stream>>>(
+            k, v, g, beta,
+            w_buf, u_buf, gcum_buf,
+            T, NH, K, V);
+    }
+
+
+    // Phase 2: State propagation → h_snapshots (MMA-based, verified correct)
+    gdn_chunk_h_launch(
+        w_buf, u_buf, gcum_buf,
+        b_gdn_hout,    // [NC+1, NH, K, V] bf16
+        state,          // final state
+        state,          // h0
+        NC, NH, K, V, stream);
+
+
+    // Phase 3: Output from h_snapshots (parallel across chunks!)
+    {
+        int NV_blocks = V / GDN_BV;
+        size_t fwd_o_smem = BT * GDN_BV * sizeof(float) + BT * sizeof(float);  // v_new + gcum
+        k_gdn_chunk_fwd_o<<<dim3(NV_blocks, NC, NH), 256, fwd_o_smem, stream>>>(
+            q, k,               // [T, NH, K] bf16 (L2-normalized)
+            w_buf, u_buf,       // [NC, NH, BT, K/V] fp32
+            b_gdn_hout,        // [NC+1, NH, K, V] bf16
+            gcum_buf,           // [NC, NH, BT] fp32
+            o,                  // [T, NH, V] bf16 output
+            T, NH, K, V, scale);
+    }
+}
+
+// ============================================================
+// NCCL setup
+// ============================================================
+torch::Tensor engine_nccl_get_unique_id() {
+    ncclUniqueId id;
+    CKNCCL(ncclGetUniqueId(&id));
+    auto out = torch::empty({NCCL_UNIQUE_ID_BYTES}, torch::TensorOptions().dtype(torch::kUInt8));
+    std::memcpy(out.data_ptr(), &id, NCCL_UNIQUE_ID_BYTES);
+    return out;
+}
+
+void engine_nccl_comm_init(torch::Tensor uid_bytes, int64_t rank, int64_t world) {
+    TORCH_CHECK(uid_bytes.numel() == NCCL_UNIQUE_ID_BYTES, "bad uid size");
+    TORCH_CHECK(uid_bytes.dtype() == torch::kUInt8, "uid must be uint8");
+    auto cpu = uid_bytes.to(torch::kCPU).contiguous();
+    ncclUniqueId id;
+    std::memcpy(&id, cpu.data_ptr(), NCCL_UNIQUE_ID_BYTES);
+    g_tp_rank = (int)rank;
+    g_tp_world = (int)world;
+    CKNCCL(ncclCommInitRank(&g_nccl_comm, (int)world, id, (int)rank));
+    printf("  NCCL comm initialized: rank=%d world=%d\n", (int)rank, (int)world);
+}
+
+// ============================================================
+// Per-seq GEMM descriptors
+// ============================================================
+struct SeqGemms {
+    FP8Gemm sq, sk, sv, so, f1, f2;
+    BF16Gemm sq_bf16, sk_bf16, sv_bf16, so_bf16;
+    BF16Gemm f1_bf16, f2_bf16;  // for force_bf16_gemms mode
+    CudnnSDPA sa_sdpa;
+    CudnnSDPA_FP8 sa_sdpa_fp8;
+    bool fp8_sdpa_built = false;
+    bool bf16_attn_built = false;
+    bool bf16_ffn_built = false;
+
+    // GatedDeltaNet GEMMs
+    FP8Gemm gdn_q, gdn_k, gdn_v, gdn_g, gdn_o;
+    BF16Gemm gdn_a, gdn_b;  // a/b have tiny N=20, FP8 not supported
+    BF16Gemm gdn_q_bf16, gdn_k_bf16, gdn_v_bf16, gdn_g_bf16, gdn_o_bf16;  // for force mode
+    bool gdn_built = false;
+    bool gdn_bf16_built = false;
+};
+static std::unordered_map<int, SeqGemms> g_gemms_by_seq;
+static FP8Gemm g_ck, g_cv;  // CA K/V only depend on ctx
+static BF16Gemm g_ck_bf16, g_cv_bf16;  // BF16 versions for force_bf16_gemms mode
+static bool g_ck_bf16_built = false;
+
+// Per-ca_len GEMM descriptors
+struct CaGemms {
+    FP8Gemm cq, co;
+    BF16Gemm cq_bf16, co_bf16;
+    CudnnSDPA ca_sdpa;
+    bool bf16_ca_built = false;
+};
+static std::unordered_map<int, CaGemms> g_ca_gemms_by_len;
+
+// Helper: get or create GEMMs for a specific seq_len
+SeqGemms* get_gemms(int seq) {
+    auto it = g_gemms_by_seq.find(seq);
+    if (it != g_gemms_by_seq.end()) return &it->second;
+
+    auto& g = g_gemms_by_seq[seq];
+    int D = g_D, FFN = g_FFN;
+    int Dpr = g_D_per_rank, FFNpr = g_FFN_per_rank;
+    int row_epi = 1;
+    // Column-parallel SA projections
+    g.sq.setup(g_ltH, seq, Dpr, D, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
+    g.sk.setup(g_ltH, seq, Dpr, D, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
+    g.sv.setup(g_ltH, seq, Dpr, D, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
+    // FFN1 (column-parallel, SiLU applied separately — no fused epilogue)
+    g.f1.setup(g_ltH, seq, FFNpr, D, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
+    // Row-parallel
+    g.so.setup(g_ltH, seq, D, Dpr, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, row_epi);
+    g.f2.setup(g_ltH, seq, D, FFNpr, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, row_epi);
+    // BF16 attention GEMMs
+    if ((g_bf16_attn || g_force_bf16_gemms) && !g.bf16_attn_built) {
+        g.sq_bf16.setup(g_ltH, seq, Dpr, D, g_gemm_ws, 32*1024*1024, 1);
+        g.sk_bf16.setup(g_ltH, seq, Dpr, D, g_gemm_ws, 32*1024*1024, 1);
+        g.sv_bf16.setup(g_ltH, seq, Dpr, D, g_gemm_ws, 32*1024*1024, 1);
+        g.so_bf16.setup(g_ltH, seq, D, Dpr, g_gemm_ws, 32*1024*1024, row_epi);
+        g.bf16_attn_built = true;
+    }
+    // BF16 FFN GEMMs
+    if (g_force_bf16_gemms && !g.bf16_ffn_built) {
+        g.f1_bf16.setup(g_ltH, seq, FFNpr, D, g_gemm_ws, 32*1024*1024, 1);
+        g.f2_bf16.setup(g_ltH, seq, D, FFNpr, g_gemm_ws, 32*1024*1024, row_epi);
+        g.bf16_ffn_built = true;
+    }
+    float scl = 1.f / sqrtf((float)g_HD);
+    g.sa_sdpa.build(g_cudnnH, g_NH_per_rank, seq, seq, g_HD, scl);
+    if (g_fp8_sdpa_enabled) {
+        g.sa_sdpa_fp8.build(g_cudnnH, g_NH_per_rank, seq, seq, g_HD, scl);
+        g.fp8_sdpa_built = true;
+    }
+
+    // GDN GEMMs (built lazily on first GDN layer forward)
+    // These use global dims since they're the same for all GDN layers
+    if (!g.gdn_built && g_gdn_key_dim > 0) {
+        int KD = g_gdn_key_dim, VD = g_gdn_value_dim;
+        int KDpr = KD / g_tp_world, VDpr = VD / g_tp_world;
+        // Col-parallel projections: output sharded
+        g.gdn_q.setup(g_ltH, seq, KDpr, D, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
+        g.gdn_k.setup(g_ltH, seq, KDpr, D, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
+        g.gdn_v.setup(g_ltH, seq, VDpr, D, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
+        g.gdn_g.setup(g_ltH, seq, VDpr, D, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
+        // a/b: small output (NH=20), use BF16 GEMMs (FP8 doesn't support tiny N)
+        g.gdn_a.setup(g_ltH, seq, g_NH, D, g_gemm_ws, 32*1024*1024, 1);
+        g.gdn_b.setup(g_ltH, seq, g_NH, D, g_gemm_ws, 32*1024*1024, 1);
+        // Row-parallel output projection
+        int row_epi = 1;
+        g.gdn_o.setup(g_ltH, seq, D, VDpr, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, row_epi);
+        g.gdn_built = true;
+    }
+    // BF16 GDN GEMMs for force mode
+    if (g_force_bf16_gemms && !g.gdn_bf16_built && g_gdn_key_dim > 0) {
+        int KD = g_gdn_key_dim, VD = g_gdn_value_dim;
+        int KDpr = KD / g_tp_world, VDpr = VD / g_tp_world;
+        g.gdn_q_bf16.setup(g_ltH, seq, KDpr, D, g_gemm_ws, 32*1024*1024, 1);
+        g.gdn_k_bf16.setup(g_ltH, seq, KDpr, D, g_gemm_ws, 32*1024*1024, 1);
+        g.gdn_v_bf16.setup(g_ltH, seq, VDpr, D, g_gemm_ws, 32*1024*1024, 1);
+        g.gdn_g_bf16.setup(g_ltH, seq, VDpr, D, g_gemm_ws, 32*1024*1024, 1);
+        int row_epi_gdn = 1;
+        g.gdn_o_bf16.setup(g_ltH, seq, D, VDpr, g_gemm_ws, 32*1024*1024, row_epi_gdn);
+        g.gdn_bf16_built = true;
+    }
+
+    return &g;
+}
+
+CaGemms* get_ca_gemms(int ca_len) {
+    auto it = g_ca_gemms_by_len.find(ca_len);
+    if (it != g_ca_gemms_by_len.end()) return &it->second;
+    auto& g = g_ca_gemms_by_len[ca_len];
+    int D = g_D;
+    int Dpr = g_D_per_rank;
+    int row_epi = 1;
+    g.cq.setup(g_ltH, ca_len, Dpr, D, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
+    g.co.setup(g_ltH, ca_len, D, Dpr, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, row_epi);
+    float scl = 1.f / sqrtf((float)g_HD);
+    int ca_kv_len = (g_actual_ctx > 0) ? g_actual_ctx : g_ctx;
+    g.ca_sdpa.build(g_cudnnH, g_NH_per_rank, ca_len, ca_kv_len, g_HD, scl);
+    // BF16 CA GEMMs for force_bf16_gemms mode
+    if (g_force_bf16_gemms && !g.bf16_ca_built) {
+        g.cq_bf16.setup(g_ltH, ca_len, Dpr, D, g_gemm_ws, 32*1024*1024, 1);
+        g.co_bf16.setup(g_ltH, ca_len, D, Dpr, g_gemm_ws, 32*1024*1024, row_epi);
+        g.bf16_ca_built = true;
+    }
+    // BF16 CA K/V GEMMs (global, built once)
+    // Always build BF16 CA K/V GEMMs (FP8 has tiling bugs at small ctx)
+    if (!g_ck_bf16_built) {
+        g_ck_bf16.setup(g_ltH, ca_kv_len, Dpr, g_CA_K_DIM, g_gemm_ws, 32*1024*1024, 1);
+        g_cv_bf16.setup(g_ltH, ca_kv_len, Dpr, g_CA_K_DIM, g_gemm_ws, 32*1024*1024, 1);
+        g_ck_bf16_built = true;
+    }
+    return &g;
+}
+
+// ============================================================
+// Init: allocate buffers
+// ============================================================
+void engine_init(int64_t D, int64_t NH, int64_t HD, int64_t NL,
+                 int64_t FFN, int64_t CA_K_DIM, int64_t max_seq, int64_t ctx,
+                 int64_t gdn_key_dim, int64_t gdn_value_dim) {
+    g_D = D; g_NH = NH; g_HD = HD; g_NL = NL; g_FFN = FFN; g_CA_K_DIM = CA_K_DIM;
+    g_max_seq = max_seq; g_ctx = ctx;
+
+    TORCH_CHECK(D % g_tp_world == 0, "D not divisible by tp_world");
+    TORCH_CHECK(NH % g_tp_world == 0, "NH not divisible by tp_world");
+    TORCH_CHECK(FFN % g_tp_world == 0, "FFN not divisible by tp_world");
+    g_D_per_rank = D / g_tp_world;
+    g_NH_per_rank = NH / g_tp_world;
+    g_FFN_per_rank = FFN / g_tp_world;
+
+    cudaDeviceProp prop; int dev; CK(cudaGetDevice(&dev));
+    CK(cudaGetDeviceProperties(&prop, dev));
+    g_nsm = prop.multiProcessorCount;
+
+    CKBL(cublasLtCreate(&g_ltH));
+    cudnnCreate(&g_cudnnH);
+
+    float one = 1.f;
+    CK(cudaMalloc(&g_scaleA, 4)); CK(cudaMemcpy(g_scaleA, &one, 4, cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&g_scaleB, 4)); CK(cudaMemcpy(g_scaleB, &one, 4, cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&g_gemm_ws, 32 * 1024 * 1024));
+
+    auto abf16 = [](size_t n) { __nv_bfloat16* p; CK(cudaMalloc(&p, n * 2)); return p; };
+    auto afp8  = [](size_t n) { __nv_fp8_e4m3* p; CK(cudaMalloc(&p, n)); return p; };
+
+    b_norm = abf16(max_seq * D); b_q = abf16(max_seq * D); b_k = abf16(max_seq * D); b_v = abf16(max_seq * D);
+    b_attn = abf16(max_seq * D); b_sa_out = abf16(max_seq * D);
+    b_ca_norm = abf16(max_seq * D); b_ca_q = abf16(max_seq * D);
+    b_ca_k = abf16(ctx * D); b_ca_v = abf16(ctx * D); b_ca_out = abf16(max_seq * D);
+    b_ffn_norm = abf16(max_seq * D); b_ffn_mid = abf16(max_seq * FFN); b_ffn_out = abf16(max_seq * D);
+    b_norm_fp8 = afp8(max_seq * D); b_ca_norm_fp8 = afp8(max_seq * D); b_ffn_norm_fp8 = afp8(max_seq * D);
+    b_sa_out_fp8 = afp8(max_seq * D); b_ca_out_fp8 = afp8(max_seq * D); b_ffn_mid_fp8 = afp8(max_seq * FFN);
+    b_enc_fp8 = afp8(ctx * CA_K_DIM);
+
+    // FP8 SDPA (opt-in via ENGINE_FP8_SDPA=1)
+    const char* fp8_sdpa_env = getenv("ENGINE_FP8_SDPA");
+    g_fp8_sdpa_enabled = (fp8_sdpa_env && atoi(fp8_sdpa_env) == 1);
+    const char* bf16_attn_env = getenv("ENGINE_BF16_ATTN");
+    g_bf16_attn = (bf16_attn_env && atoi(bf16_attn_env) == 1);
+    if (g_bf16_attn) {
+        printf("  [BF16 ATTN] enabled\n");
+    }
+    if (g_fp8_sdpa_enabled) {
+        b_q_fp8_attn = afp8(max_seq * g_D_per_rank);
+        b_k_fp8_attn = afp8(max_seq * g_D_per_rank);
+        b_v_fp8_attn = afp8(max_seq * g_D_per_rank);
+        auto af32 = []() { float* p; CK(cudaMalloc(&p, sizeof(float))); return p; };
+        g_fp8_sdpa_descale_q = af32(); g_fp8_sdpa_descale_k = af32();
+        g_fp8_sdpa_descale_v = af32(); g_fp8_sdpa_descale_s = af32();
+        g_fp8_sdpa_scale_s   = af32(); g_fp8_sdpa_scale_o   = af32();
+        g_fp8_sdpa_amax_s    = af32(); g_fp8_sdpa_amax_o    = af32();
+        float one_val = 1.f;
+        for (float* p : {g_fp8_sdpa_descale_q, g_fp8_sdpa_descale_k, g_fp8_sdpa_descale_v,
+                         g_fp8_sdpa_descale_s, g_fp8_sdpa_scale_s, g_fp8_sdpa_scale_o}) {
+            CK(cudaMemcpy(p, &one_val, sizeof(float), cudaMemcpyHostToDevice));
+        }
+        printf("  [FP8 SDPA] enabled via ENGINE_FP8_SDPA=1\n");
+    }
+
+    // CA K/V cache
+    b_ca_k_cache = abf16((size_t)NL * ctx * g_D_per_rank);
+    b_ca_v_cache = abf16((size_t)NL * ctx * g_D_per_rank);
+    g_ca_kv_cache_valid = false;
+
+    // Graph-internal I/O buffers
+    CK(cudaMalloc(&g_x_buf, (size_t)max_seq * D * sizeof(__nv_bfloat16)));
+    CK(cudaMalloc(&g_enc_buf, (size_t)ctx * CA_K_DIM * sizeof(__nv_bfloat16)));
+    CK(cudaMalloc(&g_temb_buf, (size_t)max_seq * 6 * D * sizeof(float)));
+    CK(cudaMalloc(&g_ssts_buf, (size_t)NL * 6 * D * sizeof(float)));
+    CK(cudaStreamCreateWithFlags(&g_graph_stream, cudaStreamNonBlocking));
+
+    // TP RMSNorm scratch buffers
+    if (g_tp_world > 1) {
+        CK(cudaMalloc(&b_tp_sumsq_qk, (size_t)2 * max_seq * sizeof(float)));
+        CK(cudaMalloc(&b_tp_sumsq_cq, (size_t)max_seq * sizeof(float)));
+        CK(cudaMalloc(&b_tp_sumsq_ck, (size_t)ctx * sizeof(float)));
+    }
+
+    // CA K/V GEMMs (column-parallel)
+    g_ck.setup(g_ltH, ctx, g_D_per_rank, CA_K_DIM, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
+    g_cv.setup(g_ltH, ctx, g_D_per_rank, CA_K_DIM, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
+
+    g_layers.resize(NL);
+
+    // GDN buffers
+    g_gdn_key_dim = (int)gdn_key_dim;
+    g_gdn_value_dim = (int)gdn_value_dim;
+    if (gdn_key_dim > 0 && gdn_value_dim > 0) {
+        g_gdn_head_k = gdn_key_dim / NH;
+        g_gdn_head_v = gdn_value_dim / NH;
+        int KDpr = gdn_key_dim / g_tp_world;
+        int VDpr = gdn_value_dim / g_tp_world;
+        int NHpr = NH / g_tp_world;
+        b_gdn_q = abf16(max_seq * KDpr);
+        b_gdn_k = abf16(max_seq * KDpr);
+        b_gdn_v = abf16(max_seq * VDpr);
+        b_gdn_g = abf16(max_seq * VDpr);
+        b_gdn_a = abf16(max_seq * NH);  // replicated
+        b_gdn_b = abf16(max_seq * NH);
+        b_gdn_out = abf16(max_seq * VDpr);
+        b_gdn_conv_scratch = abf16(max_seq * (size_t)std::max(KDpr, VDpr));
+        b_gdn_out_fp8 = afp8(max_seq * VDpr);
+        b_gdn_gates_g = (float*)nullptr;
+        b_gdn_gates_beta = (float*)nullptr;
+        CK(cudaMalloc(&b_gdn_gates_g, (size_t)max_seq * NHpr * sizeof(float)));
+        CK(cudaMalloc(&b_gdn_gates_beta, (size_t)max_seq * NHpr * sizeof(float)));
+        // Count GDN layers
+        g_n_gdn_layers = 0;
+        g_gdn_layer_indices.clear();
+        for (int i = 0; i < NL; i++) {
+            if (i % 4 == 3) { g_gdn_layer_indices.push_back(i); g_n_gdn_layers++; }
+        }
+        // Per-GDN-layer recurrent state: [NH_per_rank, K, V]
+        size_t state_per_layer = (size_t)NHpr * g_gdn_head_k * g_gdn_head_v;
+        CK(cudaMalloc(&b_gdn_state, (size_t)g_n_gdn_layers * state_per_layer * sizeof(float)));
+        CK(cudaMemset(b_gdn_state, 0, (size_t)g_n_gdn_layers * state_per_layer * sizeof(float)));
+        printf("  [GDN] %d layers, key_dim=%d value_dim=%d head_k=%d head_v=%d\n",
+               g_n_gdn_layers, g_gdn_key_dim, g_gdn_value_dim, g_gdn_head_k, g_gdn_head_v);
+        printf("  [GDN] state: %.1f MB\n",
+               (double)(g_n_gdn_layers * state_per_layer * sizeof(float)) / (1024.0 * 1024.0));
+        // Chunk algorithm scratch buffers — per HEAD dimensions (not per-rank)
+        int NC = ((int)max_seq + GDN_CHUNK_BT - 1) / GDN_CHUNK_BT;
+        size_t w_elems = (size_t)NC * NHpr * GDN_CHUNK_BT * g_gdn_head_k;
+        size_t u_elems = (size_t)NC * NHpr * GDN_CHUNK_BT * g_gdn_head_v;
+        size_t gcum_elems = (size_t)NC * NHpr * GDN_CHUNK_BT;
+        CK(cudaMalloc(&b_gdn_chunk_w, w_elems * sizeof(float)));
+        CK(cudaMalloc(&b_gdn_chunk_u, u_elems * sizeof(float)));
+        CK(cudaMalloc(&b_gdn_chunk_gcum, gcum_elems * sizeof(float)));
+        double chunk_mb = (double)(w_elems + u_elems + gcum_elems) * sizeof(float) / (1024.0 * 1024.0);
+        printf("  [GDN] chunk scratch: %.1f MB (NC=%d)\n", chunk_mb, NC);
+
+        // cuBLASLt chunk GDN bf16 scratch buffers
+        size_t kkt_elems   = (size_t)NC * NHpr * GDN_CHUNK_BT * GDN_CHUNK_BT;
+        size_t sk_elems    = (size_t)NC * NHpr * GDN_CHUNK_BT * g_gdn_head_k;
+        size_t sv_elems    = (size_t)NC * NHpr * GDN_CHUNK_BT * g_gdn_head_v;
+        size_t coeff_elems = (size_t)NC * NHpr * GDN_CHUNK_BT;
+        CK(cudaMalloc(&b_gdn_kkt_bf16,  kkt_elems * sizeof(__nv_bfloat16)));
+        CK(cudaMalloc(&b_gdn_sk_bf16,   sk_elems  * sizeof(__nv_bfloat16)));
+        CK(cudaMalloc(&b_gdn_sv_bf16,   sv_elems  * sizeof(__nv_bfloat16)));
+        CK(cudaMalloc(&b_gdn_w_bf16,    sk_elems  * sizeof(__nv_bfloat16)));
+        CK(cudaMalloc(&b_gdn_u_bf16,    sv_elems  * sizeof(__nv_bfloat16)));
+        CK(cudaMalloc(&b_gdn_coeff,     coeff_elems * sizeof(float)));
+        CK(cudaMalloc(&b_gdn_beta_f32,  coeff_elems * sizeof(float)));
+        // h_out: state snapshots for output kernel [(NC+1) * NH * K * V] bf16
+        size_t hout_elems = (size_t)(NC + 1) * NHpr * g_gdn_head_k * g_gdn_head_v;
+        CK(cudaMalloc(&b_gdn_hout, hout_elems * sizeof(__nv_bfloat16)));
+        // v_new: delta values for output kernel [NC * NH * BT * V] float32 (reuse u_buf)
+        double cublas_mb = (double)((kkt_elems + 2*sk_elems + 2*sv_elems) * sizeof(__nv_bfloat16)
+                                    + 2*coeff_elems * sizeof(float)
+                                    + hout_elems * sizeof(float)) / (1024.0 * 1024.0);
+        printf("  [GDN] cuBLASLt chunk scratch: %.1f MB\n", cublas_mb);
+    }
+
+    g_ready = true;
+    printf("Kairos Engine: %lld layers, max_seq=%lld, ctx=%lld, dim=%lld, ffn=%lld, ca_k=%lld, tp=(%d/%d) D/r=%d NH/r=%d FFN/r=%d\n",
+        NL, max_seq, ctx, D, FFN, CA_K_DIM,
+        g_tp_rank, g_tp_world, g_D_per_rank, g_NH_per_rank, g_FFN_per_rank);
+}
+
+// Pre-build GEMMs for a specific seq_len
+void engine_prepare_seq(int64_t seq) {
+    get_gemms((int)seq);
+}
+
+void engine_prepare_ca(int64_t ca_len) {
+    get_ca_gemms((int)ca_len);
+}
+
+// ============================================================
+// Load one layer's weights (BF16 -> FP8 conversion)
+// ============================================================
+void engine_load(int64_t li,
+    torch::Tensor sq, torch::Tensor sk, torch::Tensor sv, torch::Tensor so,
+    torch::Tensor cq, torch::Tensor ck, torch::Tensor cv, torch::Tensor co,
+    torch::Tensor f1, torch::Tensor f2,
+    torch::Tensor sqb, torch::Tensor skb, torch::Tensor svb, torch::Tensor sob,
+    torch::Tensor cqb, torch::Tensor ckb, torch::Tensor cvb, torch::Tensor cob,
+    torch::Tensor f1b, torch::Tensor f2b,
+    torch::Tensor rq, torch::Tensor rk, torch::Tensor crq, torch::Tensor crk,
+    torch::Tensor n2w, torch::Tensor n2b, torch::Tensor sst) {
+    auto& L = g_layers[li];
+
+    // In force_bf16 mode, skip FP8 weights entirely (saves ~50% weight memory)
+    if (!g_force_bf16_gemms) {
+        auto conv = [](torch::Tensor w, void** dst) {
+            auto fp8 = w.to(torch::kFloat8_e4m3fn).contiguous();
+            CK(cudaMalloc(dst, fp8.nbytes()));
+            CK(cudaMemcpy(*dst, fp8.data_ptr(), fp8.nbytes(), cudaMemcpyDeviceToDevice));
+        };
+        conv(sq, &L.sq_w8); conv(sk, &L.sk_w8); conv(sv, &L.sv_w8); conv(so, &L.so_w8);
+        conv(cq, &L.cq_w8); conv(ck, &L.ck_w8); conv(cv, &L.cv_w8); conv(co, &L.co_w8);
+        conv(f1, &L.f1_w8); conv(f2, &L.f2_w8);
+    }
+
+    // BF16 weight copies for force_bf16_gemms mode (CA K/V now pre-computed in Python)
+    if (g_force_bf16_gemms) {
+        auto keep_bf16 = [](torch::Tensor w, __nv_bfloat16** dst) {
+            auto tc = w.to(torch::kBFloat16).contiguous();
+            size_t nbytes = tc.numel() * sizeof(__nv_bfloat16);
+            CK(cudaMalloc((void**)dst, nbytes));
+            CK(cudaMemcpy(*dst, tc.data_ptr(), nbytes, cudaMemcpyDeviceToDevice));
+        };
+        keep_bf16(sq, &L.sq_w16); keep_bf16(sk, &L.sk_w16);
+        keep_bf16(sv, &L.sv_w16); keep_bf16(so, &L.so_w16);
+        keep_bf16(cq, &L.cq_w16); keep_bf16(ck, &L.ck_w16);
+        keep_bf16(cv, &L.cv_w16); keep_bf16(co, &L.co_w16);
+        keep_bf16(f1, &L.f1_w16); keep_bf16(f2, &L.f2_w16);
+    }
+
+    // Persist biases
+    auto persist_bf16 = [](torch::Tensor t, __nv_bfloat16** dst) {
+        auto tc = t.contiguous();
+        size_t nbytes = tc.numel() * sizeof(__nv_bfloat16);
+        CK(cudaMalloc((void**)dst, nbytes));
+        CK(cudaMemcpy(*dst, tc.data_ptr(), nbytes, cudaMemcpyDeviceToDevice));
+    };
+    persist_bf16(sqb, &L.sqb); persist_bf16(skb, &L.skb);
+    persist_bf16(svb, &L.svb); persist_bf16(sob, &L.sob);
+    persist_bf16(cqb, &L.cqb); persist_bf16(ckb, &L.ckb);
+    persist_bf16(cvb, &L.cvb); persist_bf16(cob, &L.cob);
+    persist_bf16(f1b, &L.f1b); persist_bf16(f2b, &L.f2b);
+
+    // Persist norm weights
+    auto persist_f32 = [](torch::Tensor t, float** dst) {
+        TORCH_CHECK(t.scalar_type() == torch::kFloat32, "persist_f32: expected float32");
+        auto tc = t.contiguous();
+        size_t n = tc.numel();
+        CK(cudaMalloc(dst, n * sizeof(float)));
+        CK(cudaMemcpy(*dst, tc.data_ptr<float>(), n * sizeof(float), cudaMemcpyDeviceToDevice));
+    };
+    persist_f32(rq, &L.rms_q); persist_f32(rk, &L.rms_k);
+    persist_f32(crq, &L.ca_rms_q); persist_f32(crk, &L.ca_rms_k);
+    L.has_norm2 = (n2w.numel() > 0);
+    if (L.has_norm2) { persist_f32(n2w, &L.n2w); persist_f32(n2b, &L.n2b); }
+    else { L.n2w = nullptr; L.n2b = nullptr; }
+    persist_f32(sst, &L.sst);
+    L.ffn_dim = f1.size(0);
+    L.ca_k_dim = ck.size(1);
+}
+
+// Load GDN-specific weights for one linear attention layer.
+void engine_load_gdn(int64_t li,
+    torch::Tensor q_w, torch::Tensor k_w, torch::Tensor v_w,
+    torch::Tensor a_w, torch::Tensor b_w,
+    torch::Tensor g_w, torch::Tensor o_w,
+    torch::Tensor q_b, torch::Tensor k_b, torch::Tensor v_b,
+    torch::Tensor a_b, torch::Tensor b_b,
+    torch::Tensor g_b, torch::Tensor o_b,
+    torch::Tensor conv_q_w, torch::Tensor conv_k_w, torch::Tensor conv_v_w,
+    torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor o_norm_w) {
+    auto& L = g_layers[li];
+    L.is_gdn = true;
+    L.gdn_key_dim = g_gdn_key_dim / g_tp_world;
+    L.gdn_value_dim = g_gdn_value_dim / g_tp_world;
+    L.gdn_head_k = g_gdn_head_k;
+    L.gdn_head_v = g_gdn_head_v;
+
+    if (!g_force_bf16_gemms) {
+        auto conv = [](torch::Tensor w, void** dst) {
+            auto fp8 = w.to(torch::kFloat8_e4m3fn).contiguous();
+            CK(cudaMalloc(dst, fp8.nbytes()));
+            CK(cudaMemcpy(*dst, fp8.data_ptr(), fp8.nbytes(), cudaMemcpyDeviceToDevice));
+        };
+        conv(q_w, &L.gdn_q_w8); conv(k_w, &L.gdn_k_w8); conv(v_w, &L.gdn_v_w8);
+        conv(a_w, &L.gdn_a_w8); conv(b_w, &L.gdn_b_w8);
+        conv(g_w, &L.gdn_g_w8); conv(o_w, &L.gdn_o_w8);
+    }
+
+    // Keep BF16 weight copies for force_bf16_gemms mode (q/k/v/g/o only — a/b already have bf16)
+    if (g_force_bf16_gemms) {
+        auto keep_bf16 = [](torch::Tensor w, __nv_bfloat16** dst) {
+            auto tc = w.to(torch::kBFloat16).contiguous();
+            size_t nbytes = tc.numel() * sizeof(__nv_bfloat16);
+            CK(cudaMalloc((void**)dst, nbytes));
+            CK(cudaMemcpy(*dst, tc.data_ptr(), nbytes, cudaMemcpyDeviceToDevice));
+        };
+        keep_bf16(q_w, &L.gdn_q_w16); keep_bf16(k_w, &L.gdn_k_w16);
+        keep_bf16(v_w, &L.gdn_v_w16); keep_bf16(g_w, &L.gdn_g_w16);
+        keep_bf16(o_w, &L.gdn_o_w16);
+    }
+
+    auto persist_bf16 = [](torch::Tensor t, __nv_bfloat16** dst) {
+        if (t.numel() == 0) { *dst = nullptr; return; }
+        auto tc = t.contiguous();
+        size_t nbytes = tc.numel() * sizeof(__nv_bfloat16);
+        CK(cudaMalloc((void**)dst, nbytes));
+        CK(cudaMemcpy(*dst, tc.data_ptr(), nbytes, cudaMemcpyDeviceToDevice));
+    };
+    persist_bf16(q_b, &L.gdn_qb); persist_bf16(k_b, &L.gdn_kb); persist_bf16(v_b, &L.gdn_vb);
+    persist_bf16(a_b, &L.gdn_ab); persist_bf16(b_b, &L.gdn_bb);
+    persist_bf16(g_b, &L.gdn_gb); persist_bf16(o_b, &L.gdn_ob);
+    // BF16 copies of a/b weights for BF16Gemm path (FP8 doesn't support N=20)
+    persist_bf16(a_w.to(torch::kBFloat16).contiguous(), &L.gdn_a_w_bf16);
+    persist_bf16(b_w.to(torch::kBFloat16).contiguous(), &L.gdn_b_w_bf16);
+
+    auto persist_f32 = [](torch::Tensor t, float** dst) {
+        auto tc = t.contiguous();
+        CK(cudaMalloc(dst, tc.numel() * sizeof(float)));
+        CK(cudaMemcpy(*dst, tc.data_ptr<float>(), tc.numel() * sizeof(float), cudaMemcpyDeviceToDevice));
+    };
+    // Conv weights: reshape from [C, 1, K] to [C, K]
+    persist_f32(conv_q_w.squeeze(1).to(torch::kFloat32), &L.gdn_conv_q_w);
+    persist_f32(conv_k_w.squeeze(1).to(torch::kFloat32), &L.gdn_conv_k_w);
+    persist_f32(conv_v_w.squeeze(1).to(torch::kFloat32), &L.gdn_conv_v_w);
+    persist_f32(A_log.to(torch::kFloat32), &L.gdn_A_log);
+    persist_f32(dt_bias.to(torch::kFloat32), &L.gdn_dt_bias);
+    persist_f32(o_norm_w.to(torch::kFloat32), &L.gdn_o_norm_w);
+}
+
+void engine_reset_gdn_state() {
+    if (b_gdn_state && g_n_gdn_layers > 0) {
+        int NHpr = g_NH_per_rank;
+        size_t total = (size_t)g_n_gdn_layers * NHpr * g_gdn_head_k * g_gdn_head_v * sizeof(float);
+        CK(cudaMemset(b_gdn_state, 0, total));
+    }
+}
+
+// Write pre-computed CA K/V into the cache for one layer
+// This lets Python pre-compute CA K/V using stock PyTorch ops
+// and inject them, bypassing the engine's cuBLASLt GEMM + RMSNorm.
+void engine_set_ca_kv_cache(int64_t layer, torch::Tensor k_t, torch::Tensor v_t) {
+    TORCH_CHECK(g_ready, "engine not initialized");
+    int Dpr = g_D_per_rank;
+    int ctx_rows = (int)k_t.size(0);
+    TORCH_CHECK(ctx_rows <= g_ctx, "ctx_rows > g_ctx");
+    TORCH_CHECK(k_t.size(1) == Dpr, "K dim mismatch");
+    TORCH_CHECK(v_t.size(0) == ctx_rows && v_t.size(1) == Dpr, "V shape mismatch");
+    size_t slot = (size_t)layer * (size_t)g_ctx * (size_t)Dpr;
+    size_t bytes = (size_t)ctx_rows * Dpr * sizeof(__nv_bfloat16);
+    CK(cudaMemcpy(b_ca_k_cache + slot, k_t.data_ptr(), bytes, cudaMemcpyDeviceToDevice));
+    CK(cudaMemcpy(b_ca_v_cache + slot, v_t.data_ptr(), bytes, cudaMemcpyDeviceToDevice));
+}
+
+void engine_set_ca_kv_cache_valid(bool v, int64_t actual_ctx) {
+    g_ca_kv_cache_valid = v;
+    if (actual_ctx > 0 && (int)actual_ctx != g_actual_ctx) {
+        g_actual_ctx = (int)actual_ctx;
+        // Must rebuild CA SDPA for new K/V length
+        g_ca_gemms_by_len.clear();
+    }
+}
+
+// Invalidate CA K/V cache
+void engine_invalidate_ca_kv_cache() {
+    g_ca_kv_cache_valid = false;
+}
+
+// Toggle cuBLASLt chunk GDN (true) vs fused recurrent (false)
+void engine_set_gdn_cublas_chunk(bool enable) {
+    g_gdn_use_cublas_chunk = enable;
+    printf("  [GDN] cuBLASLt chunk mode: %s\n", enable ? "ON" : "OFF");
+}
+
+// ============================================================
+// Forward core: runs layers [start_layer, end_layer)
+// Handles both quadratic attention and GatedDeltaNet layers.
+// ============================================================
+static void forward_core(
+    __nv_bfloat16* x, __nv_bfloat16* enc,
+    float* temb_base, float* ssts_base, float* rope_freqs,
+    int seq, int ca_len, int temb_row_stride,
+    int start_layer, int end_layer,
+    cudaStream_t stream) {
+    int D = g_D, ctx = g_actual_ctx > 0 ? g_actual_ctx : g_ctx;
+    int NH = g_NH, HD = g_HD, FFN = g_FFN;
+    int Dpr = g_D_per_rank, NHpr = g_NH_per_rank, FFNpr = g_FFN_per_rank;
+    int seq_D = seq * D;
+    int seq_Dpr = seq * Dpr;
+    int seq_FFNpr = seq * FFNpr;
+    const bool TP = (g_tp_world > 1);
+
+    // Get GEMMs/SDPA (creates if not cached)
+    SeqGemms* gm = get_gemms(seq);
+    CaGemms* cg = get_ca_gemms(ca_len);
+    int ca_len_Dpr = ca_len * Dpr;
+
+    // Convert encoder to FP8 once (skip in force_bf16 mode — use enc directly)
+    if (DO_EWISE && !g_force_bf16_gemms) k_bf16_to_fp8<<<g_nsm, 256, 0, stream>>>(b_enc_fp8, enc, ctx * g_CA_K_DIM);
+
+    size_t ssts_layer_stride = (size_t)6 * D;
+
+    // Kairos modulation order: [scale_sa, shift_sa, gate_sa, scale_ffn, shift_ffn, gate_ffn]
+    // temb layout per row follows the same order.
+
+    // GatedDeltaNet layer indices (every 4th starting at 3)
+    // These layers are skipped by the engine and handled in Python.
+    auto is_gdn_layer = [](int li) -> bool {
+        return (li % 4 == 3);
+    };
+
+    // Optional per-phase timing
+    const char* time_env = getenv("ENGINE_TIME");
+    const bool DO_TIME = (time_env && atoi(time_env) == 1);
+    const int NPHASES = 11;  // SA_LN, SA_QKV, SA_SDPA, SA_O, CA_LN, CA_QKV, CA_SDPA, CA_O, FFN_LN, FFN1, FFN2
+    std::vector<cudaEvent_t> evs;
+    int n_quadratic = 0;
+    if (DO_TIME) {
+        for (int li = start_layer; li < end_layer; li++) {
+            if (!is_gdn_layer(li)) n_quadratic++;
+        }
+        evs.resize((NPHASES + 1) * n_quadratic);
+        for (auto& e : evs) cudaEventCreate(&e);
+    }
+    int quad_idx = 0;
+    auto TREC = [&](int idx) {
+        if (DO_TIME) cudaEventRecord(evs[quad_idx * (NPHASES + 1) + idx], stream);
+    };
+
+    bool sa_ln_fused_from_prev = false;
+
+    for (int li = start_layer; li < end_layer; li++) {
+        const auto& L = g_layers[li];
+        float* ssts_L = ssts_base + li * ssts_layer_stride;
+
+        // Kairos modulation order: [scale_sa, shift_sa, gate_sa, scale_ffn, shift_ffn, gate_ffn]
+        float* ssts_scale_sa  = ssts_L + 0 * D;
+        float* ssts_shift_sa  = ssts_L + 1 * D;
+        float* ssts_gate_sa   = ssts_L + 2 * D;
+        float* ssts_scale_ffn = ssts_L + 3 * D;
+        float* ssts_shift_ffn = ssts_L + 4 * D;
+        float* ssts_gate_ffn  = ssts_L + 5 * D;
+
+        // temb layout per row: [6, D] matching modulation order
+        float* temb_scale_sa  = temb_base + 0 * D;
+        float* temb_shift_sa  = temb_base + 1 * D;
+        float* temb_gate_sa   = temb_base + 2 * D;
+        float* temb_scale_ffn = temb_base + 3 * D;
+        float* temb_shift_ffn = temb_base + 4 * D;
+        float* temb_gate_ffn  = temb_base + 5 * D;
+
+        if (is_gdn_layer(li) && L.is_gdn) {
+            // ---- GatedDeltaNet path ----
+            // SA LN + AdaLN — write BOTH bf16 (for a/b BF16 GEMMs) and fp8 (for FP8 GEMMs)
+            if (DO_EWISE && !sa_ln_fused_from_prev) {
+                k_ln_adaln_ssts<<<seq, 256, (size_t)D*sizeof(__nv_bfloat16), stream>>>(x, b_norm, b_norm_fp8,
+                    ssts_scale_sa, ssts_shift_sa, temb_scale_sa, temb_shift_sa, D, temb_row_stride);
+            }
+            sa_ln_fused_from_prev = false;
+
+            int KDpr = L.gdn_key_dim, VDpr = L.gdn_value_dim;
+            int NHpr = g_NH_per_rank;
+            int hk = L.gdn_head_k, hv = L.gdn_head_v;
+
+            // Projections: q/k/v/g use FP8, a/b use BF16 (N=20 too small for FP8)
+            if (DO_GEMM) {
+                if (g_force_bf16_gemms) {
+                    gm->gdn_q_bf16.run(g_ltH, L.gdn_q_w16, b_norm, b_gdn_q, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.gdn_qb);
+                    gm->gdn_k_bf16.run(g_ltH, L.gdn_k_w16, b_norm, b_gdn_k, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.gdn_kb);
+                    gm->gdn_v_bf16.run(g_ltH, L.gdn_v_w16, b_norm, b_gdn_v, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.gdn_vb);
+                    gm->gdn_g_bf16.run(g_ltH, L.gdn_g_w16, b_norm, b_gdn_g, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.gdn_gb);
+                } else {
+                    gm->gdn_q.run(g_ltH, L.gdn_q_w8, b_norm_fp8, b_gdn_q, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.gdn_qb);
+                    gm->gdn_k.run(g_ltH, L.gdn_k_w8, b_norm_fp8, b_gdn_k, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.gdn_kb);
+                    gm->gdn_v.run(g_ltH, L.gdn_v_w8, b_norm_fp8, b_gdn_v, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.gdn_vb);
+                    gm->gdn_g.run(g_ltH, L.gdn_g_w8, b_norm_fp8, b_gdn_g, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.gdn_gb);
+                }
+                gm->gdn_a.run(g_ltH, L.gdn_a_w_bf16, b_norm, b_gdn_a, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.gdn_ab);
+                gm->gdn_b.run(g_ltH, L.gdn_b_w_bf16, b_norm, b_gdn_b, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.gdn_bb);
+            }
+
+            // Causal depthwise conv + SiLU on Q, K, V
+            if (DO_EWISE) {
+                int conv_k = g_gdn_conv_k;
+                int blk = (KDpr * seq + 255) / 256;
+                k_causal_dw_conv_silu<<<blk, 256, 0, stream>>>(b_gdn_q, b_gdn_conv_scratch, L.gdn_conv_q_w, seq, KDpr, conv_k);
+                CK(cudaMemcpyAsync(b_gdn_q, b_gdn_conv_scratch, (size_t)seq * KDpr * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+                k_causal_dw_conv_silu<<<blk, 256, 0, stream>>>(b_gdn_k, b_gdn_conv_scratch, L.gdn_conv_k_w, seq, KDpr, conv_k);
+                CK(cudaMemcpyAsync(b_gdn_k, b_gdn_conv_scratch, (size_t)seq * KDpr * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+                int blk_v = (VDpr * seq + 255) / 256;
+                k_causal_dw_conv_silu<<<blk_v, 256, 0, stream>>>(b_gdn_v, b_gdn_conv_scratch, L.gdn_conv_v_w, seq, VDpr, conv_k);
+                CK(cudaMemcpyAsync(b_gdn_v, b_gdn_conv_scratch, (size_t)seq * VDpr * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+            }
+
+            // Compute gates: beta and g
+            if (DO_EWISE) {
+                int blk_g = (seq * NHpr + 255) / 256;
+                k_gdn_compute_gates<<<blk_g, 256, 0, stream>>>(
+                    b_gdn_a, b_gdn_b, L.gdn_A_log, L.gdn_dt_bias,
+                    b_gdn_gates_g, b_gdn_gates_beta, seq, NHpr);
+            }
+
+            // GDN forward: cuBLASLt chunk or fused recurrent
+            // Q, K are [seq, KDpr] = [seq, NHpr*hk], need [seq, NHpr, hk] view (already contiguous)
+            // V is [seq, VDpr] = [seq, NHpr*hv], need [seq, NHpr, hv] view
+            if (DO_EWISE) {
+                // Find GDN layer index for state offset
+                int gdn_idx = 0;
+                for (int gi = 0; gi < (int)g_gdn_layer_indices.size(); gi++) {
+                    if (g_gdn_layer_indices[gi] == li) { gdn_idx = gi; break; }
+                }
+                size_t state_per_layer = (size_t)NHpr * hk * hv;
+                float* layer_state = b_gdn_state + gdn_idx * state_per_layer;
+                float sc = 1.f / sqrtf((float)hk);
+
+                if (g_gdn_use_cublas_chunk && b_gdn_kkt_bf16 != nullptr) {
+                    // cuBLASLt chunk GDN: phases 1-4
+                    // Q/K L2-norm is handled inside the chunk kernels
+                    // (prepare kernel normalizes K, state kernel normalizes Q)
+                    // But we still need to L2-norm Q for the state kernel (it reads raw Q)
+                    // The k_gdn_chunk_state_output kernel normalizes Q inline, so no pre-norm needed.
+                    gdn_cublas_chunk_forward(
+                        b_gdn_q, b_gdn_k, b_gdn_v,
+                        b_gdn_gates_g, b_gdn_gates_beta,
+                        b_gdn_out, layer_state,
+                        b_gdn_chunk_w, b_gdn_chunk_u, b_gdn_chunk_gcum,
+                        seq, NHpr, hk, hv, sc, stream);
+                } else {
+                    // Legacy: pre-normalize Q and K (L2 norm + scale)
+                    k_gdn_l2norm_scale<<<dim3(seq, NHpr), 256, 0, stream>>>(
+                        b_gdn_q, b_gdn_k, hk, sc);
+
+                    // Persistent GDN recurrent — Triton-style work stealing
+                    int NV_blocks = hv / GDN_BV;
+                    int total_tiles = NHpr * NV_blocks;
+                    int zero = 0;
+                    cudaMemcpyToSymbolAsync(g_gdn_work_counter, &zero, sizeof(int), 0,
+                                            cudaMemcpyHostToDevice, stream);
+                    int n_persistent = std::min(total_tiles, g_nsm * 8);
+                    k_gdn_recurrent<<<n_persistent, 32, 0, stream>>>(
+                        b_gdn_q, b_gdn_k, b_gdn_v,
+                        b_gdn_gates_g, b_gdn_gates_beta,
+                        b_gdn_out, layer_state,
+                        seq, NHpr, hk, hv, sc, total_tiles);
+                }
+            }
+
+            // RMSNorm + SiLU gating
+            if (DO_EWISE) {
+                k_gdn_rmsnorm_silu_gate<<<seq * NHpr, 256, 0, stream>>>(
+                    b_gdn_out, b_gdn_g, L.gdn_o_norm_w,
+                    b_gdn_out, seq, NHpr, hv);
+            }
+
+            // Output projection (row-parallel)
+            if (g_force_bf16_gemms) {
+                if (DO_GEMM) gm->gdn_o_bf16.run(g_ltH, L.gdn_o_w16, b_gdn_out, b_sa_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.gdn_ob);
+            } else {
+                // BF16->FP8 for output projection
+                if (DO_EWISE) k_bf16_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_gdn_out_fp8, b_gdn_out, seq * VDpr);
+                if (DO_GEMM) gm->gdn_o.run(g_ltH, L.gdn_o_w8, b_gdn_out_fp8, b_sa_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.gdn_ob);
+            }
+            if (TP) {
+                CKNCCL(ncclAllReduce(b_sa_out, b_sa_out, (size_t)seq_D, ncclBfloat16, ncclSum, g_nccl_comm, stream));
+            }
+
+            // Gate residual (same as quadratic)
+            if (DO_EWISE) k_gate_res_ssts<<<8*g_nsm, 256, 0, stream>>>(x, b_sa_out, ssts_gate_sa, temb_gate_sa, seq, D, temb_row_stride);
+
+            // ---- CA + FFN (identical to quadratic path) ----
+          if (!g_skip_ca) {
+            // CA LN (affine)
+            if (DO_EWISE) {
+                if (L.has_norm2) {
+                    k_ln_affine<<<ca_len, 256, 0, stream>>>(x, b_ca_norm, b_ca_norm_fp8, L.n2w, L.n2b, D);
+                } else if (!g_force_bf16_gemms) {
+                    k_bf16_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_ca_norm_fp8, x, ca_len * D);
+                }
+            }
+            // CA Q/K/V
+            if (DO_GEMM) {
+                if (g_force_bf16_gemms) {
+                    __nv_bfloat16* ca_norm_bf16 = L.has_norm2 ? b_ca_norm : x;
+                    cg->cq_bf16.run(g_ltH, L.cq_w16, ca_norm_bf16, b_ca_q, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.cqb);
+                } else {
+                    cg->cq.run(g_ltH, L.cq_w8, b_ca_norm_fp8, b_ca_q, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.cqb);
+                }
+            }
+            __nv_bfloat16* ca_k_ptr;
+            __nv_bfloat16* ca_v_ptr;
+            size_t ca_kv_slot = (size_t)li * (size_t)g_ctx * (size_t)Dpr;  // use g_ctx for consistent cache slot
+            if (g_ca_kv_cache_valid) {
+                ca_k_ptr = b_ca_k_cache + ca_kv_slot;
+                ca_v_ptr = b_ca_v_cache + ca_kv_slot;
+            } else {
+                if (DO_GEMM) {
+                    if (g_force_bf16_gemms) {
+                        g_ck_bf16.run(g_ltH, L.ck_w16, enc, b_ca_k, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.ckb);
+                        g_cv_bf16.run(g_ltH, L.cv_w16, enc, b_ca_v, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.cvb);
+                    } else {
+                        g_ck.run(g_ltH, L.ck_w8, b_enc_fp8, b_ca_k, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.ckb);
+                        g_cv.run(g_ltH, L.cv_w8, b_enc_fp8, b_ca_v, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.cvb);
+                    }
+                }
+                ca_k_ptr = b_ca_k;
+                ca_v_ptr = b_ca_v;
+            }
+            // CA RMSNorm
+            if (DO_EWISE) {
+                if (!TP) {
+                    k_rmsnorm<<<ca_len, 256, 0, stream>>>(b_ca_q, L.ca_rms_q, Dpr);
+                    if (!g_ca_kv_cache_valid) k_rmsnorm<<<ctx, 256, 0, stream>>>(b_ca_k, L.ca_rms_k, Dpr);
+                } else {
+                    k_partial_sumsq<<<ca_len, 256, 0, stream>>>(b_ca_q, b_tp_sumsq_cq, Dpr);
+                    if (!g_ca_kv_cache_valid) {
+                        k_partial_sumsq<<<ctx, 256, 0, stream>>>(b_ca_k, b_tp_sumsq_ck, Dpr);
+                        ncclGroupStart();
+                        CKNCCL(ncclAllReduce(b_tp_sumsq_cq, b_tp_sumsq_cq, (size_t)ca_len, ncclFloat32, ncclSum, g_nccl_comm, stream));
+                        CKNCCL(ncclAllReduce(b_tp_sumsq_ck, b_tp_sumsq_ck, (size_t)ctx, ncclFloat32, ncclSum, g_nccl_comm, stream));
+                        ncclGroupEnd();
+                    } else {
+                        CKNCCL(ncclAllReduce(b_tp_sumsq_cq, b_tp_sumsq_cq, (size_t)ca_len, ncclFloat32, ncclSum, g_nccl_comm, stream));
+                    }
+                    size_t smem_rr = (size_t)Dpr * sizeof(__nv_bfloat16);
+                    k_apply_rmsnorm_rope<<<ca_len, 256, smem_rr, stream>>>(b_ca_q, L.ca_rms_q, nullptr, b_tp_sumsq_cq, D, NHpr, HD);
+                    if (!g_ca_kv_cache_valid)
+                        k_apply_rmsnorm_rope<<<ctx, 256, smem_rr, stream>>>(b_ca_k, L.ca_rms_k, nullptr, b_tp_sumsq_ck, D, NHpr, HD);
+                }
+                if (!g_ca_kv_cache_valid) {
+                    CK(cudaMemcpyAsync(b_ca_k_cache + ca_kv_slot, b_ca_k, (size_t)ctx * Dpr * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+                    CK(cudaMemcpyAsync(b_ca_v_cache + ca_kv_slot, b_ca_v, (size_t)ctx * Dpr * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+                }
+            }
+            // CA SDPA
+            if (DO_SDPA) {
+                if (li == 0 && start_layer == 0) {
+                }
+                if (g_use_torch_sdpa) {
+                    float ca_scale = 1.0f / sqrtf((float)HD);
+                    torch_sdpa_bf16(b_ca_q, ca_k_ptr, ca_v_ptr, b_ca_out, ca_len, ctx, NHpr, HD, ca_scale, stream);
+                } else {
+                    cg->ca_sdpa.run(g_cudnnH, b_ca_q, ca_k_ptr, ca_v_ptr, b_ca_out, stream);
+                }
+            }
+            // CA_O (ungated residual)
+            if (g_force_bf16_gemms) {
+                if (!TP) {
+                    if (DO_GEMM) cg->co_bf16.run(g_ltH, L.co_w16, b_ca_out, x, g_gemm_ws, 32*1024*1024, 1.f, 1.f, stream, L.cob);
+                } else {
+                    if (DO_GEMM) cg->co_bf16.run(g_ltH, L.co_w16, b_ca_out, b_sa_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.cob);
+                    CKNCCL(ncclAllReduce(b_sa_out, b_sa_out, (size_t)ca_len * D, ncclBfloat16, ncclSum, g_nccl_comm, stream));
+                    if (DO_EWISE) k_add_vec<<<8*g_nsm, 256, 0, stream>>>(x, b_sa_out, ca_len * D);
+                }
+            } else {
+                if (DO_EWISE) k_bf16_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_ca_out_fp8, b_ca_out, ca_len_Dpr);
+                if (!TP) {
+                    if (DO_GEMM) cg->co.run(g_ltH, L.co_w8, b_ca_out_fp8, x, g_gemm_ws, 32*1024*1024, 1.f, 1.f, stream, L.cob);
+                } else {
+                    if (DO_GEMM) cg->co.run(g_ltH, L.co_w8, b_ca_out_fp8, b_sa_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.cob);
+                    CKNCCL(ncclAllReduce(b_sa_out, b_sa_out, (size_t)ca_len * D, ncclBfloat16, ncclSum, g_nccl_comm, stream));
+                    if (DO_EWISE) k_add_vec<<<8*g_nsm, 256, 0, stream>>>(x, b_sa_out, ca_len * D);
+                }
+            }
+          } // end if (!g_skip_ca) — GDN CA path
+            // FFN LN
+            if (DO_EWISE) {
+                k_ln_adaln_ssts<<<seq, 256, (size_t)D*sizeof(__nv_bfloat16), stream>>>(x, b_ffn_norm, b_ffn_norm_fp8,
+                    ssts_scale_ffn, ssts_shift_ffn, temb_scale_ffn, temb_shift_ffn, D, temb_row_stride);
+            }
+            // FFN1 + SiLU
+            if (g_force_bf16_gemms) {
+                if (DO_GEMM) gm->f1_bf16.run(g_ltH, L.f1_w16, b_ffn_norm, b_ffn_mid, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f1b);
+                if (DO_EWISE) k_silu_bf16<<<(seq_FFNpr + 255) / 256, 256, 0, stream>>>(b_ffn_mid, seq_FFNpr);
+            } else {
+                if (DO_GEMM) gm->f1.run(g_ltH, L.f1_w8, b_ffn_norm_fp8, b_ffn_mid, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f1b);
+                if (DO_EWISE) k_silu_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_ffn_mid, b_ffn_mid_fp8, seq_FFNpr);
+            }
+            // FFN2
+            if (g_force_bf16_gemms) {
+                if (DO_GEMM) gm->f2_bf16.run(g_ltH, L.f2_w16, b_ffn_mid, b_ffn_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f2b);
+            } else {
+                if (DO_GEMM) gm->f2.run(g_ltH, L.f2_w8, b_ffn_mid_fp8, b_ffn_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f2b);
+            }
+            if (TP) CKNCCL(ncclAllReduce(b_ffn_out, b_ffn_out, (size_t)seq_D, ncclBfloat16, ncclSum, g_nccl_comm, stream));
+            // FFN gate residual (with optional fusion to next layer)
+            if (DO_EWISE) {
+                int next_quad = -1;  // DISABLED: force separate gate + LN to debug
+                if (false && next_quad >= 0) {
+                    float* ssts_L_next = ssts_base + next_quad * ssts_layer_stride;
+                    float* next_ssts_scale_sa = ssts_L_next + 0 * D;
+                    float* next_ssts_shift_sa = ssts_L_next + 1 * D;
+                    size_t smem_fused = (size_t)(D + 16) * sizeof(float);
+                    k_gate_res_ln_adaln_ssts<<<seq, 256, smem_fused, stream>>>(
+                        x, b_ffn_out, ssts_gate_ffn, temb_gate_ffn,
+                        next_ssts_scale_sa, next_ssts_shift_sa,
+                        temb_scale_sa, temb_shift_sa,
+                        g_force_bf16_gemms ? b_norm : nullptr, b_norm_fp8, D, temb_row_stride);
+                    sa_ln_fused_from_prev = true;
+                } else {
+                    k_gate_res_ssts<<<8*g_nsm, 256, 0, stream>>>(x, b_ffn_out, ssts_gate_ffn, temb_gate_ffn, seq, D, temb_row_stride);
+                }
+            }
+        } else {
+            // ---- Quadratic attention path (existing code) ----
+            if (DO_TIME) TREC(0);
+
+            // ---- SA LN + AdaLN ----
+            if (DO_EWISE && !sa_ln_fused_from_prev) {
+                // Always write both BF16 and FP8 outputs (BF16 needed for force_bf16 mode and a/b GEMMs)
+                k_ln_adaln_ssts<<<seq, 256, (size_t)D*sizeof(__nv_bfloat16), stream>>>(x, b_norm, b_norm_fp8,
+                    ssts_scale_sa, ssts_shift_sa, temb_scale_sa, temb_shift_sa, D, temb_row_stride);
+            }
+            sa_ln_fused_from_prev = false;
+            if (DO_TIME) TREC(1);
+
+            // ---- SA Q/K/V (bias fused in epilogue) ----
+            if (g_force_bf16_gemms) {
+                if (DO_GEMM) gm->sq_bf16.run(g_ltH, L.sq_w16, b_norm, b_q, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.sqb);
+                if (DO_GEMM) gm->sk_bf16.run(g_ltH, L.sk_w16, b_norm, b_k, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.skb);
+                if (DO_GEMM) gm->sv_bf16.run(g_ltH, L.sv_w16, b_norm, b_v, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.svb);
+            } else {
+                if (DO_GEMM) gm->sq.run(g_ltH, L.sq_w8, b_norm_fp8, b_q, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.sqb);
+                if (DO_GEMM) gm->sk.run(g_ltH, L.sk_w8, b_norm_fp8, b_k, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.skb);
+                if (DO_GEMM) gm->sv.run(g_ltH, L.sv_w8, b_norm_fp8, b_v, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.svb);
+            }
+
+            // ---- RMSNorm + RoPE for Q and K ----
+            bool q_fp8_fused = false, k_fp8_fused = false;
+            if (DO_EWISE) {
+                if (!TP) {
+                    if (rope_freqs && g_fp8_sdpa_enabled) {
+                        size_t smem_rr = (size_t)Dpr * sizeof(__nv_bfloat16);
+                        k_rmsnorm_rope_fp8<<<seq, 256, smem_rr, stream>>>(b_q, b_q_fp8_attn, L.rms_q, rope_freqs, NHpr, HD);
+                        k_rmsnorm_rope_fp8<<<seq, 256, smem_rr, stream>>>(b_k, b_k_fp8_attn, L.rms_k, rope_freqs, NHpr, HD);
+                        q_fp8_fused = true;
+                        k_fp8_fused = true;
+                    } else if (rope_freqs) {
+                        size_t smem_rr = (size_t)Dpr * sizeof(__nv_bfloat16);
+                        k_rmsnorm_rope<<<seq, 256, smem_rr, stream>>>(b_q, L.rms_q, rope_freqs, NHpr, HD);
+                        k_rmsnorm_rope<<<seq, 256, smem_rr, stream>>>(b_k, L.rms_k, rope_freqs, NHpr, HD);
+                    } else {
+                        k_rmsnorm<<<seq, 256, 0, stream>>>(b_q, L.rms_q, Dpr);
+                        k_rmsnorm<<<seq, 256, 0, stream>>>(b_k, L.rms_k, Dpr);
+                    }
+                } else {
+                    // TP: 2-phase RMSNorm
+                    float* sumsq_q = b_tp_sumsq_qk;
+                    float* sumsq_k = b_tp_sumsq_qk + seq;
+                    k_partial_sumsq<<<seq, 256, 0, stream>>>(b_q, sumsq_q, Dpr);
+                    k_partial_sumsq<<<seq, 256, 0, stream>>>(b_k, sumsq_k, Dpr);
+                    CKNCCL(ncclAllReduce(b_tp_sumsq_qk, b_tp_sumsq_qk, (size_t)2 * seq, ncclFloat32, ncclSum, g_nccl_comm, stream));
+                    size_t smem_rr = (size_t)Dpr * sizeof(__nv_bfloat16);
+                    if (g_fp8_sdpa_enabled) {
+                        k_apply_rmsnorm_rope_fp8<<<seq, 256, smem_rr, stream>>>(b_q, b_q_fp8_attn, L.rms_q, rope_freqs, sumsq_q, D, NHpr, HD);
+                        k_apply_rmsnorm_rope_fp8<<<seq, 256, smem_rr, stream>>>(b_k, b_k_fp8_attn, L.rms_k, rope_freqs, sumsq_k, D, NHpr, HD);
+                        q_fp8_fused = true;
+                        k_fp8_fused = true;
+                    } else {
+                        k_apply_rmsnorm_rope<<<seq, 256, smem_rr, stream>>>(b_q, L.rms_q, rope_freqs, sumsq_q, D, NHpr, HD);
+                        k_apply_rmsnorm_rope<<<seq, 256, smem_rr, stream>>>(b_k, L.rms_k, rope_freqs, sumsq_k, D, NHpr, HD);
+                    }
+                }
+            }
+            if (DO_TIME) TREC(2);
+
+            // ---- SDPA ----
+            if (g_sdpa_backend == SdpaBackend::SageAttn3Py) {
+                if (DO_SDPA) {
+                    sageattn3_py_bf16(b_q, b_k, b_v, b_attn, seq, seq, NHpr, HD, stream);
+                }
+                if (DO_TIME) TREC(3);
+                if (DO_EWISE && !g_force_bf16_gemms) {
+                    k_bf16_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_sa_out_fp8, b_attn, seq_Dpr);
+                }
+            } else if (g_sdpa_backend == SdpaBackend::SageAttn3Cpp) {
+                if (DO_SDPA) {
+                    sageattn3_cpp_bf16(b_q, b_k, b_v, b_attn, seq, seq, NHpr, HD, stream);
+                }
+                if (DO_TIME) TREC(3);
+                if (DO_EWISE && !g_force_bf16_gemms) {
+                    k_bf16_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_sa_out_fp8, b_attn, seq_Dpr);
+                }
+            } else if (g_fp8_sdpa_enabled && gm->fp8_sdpa_built && !g_force_bf16_gemms) {
+                if (DO_EWISE) {
+                    if (!q_fp8_fused) {
+                        k_bf16_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_q_fp8_attn, b_q, seq_Dpr);
+                    }
+                    if (!k_fp8_fused) {
+                        k_bf16_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_k_fp8_attn, b_k, seq_Dpr);
+                    }
+                    k_bf16_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_v_fp8_attn, b_v, seq_Dpr);
+                }
+                if (DO_SDPA) {
+                    gm->sa_sdpa_fp8.run(g_cudnnH,
+                        b_q_fp8_attn, b_k_fp8_attn, b_v_fp8_attn, b_sa_out_fp8,
+                        g_fp8_sdpa_descale_q, g_fp8_sdpa_descale_k, g_fp8_sdpa_descale_v,
+                        g_fp8_sdpa_descale_s, g_fp8_sdpa_scale_s, g_fp8_sdpa_scale_o,
+                        g_fp8_sdpa_amax_s, g_fp8_sdpa_amax_o, stream);
+                }
+                if (DO_TIME) TREC(3);
+            } else {
+                if (DO_SDPA) {
+                    if (g_use_torch_sdpa) {
+                        float sa_scale = 1.0f / sqrtf((float)HD);
+                        torch_sdpa_bf16(b_q, b_k, b_v, b_attn, seq, seq, NHpr, HD, sa_scale, stream);
+                    } else {
+                        gm->sa_sdpa.run(g_cudnnH, b_q, b_k, b_v, b_attn, stream);
+                    }
+                }
+                if (DO_TIME) TREC(3);
+                if (DO_EWISE && !g_force_bf16_gemms) k_bf16_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_sa_out_fp8, b_attn, seq_Dpr);
+            }
+
+            // ---- SA_O GEMM (row-parallel) ----
+            if (g_force_bf16_gemms) {
+                // In force BF16 mode: SDPA output is b_attn (BF16), use BF16 GEMM
+                if (DO_GEMM) gm->so_bf16.run(g_ltH, L.so_w16, b_attn, b_sa_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.sob);
+            } else {
+                if (DO_GEMM) gm->so.run(g_ltH, L.so_w8, b_sa_out_fp8, b_sa_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.sob);
+            }
+
+            // TP AllReduce for SA_O
+            if (TP) {
+                CKNCCL(ncclAllReduce(b_sa_out, b_sa_out, (size_t)seq_D, ncclBfloat16, ncclSum, g_nccl_comm, stream));
+            }
+
+            // ---- SA gated residual ----
+            if (DO_EWISE) k_gate_res_ssts<<<8*g_nsm, 256, 0, stream>>>(x, b_sa_out, ssts_gate_sa, temb_gate_sa, seq, D, temb_row_stride);
+            if (DO_TIME) TREC(4);
+
+          if (!g_skip_ca) {
+            // ---- CA norm2 (affine LN, cross_attn_norm) applied to ALL tokens ----
+            if (DO_EWISE) {
+                if (L.has_norm2) {
+                    k_ln_affine<<<ca_len, 256, 0, stream>>>(x, b_ca_norm, b_ca_norm_fp8, L.n2w, L.n2b, D);
+                } else if (!g_force_bf16_gemms) {
+                    k_bf16_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_ca_norm_fp8, x, ca_len * D);
+                }
+            }
+            if (DO_TIME) TREC(5);
+
+            // ---- CA Q/K/V ----
+            if (DO_GEMM) {
+                if (g_force_bf16_gemms) {
+                    __nv_bfloat16* ca_norm_bf16 = L.has_norm2 ? b_ca_norm : x;
+                    cg->cq_bf16.run(g_ltH, L.cq_w16, ca_norm_bf16, b_ca_q, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.cqb);
+                } else {
+                    cg->cq.run(g_ltH, L.cq_w8, b_ca_norm_fp8, b_ca_q, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.cqb);
+                }
+            }
+            __nv_bfloat16* ca_k_ptr;
+            __nv_bfloat16* ca_v_ptr;
+            size_t ca_kv_slot = (size_t)li * (size_t)g_ctx * (size_t)Dpr;  // use g_ctx for consistent cache slot
+            if (g_ca_kv_cache_valid) {
+                ca_k_ptr = b_ca_k_cache + ca_kv_slot;
+                ca_v_ptr = b_ca_v_cache + ca_kv_slot;
+            } else {
+                if (DO_GEMM) {
+                    if (g_force_bf16_gemms) {
+                        g_ck_bf16.run(g_ltH, L.ck_w16, enc, b_ca_k, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.ckb);
+                        g_cv_bf16.run(g_ltH, L.cv_w16, enc, b_ca_v, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.cvb);
+                    } else {
+                        g_ck.run(g_ltH, L.ck_w8, b_enc_fp8, b_ca_k, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.ckb);
+                        g_cv.run(g_ltH, L.cv_w8, b_enc_fp8, b_ca_v, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.cvb);
+                    }
+                }
+                ca_k_ptr = b_ca_k;
+                ca_v_ptr = b_ca_v;
+            }
+
+            // ---- RMSNorm CA Q/K ----
+            if (DO_EWISE) {
+                if (!TP) {
+                    k_rmsnorm<<<ca_len, 256, 0, stream>>>(b_ca_q, L.ca_rms_q, Dpr);
+                    if (!g_ca_kv_cache_valid) {
+                        k_rmsnorm<<<ctx, 256, 0, stream>>>(b_ca_k, L.ca_rms_k, Dpr);
+                    }
+                } else {
+                    k_partial_sumsq<<<ca_len, 256, 0, stream>>>(b_ca_q, b_tp_sumsq_cq, Dpr);
+                    if (!g_ca_kv_cache_valid) {
+                        k_partial_sumsq<<<ctx, 256, 0, stream>>>(b_ca_k, b_tp_sumsq_ck, Dpr);
+                        ncclGroupStart();
+                        CKNCCL(ncclAllReduce(b_tp_sumsq_cq, b_tp_sumsq_cq, (size_t)ca_len, ncclFloat32, ncclSum, g_nccl_comm, stream));
+                        CKNCCL(ncclAllReduce(b_tp_sumsq_ck, b_tp_sumsq_ck, (size_t)ctx,    ncclFloat32, ncclSum, g_nccl_comm, stream));
+                        ncclGroupEnd();
+                    } else {
+                        CKNCCL(ncclAllReduce(b_tp_sumsq_cq, b_tp_sumsq_cq, (size_t)ca_len, ncclFloat32, ncclSum, g_nccl_comm, stream));
+                    }
+                    size_t smem_rr = (size_t)Dpr * sizeof(__nv_bfloat16);
+                    k_apply_rmsnorm_rope<<<ca_len, 256, smem_rr, stream>>>(b_ca_q, L.ca_rms_q, nullptr, b_tp_sumsq_cq, D, NHpr, HD);
+                    if (!g_ca_kv_cache_valid) {
+                        k_apply_rmsnorm_rope<<<ctx, 256, smem_rr, stream>>>(b_ca_k, L.ca_rms_k, nullptr, b_tp_sumsq_ck, D, NHpr, HD);
+                    }
+                }
+                // Populate CA K/V cache on miss
+                if (!g_ca_kv_cache_valid) {
+                    CK(cudaMemcpyAsync(b_ca_k_cache + ca_kv_slot, b_ca_k,
+                                       (size_t)ctx * Dpr * sizeof(__nv_bfloat16),
+                                       cudaMemcpyDeviceToDevice, stream));
+                    CK(cudaMemcpyAsync(b_ca_v_cache + ca_kv_slot, b_ca_v,
+                                       (size_t)ctx * Dpr * sizeof(__nv_bfloat16),
+                                       cudaMemcpyDeviceToDevice, stream));
+                }
+            }
+            if (DO_TIME) TREC(6);
+
+            // ---- CA SDPA ----
+            if (DO_SDPA) {
+                if (li == 0) {
+                }
+                if (g_use_torch_sdpa) {
+                    float ca_scale = 1.0f / sqrtf((float)HD);
+                    torch_sdpa_bf16(b_ca_q, ca_k_ptr, ca_v_ptr, b_ca_out, ca_len, ctx, NHpr, HD, ca_scale, stream);
+                } else {
+                    cg->ca_sdpa.run(g_cudnnH, b_ca_q, ca_k_ptr, ca_v_ptr, b_ca_out, stream);
+                }
+            }
+            if (DO_TIME) TREC(7);
+
+            // ---- CA_O GEMM + ungated residual ----
+            // Kairos: CA residual is ungated (x += ca_out, no gate)
+            if (g_force_bf16_gemms) {
+                if (!TP) {
+                    if (DO_GEMM) cg->co_bf16.run(g_ltH, L.co_w16, b_ca_out, x, g_gemm_ws, 32*1024*1024, 1.f, 1.f, stream, L.cob);
+                } else {
+                    if (DO_GEMM) cg->co_bf16.run(g_ltH, L.co_w16, b_ca_out, b_sa_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.cob);
+                    CKNCCL(ncclAllReduce(b_sa_out, b_sa_out, (size_t)ca_len * D, ncclBfloat16, ncclSum, g_nccl_comm, stream));
+                    if (DO_EWISE) k_add_vec<<<8*g_nsm, 256, 0, stream>>>(x, b_sa_out, ca_len * D);
+                }
+            } else {
+                if (DO_EWISE) k_bf16_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_ca_out_fp8, b_ca_out, ca_len_Dpr);
+                if (!TP) {
+                    // Single-GPU: fused bias + residual via beta=1
+                    if (DO_GEMM) cg->co.run(g_ltH, L.co_w8, b_ca_out_fp8, x, g_gemm_ws, 32*1024*1024, 1.f, 1.f, stream, L.cob);
+                } else {
+                    // TP row-parallel: bias/W in epilogue, AllReduce, then simple residual add
+                    if (DO_GEMM) cg->co.run(g_ltH, L.co_w8, b_ca_out_fp8, b_sa_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.cob);
+                    CKNCCL(ncclAllReduce(b_sa_out, b_sa_out, (size_t)ca_len * D, ncclBfloat16, ncclSum, g_nccl_comm, stream));
+                    if (DO_EWISE) k_add_vec<<<8*g_nsm, 256, 0, stream>>>(x, b_sa_out, ca_len * D);
+                }
+            }
+            if (DO_TIME) TREC(8);
+          } // end if (!g_skip_ca) — quadratic CA path
+
+            // ---- FFN LN on full x ----
+            if (DO_EWISE) {
+                k_ln_adaln_ssts<<<seq, 256, (size_t)D*sizeof(__nv_bfloat16), stream>>>(x, b_ffn_norm, b_ffn_norm_fp8,
+                    ssts_scale_ffn, ssts_shift_ffn, temb_scale_ffn, temb_shift_ffn, D, temb_row_stride);
+            }
+            if (DO_TIME) TREC(9);
+
+            // ---- FFN1 + SiLU + FP8 ----
+            if (g_force_bf16_gemms) {
+                if (DO_GEMM) gm->f1_bf16.run(g_ltH, L.f1_w16, b_ffn_norm, b_ffn_mid, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f1b);
+                if (DO_EWISE) k_silu_bf16<<<(seq_FFNpr + 255) / 256, 256, 0, stream>>>(b_ffn_mid, seq_FFNpr);
+            } else {
+                if (DO_GEMM) gm->f1.run(g_ltH, L.f1_w8, b_ffn_norm_fp8, b_ffn_mid, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f1b);
+                if (DO_EWISE) k_silu_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_ffn_mid, b_ffn_mid_fp8, seq_FFNpr);
+            }
+            if (DO_TIME) TREC(10);
+
+            // ---- FFN2 (row-parallel) ----
+            if (g_force_bf16_gemms) {
+                if (DO_GEMM) gm->f2_bf16.run(g_ltH, L.f2_w16, b_ffn_mid, b_ffn_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f2b);
+            } else {
+                if (DO_GEMM) gm->f2.run(g_ltH, L.f2_w8, b_ffn_mid_fp8, b_ffn_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f2b);
+            }
+            if (TP) {
+                CKNCCL(ncclAllReduce(b_ffn_out, b_ffn_out, (size_t)seq_D, ncclBfloat16, ncclSum, g_nccl_comm, stream));
+            }
+
+            // ---- FFN gated residual ----
+            // Optimization 3: fuse gate_res + next-layer SA LN when the next layer
+            // is also in range AND is a quadratic layer (not GatedDeltaNet).
+            if (DO_EWISE) {
+                // Find the next quadratic layer in range
+                int next_quad = -1;  // DISABLED: force separate gate + LN to debug
+                if (false && next_quad >= 0) {
+                    // Fused: gate_res + next layer's SA LN
+                    float* ssts_L_next = ssts_base + next_quad * ssts_layer_stride;
+                    float* next_ssts_scale_sa = ssts_L_next + 0 * D;
+                    float* next_ssts_shift_sa = ssts_L_next + 1 * D;
+                    size_t smem_fused = (size_t)(D + 16) * sizeof(float);
+                    k_gate_res_ln_adaln_ssts<<<seq, 256, smem_fused, stream>>>(
+                        x, b_ffn_out,
+                        ssts_gate_ffn, temb_gate_ffn,
+                        next_ssts_scale_sa, next_ssts_shift_sa,
+                        temb_scale_sa, temb_shift_sa,
+                        g_force_bf16_gemms ? b_norm : nullptr, b_norm_fp8,
+                        D, temb_row_stride);
+                    sa_ln_fused_from_prev = true;
+                } else {
+                    // Last quadratic layer in range: no fusion
+                    k_gate_res_ssts<<<8*g_nsm, 256, 0, stream>>>(x, b_ffn_out, ssts_gate_ffn, temb_gate_ffn, seq, D, temb_row_stride);
+                }
+            }
+            if (DO_TIME) { TREC(11); quad_idx++; }
+        } // end if/else GDN vs quadratic
+    }
+
+    // Mark CA K/V cache valid after first forward
+    // Don't auto-enable cache — CFG needs fresh K/V per call
+    // Cache can be explicitly enabled via set_ca_kv_cache_valid()
+    // if (!g_ca_kv_cache_valid) g_ca_kv_cache_valid = true;
+
+    // Print per-phase timing
+    if (DO_TIME && n_quadratic > 0) {
+        cudaStreamSynchronize(stream);
+        const char* PHASE_NAMES[NPHASES] = {
+            "SA_LN   ", "SA_QKV  ", "SA_SDPA ", "SA_O    ",
+            "CA_LN   ", "CA_QKV  ", "CA_SDPA ", "CA_O    ",
+            "FFN_LN  ", "FFN1    ", "FFN2    "
+        };
+        float totals[NPHASES] = {0};
+        for (int qi = 0; qi < n_quadratic; qi++) {
+            for (int p = 0; p < NPHASES; p++) {
+                float dt;
+                cudaEventElapsedTime(&dt,
+                    evs[qi * (NPHASES + 1) + p],
+                    evs[qi * (NPHASES + 1) + p + 1]);
+                totals[p] += dt;
+            }
+        }
+        float total_all = 0;
+        for (int p = 0; p < NPHASES; p++) total_all += totals[p];
+        printf("\n=== KAIROS_ENGINE_TIME: %d quadratic layers [%d,%d), total=%.3f ms ===\n",
+               n_quadratic, start_layer, end_layer, total_all);
+        for (int p = 0; p < NPHASES; p++) {
+            printf("  %s %7.3f ms  (%4.1f%%)   %.4f ms/layer\n",
+                PHASE_NAMES[p], totals[p], 100.0f * totals[p] / total_all, totals[p] / n_quadratic);
+        }
+        for (auto& e : evs) cudaEventDestroy(e);
+    }
+}
+
+// ============================================================
+// engine_forward: Python-callable wrapper
+// ============================================================
+void set_use_graph(int64_t flag) { g_use_graph = (flag != 0); }
+
+torch::Tensor engine_forward(
+    torch::Tensor x_t,      // [seq, D] bf16
+    torch::Tensor enc_t,    // [ctx, CA_K_DIM] bf16
+    torch::Tensor temb_t,   // [seq, 6, D] or [1, 6, D] float32
+    torch::Tensor ssts_t,   // [NL, 6, D] float32
+    torch::Tensor rope_t,   // [seq, 2*HD] float32 or empty
+    int64_t ca_len,         // always == seq for Kairos
+    int64_t start_layer,    // first layer to run (inclusive)
+    int64_t end_layer       // last layer to run (exclusive)
+) {
+    TORCH_CHECK(g_ready, "engine_init first");
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    int seq = x_t.size(0);
+    int ca_l = (int)ca_len;
+    if (ca_l <= 0 || ca_l > seq) ca_l = seq;
+    // Set actual context size from encoder tensor (may be < g_ctx)
+    int actual_ctx = (int)enc_t.size(0);
+    if (actual_ctx != g_actual_ctx) {
+        g_actual_ctx = actual_ctx;
+        // Rebuild CA K/V GEMMs for actual ctx if different from init
+        if (actual_ctx != g_ctx && actual_ctx > 0) {
+            g_ck.setup(g_ltH, actual_ctx, g_D_per_rank, g_CA_K_DIM, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
+            g_cv.setup(g_ltH, actual_ctx, g_D_per_rank, g_CA_K_DIM, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
+            // Always rebuild BF16 K/V GEMMs (used unconditionally for CA K/V)
+            g_ck_bf16.setup(g_ltH, actual_ctx, g_D_per_rank, g_CA_K_DIM, g_gemm_ws, 32*1024*1024, 1);
+            g_cv_bf16.setup(g_ltH, actual_ctx, g_D_per_rank, g_CA_K_DIM, g_gemm_ws, 32*1024*1024, 1);
+            g_ck_bf16_built = true;
+            // Clear CA SDPA cache so it rebuilds with correct K/V length
+            g_ca_gemms_by_len.clear();
+            g_ca_kv_cache_valid = false;
+        }
+    }
+    TORCH_CHECK(actual_ctx <= g_ctx, "actual ctx ", actual_ctx, " > max ctx ", g_ctx);
+    int temb_rows = temb_t.size(0);
+    int temb_row_stride = (temb_rows == 1) ? 0 : (6 * g_D);
+    float* rope_ptr = rope_t.numel() > 0 ? rope_t.data_ptr<float>() : nullptr;
+
+    int sl = (int)start_layer;
+    int el = (int)end_layer;
+    if (sl < 0) sl = 0;
+    if (el <= 0 || el > g_NL) el = g_NL;
+
+    if (!g_use_graph) {
+        forward_core(
+            (__nv_bfloat16*)x_t.data_ptr(), (__nv_bfloat16*)enc_t.data_ptr(),
+            temb_t.data_ptr<float>(), ssts_t.data_ptr<float>(), rope_ptr,
+            seq, ca_l, temb_row_stride,
+            sl, el,
+            stream);
+        return x_t;
+    }
+
+    // CUDA graph path
+    size_t x_bytes = (size_t)seq * g_D * sizeof(__nv_bfloat16);
+    size_t enc_bytes = (size_t)g_ctx * g_CA_K_DIM * sizeof(__nv_bfloat16);
+    size_t temb_bytes = (size_t)temb_rows * 6 * g_D * sizeof(float);
+    size_t ssts_bytes = (size_t)g_NL * 6 * g_D * sizeof(float);
+
+    CK(cudaStreamSynchronize(stream));
+
+    CK(cudaMemcpyAsync(g_x_buf, x_t.data_ptr(), x_bytes, cudaMemcpyDeviceToDevice, g_graph_stream));
+    CK(cudaMemcpyAsync(g_enc_buf, enc_t.data_ptr(), enc_bytes, cudaMemcpyDeviceToDevice, g_graph_stream));
+    CK(cudaMemcpyAsync(g_temb_buf, temb_t.data_ptr(), temb_bytes, cudaMemcpyDeviceToDevice, g_graph_stream));
+    CK(cudaMemcpyAsync(g_ssts_buf, ssts_t.data_ptr(), ssts_bytes, cudaMemcpyDeviceToDevice, g_graph_stream));
+
+    // Graph key includes seq, start_layer, end_layer
+    int graph_key = seq * 10000 + sl * 100 + el;
+    auto git = g_graphs_by_seq.find(graph_key);
+    if (git == g_graphs_by_seq.end()) {
+        // Warmup
+        forward_core(g_x_buf, g_enc_buf, g_temb_buf, g_ssts_buf, rope_ptr,
+                     seq, ca_l, temb_row_stride, sl, el, g_graph_stream);
+        CK(cudaStreamSynchronize(g_graph_stream));
+        // Capture
+        CK(cudaStreamBeginCapture(g_graph_stream, cudaStreamCaptureModeRelaxed));
+        forward_core(g_x_buf, g_enc_buf, g_temb_buf, g_ssts_buf, rope_ptr,
+                     seq, ca_l, temb_row_stride, sl, el, g_graph_stream);
+        cudaGraph_t graph;
+        CK(cudaStreamEndCapture(g_graph_stream, &graph));
+        cudaGraphExec_t graph_exec;
+        CK(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+        CK(cudaGraphDestroy(graph));
+        g_graphs_by_seq[graph_key] = graph_exec;
+        g_graph_temb_rows[graph_key] = temb_rows;
+        printf("  Built graph for seq=%d layers=[%d,%d)\n", seq, sl, el);
+        CK(cudaGraphLaunch(graph_exec, g_graph_stream));
+    } else {
+        CK(cudaGraphLaunch(git->second, g_graph_stream));
+    }
+
+    CK(cudaMemcpyAsync(x_t.data_ptr(), g_x_buf, x_bytes, cudaMemcpyDeviceToDevice, g_graph_stream));
+    CK(cudaStreamSynchronize(g_graph_stream));
+    return x_t;
+}
+
+// Debug: expose internal buffers as torch tensors (view, no copy)
+torch::Tensor get_buf(std::string name, int64_t seq) {
+    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    auto opts_fp8 = torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA);
+    void* p = nullptr;
+    bool is_fp8 = false;
+    int n_rows = seq;
+    int n_cols = g_D;
+    if      (name == "b_norm")         { p = b_norm; }
+    else if (name == "b_norm_fp8")     { p = b_norm_fp8; is_fp8 = true; }
+    else if (name == "b_q")            { p = b_q; }
+    else if (name == "b_k")            { p = b_k; }
+    else if (name == "b_v")            { p = b_v; }
+    else if (name == "b_attn")         { p = b_attn; }
+    else if (name == "b_sa_out")       { p = b_sa_out; }
+    else if (name == "b_ca_norm")      { p = b_ca_norm; }
+    else if (name == "b_ca_norm_fp8")  { p = b_ca_norm_fp8; is_fp8 = true; }
+    else if (name == "b_ca_q")         { p = b_ca_q; }
+    else if (name == "b_ca_k")         { p = b_ca_k; n_rows = g_ctx; }
+    else if (name == "b_ca_v")         { p = b_ca_v; n_rows = g_ctx; }
+    else if (name == "b_ca_out")       { p = b_ca_out; }
+    else if (name == "b_ffn_norm")     { p = b_ffn_norm; }
+    else if (name == "b_ffn_mid")      { p = b_ffn_mid; n_cols = g_FFN; }
+    else if (name == "b_ffn_out")      { p = b_ffn_out; }
+    else TORCH_CHECK(false, "unknown buffer: ", name);
+    auto& opts = is_fp8 ? opts_fp8 : opts_bf16;
+    return torch::from_blob(p, {n_rows, n_cols}, opts).clone();
+}
+
+// ============================================================
+// PYBIND11 module
+// ============================================================
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("init", &engine_init, "Initialize Kairos engine",
+          py::arg("D"), py::arg("NH"), py::arg("HD"), py::arg("NL"),
+          py::arg("FFN"), py::arg("CA_K_DIM"), py::arg("max_seq"), py::arg("ctx"),
+          py::arg("gdn_key_dim") = 0, py::arg("gdn_value_dim") = 0);
+    m.def("prepare_seq", &engine_prepare_seq, "Pre-build GEMMs for a specific seq_len");
+    m.def("prepare_ca", &engine_prepare_ca, "Pre-build CA GEMMs for a specific ca_len");
+    m.def("load", &engine_load, "Load one layer's weights");
+    m.def("load_gdn", &engine_load_gdn, "Load GDN weights for one linear attention layer");
+    m.def("reset_gdn_state", &engine_reset_gdn_state, "Reset GDN recurrent state (call between inferences)");
+    m.def("set_ca_kv_cache", &engine_set_ca_kv_cache,
+          "Write pre-computed CA K/V for one layer into the engine cache");
+    m.def("set_ca_kv_cache_valid", &engine_set_ca_kv_cache_valid,
+          "Mark CA K/V cache as valid with actual context length",
+          py::arg("valid"), py::arg("actual_ctx"));
+    m.def("forward", &engine_forward,
+          "Forward pass through a range of quadratic layers (skips GatedDeltaNet layers).",
+          py::arg("x_t"), py::arg("enc_t"), py::arg("temb_t"), py::arg("ssts_t"),
+          py::arg("rope_t"), py::arg("ca_len"),
+          py::arg("start_layer") = 0, py::arg("end_layer") = -1);
+    m.def("invalidate_ca_kv_cache", &engine_invalidate_ca_kv_cache,
+          "Invalidate CA K/V cache (call when text encoder output changes)");
+    m.def("nccl_get_unique_id", &engine_nccl_get_unique_id,
+          "Generate NCCL unique id (call on rank 0)");
+    m.def("nccl_comm_init", &engine_nccl_comm_init,
+          "Initialize NCCL comm from broadcast id");
+    m.def("set_profile_mode", &set_profile_mode,
+          "0=all,1=gemm,2=ewise,3=sdpa,4=no_sdpa,5=no_gemm,6=no_ewise");
+    m.def("set_torch_sdpa", &set_torch_sdpa,
+          "Use PyTorch SDPA instead of cuDNN SDPA (for correctness debugging)");
+    m.def("set_sdpa_backend", &set_sdpa_backend,
+          "Set engine SA backend: cudnn, torch, sage3_py, or sage3_cpp");
+    m.def("get_sdpa_backend", &get_sdpa_backend,
+          "Get current engine SA backend");
+    m.def("set_skip_ca", &set_skip_ca,
+          "Skip all CA operations in engine (let Python handle cross-attention)");
+    m.def("set_use_graph", &set_use_graph, "Enable/disable CUDA graph capture");
+    m.def("get_buf", &get_buf, "Get a clone of an internal buffer by name");
+    m.def("set_gdn_cublas_chunk", &engine_set_gdn_cublas_chunk,
+          "Toggle cuBLASLt chunk GDN (true) vs fused recurrent (false)",
+          py::arg("enable") = true);
+    m.def("set_force_bf16_gemms", &set_force_bf16_gemms,
+          "Force all GEMMs to BF16 (no FP8) for quality debugging");
+    m.def("run_chunk_fwd_o", [](torch::Tensor q_t, torch::Tensor k_t,
+                                  torch::Tensor w_t, torch::Tensor u_t,
+                                  torch::Tensor h_snap_t, torch::Tensor gcum_t,
+                                  int64_t T, int64_t NH, int64_t K, int64_t V,
+                                  double scale) {
+        // Run k_gdn_chunk_fwd_o with given inputs
+        int NV_blocks = (int)V / GDN_BV;
+        auto o_out = torch::zeros({T, NH, V}, torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        int NC_local = ((int)T + GDN_CHUNK_BT - 1) / GDN_CHUNK_BT;
+        size_t fwd_o_smem = GDN_CHUNK_BT * GDN_BV * sizeof(float) + GDN_CHUNK_BT * sizeof(float);
+        k_gdn_chunk_fwd_o<<<dim3(NV_blocks, NC_local, (int)NH), 128, fwd_o_smem, stream>>>(
+            (__nv_bfloat16*)q_t.data_ptr(), (__nv_bfloat16*)k_t.data_ptr(),
+            (float*)w_t.data_ptr(), (float*)u_t.data_ptr(),
+            (__nv_bfloat16*)h_snap_t.data_ptr(), (float*)gcum_t.data_ptr(),
+            (__nv_bfloat16*)o_out.data_ptr(),
+            (int)T, (int)NH, (int)K, (int)V, (float)scale);
+        CK(cudaStreamSynchronize(stream));
+        return o_out;
+    }, "Run chunk forward output kernel");
+    m.def("run_chunk_h_simple", [](torch::Tensor k_t,
+                                    torch::Tensor w_t, torch::Tensor u_t,
+                                    torch::Tensor gcum_t,
+                                    int64_t T, int64_t NC, int64_t NH, int64_t K, int64_t V) {
+        auto h_out = torch::zeros({(NC+1) * NH * K * V}, torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+        auto state = torch::zeros({NH * K * V}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        int NV_blocks = (int)V / GDN_BV;
+        k_gdn_chunk_h_simple<<<dim3(NV_blocks, (int)NH), 32, 0, stream>>>(
+            (__nv_bfloat16*)k_t.data_ptr(),
+            (float*)w_t.data_ptr(), (float*)u_t.data_ptr(), (float*)gcum_t.data_ptr(),
+            (__nv_bfloat16*)h_out.data_ptr(), (float*)state.data_ptr(), nullptr, nullptr,
+            (int)T, (int)NC, (int)NH, (int)K, (int)V);
+        CK(cudaStreamSynchronize(stream));
+        return std::make_tuple(h_out.reshape({(long)(NC+1), (long)NH, (long)K, (long)V}), state.reshape({(long)NH, (long)K, (long)V}));
+    }, "Run simple chunk_h kernel");
+    m.def("run_chunk_prepare", [](torch::Tensor k_t, torch::Tensor v_t,
+                                   torch::Tensor g_t, torch::Tensor beta_t,
+                                   int64_t T, int64_t NH, int64_t K, int64_t V) {
+        // Run k_gdn_chunk_prepare and return w, u, gcum as tensors
+        const int BT = GDN_CHUNK_BT;
+        int NC = ((int)T + BT - 1) / BT;
+        size_t w_elems = (size_t)NC * NH * BT * K;
+        size_t u_elems = (size_t)NC * NH * BT * V;
+        size_t g_elems = (size_t)NC * NH * BT;
+        auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+        auto w_out = torch::zeros({(long)w_elems}, opts_f32);
+        auto u_out = torch::zeros({(long)u_elems}, opts_f32);
+        auto g_out = torch::zeros({(long)g_elems}, opts_f32);
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        size_t smem = gdn_chunk_prepare_smem((int)K, (int)V);
+        if (smem > 48 * 1024)
+            cudaFuncSetAttribute(k_gdn_chunk_prepare,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        k_gdn_chunk_prepare<<<dim3(NC, (int)NH), 64, smem, stream>>>(
+            (__nv_bfloat16*)k_t.data_ptr(), (__nv_bfloat16*)v_t.data_ptr(),
+            (float*)g_t.data_ptr(), (float*)beta_t.data_ptr(),
+            (float*)w_out.data_ptr(), (float*)u_out.data_ptr(), (float*)g_out.data_ptr(),
+            (int)T, (int)NH, (int)K, (int)V);
+        CK(cudaStreamSynchronize(stream));
+        return std::make_tuple(
+            w_out.reshape({NC, (long)NH, BT, (long)K}),
+            u_out.reshape({NC, (long)NH, BT, (long)V}),
+            g_out.reshape({NC, (long)NH, BT}));
+    }, "Run chunk prepare kernel and return w, u, gcum tensors");
+}
