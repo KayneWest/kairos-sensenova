@@ -32,7 +32,7 @@ Input x [seq, D] bf16
   → Self-Attention SDPA (cuDNN BF16)
   → Output projection (FP8 GEMM, beta=0)
   → Gate residual (k_gate_res_ssts)
-  → Cross-Attention (CA K/V pre-computed in Python, cuDNN SDPA)
+  → Cross-Attention (CA K/V built and cached in-engine, reused across denoise steps, cuDNN SDPA)
   → CA output projection + ungated residual
   → FFN LN + AdaLN → SiLU → FP8 GEMM up → FP8 GEMM down
   → FFN gate residual
@@ -230,6 +230,8 @@ Larger synthetic smoke test at `seq=2048`, `ctx=128`:
 | `sage3_py` | 672.4 ms |
 
 At `seq=2048`, the fully native `sage3_cpp` path is now a clear win over the engine's cuDNN BF16 backend: `429.9 ms` vs `513.8 ms` (`1.20x`). The Python-wrapper path remains too slow to keep.
+
+CA cache persistence is now enabled in the runner. For a real 4-step generation with a fixed prompt/context, the engine now rebuilds CA K/V once and prepares CA descriptors once, then reuses both for the remaining denoise steps.
 
 ## Optimization Targets (Priority Order)
 

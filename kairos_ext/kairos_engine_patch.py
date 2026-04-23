@@ -11,6 +11,7 @@ Usage:
 """
 import os
 import time
+import types
 import torch
 import torch.nn as nn
 
@@ -39,6 +40,11 @@ def get_ext():
     cudnn_fe = os.environ.get("CUDNN_FRONTEND", "/tmp/cudnn-frontend/include")
     cudnn_inc = os.environ.get("CUDNN_INC", "")
     cudnn_lib = os.environ.get("CUDNN_LIB", "")
+    if not cudnn_lib and cudnn_inc:
+        cudnn_root = os.path.dirname(cudnn_inc.rstrip("/"))
+        guessed_cudnn_lib = os.path.join(cudnn_root, "lib")
+        if os.path.isdir(guessed_cudnn_lib):
+            cudnn_lib = guessed_cudnn_lib
     nccl_inc = os.environ.get("NCCL_HOME", "/usr")
     # CUTLASS headers for CuTe MMA atoms (tensor core chunk GDN kernel)
     cutlass_inc = os.environ.get("CUTLASS_INC",
@@ -402,6 +408,10 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
         ext.set_sdpa_backend(sdpa_backend)
         if verbose:
             print(f"  SA backend: {sdpa_backend}")
+    use_graph = os.environ.get("KAIROS_ENGINE_USE_GRAPH", "").strip().lower() in {"1", "true", "yes", "on"}
+    ext.set_use_graph(1 if use_graph else 0)
+    if verbose and use_graph:
+        print("  CUDA graphs: enabled")
     # Chunk GDN is correct but slower (0.63x) — needs MMA fwd_o for speed.
     # Default to recurrent path (1.25x) until MMA fwd_o is implemented.
     # ext.set_gdn_cublas_chunk(True)  # enable for chunk path
@@ -538,8 +548,116 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
 
     _prepared_ca_lens = set()
     _rope_cache: dict = {}
+    _context_sample_indices: dict = {}
     _runner_hd = hd
     _engine_ctx_len = ctx_len
+    from kairos.modules.dits.kairos_dit import sinusoidal_embedding_1d
+
+    def _get_context_sample_idx(numel: int, device: torch.device) -> torch.Tensor:
+        key = (numel, device.type, device.index)
+        idx = _context_sample_indices.get(key)
+        if idx is not None:
+            return idx
+        sample_count = min(256, numel)
+        if sample_count == numel:
+            idx = torch.arange(numel, device=device, dtype=torch.long)
+        else:
+            idx = torch.linspace(0, numel - 1, steps=sample_count, device=device)
+            idx = idx.round().to(torch.long)
+        _context_sample_indices[key] = idx
+        return idx
+
+    def _make_context_content_key(enci: torch.Tensor):
+        flat = enci.reshape(-1)
+        if flat.numel() == 0:
+            sample_bytes = b""
+        else:
+            sample_idx = _get_context_sample_idx(flat.numel(), flat.device)
+            sample = flat.index_select(0, sample_idx).to(dtype=torch.float32)
+            sample_bytes = sample.cpu().numpy().tobytes()
+        return (
+            tuple(enci.shape),
+            str(enci.dtype),
+            enci.device.type,
+            enci.device.index,
+            sample_bytes,
+        )
+
+    def _run_engine_blocks(x, context, t_mod, freqs, grid_size, context_mask=None):
+        del grid_size, context_mask
+        first._engine_forward_calls += 1
+        if x.dim() == 3 and x.shape[0] != 1:
+            raise RuntimeError(f"Kairos engine patch currently supports batch size 1, got x shape {tuple(x.shape)}")
+        if context.dim() == 3 and context.shape[0] != 1:
+            raise RuntimeError(
+                f"Kairos engine patch currently supports batch size 1 context, got context shape {tuple(context.shape)}"
+            )
+
+        xi = x.squeeze(0).contiguous() if x.dim() == 3 else x.contiguous()
+        enci = context.squeeze(0).contiguous() if context.dim() == 3 else context.contiguous()
+        seq = xi.shape[0]
+        ctx_ptr_key = (
+            int(enci.data_ptr()),
+            tuple(enci.shape),
+            str(enci.dtype),
+            enci.device.type,
+            enci.device.index,
+        )
+
+        # Prepare temb: [B, 6, D] or [B, seq, 6, D] → [1, 6, D] or [seq, 6, D]
+        ei = t_mod.float().contiguous()
+        while ei.dim() > 3:
+            ei = ei.squeeze(2) if ei.shape[2] == 1 else ei.squeeze(0)
+        if ei.dim() == 2:
+            ei = ei.unsqueeze(0)
+
+        # RoPE: Kairos complex → Helios float
+        if freqs is not None and freqs.numel() > 0:
+            if freqs.is_complex():
+                ck = (seq, int(freqs.shape[-1]), _runner_hd)
+                cached = _rope_cache.get(ck)
+                if cached is None:
+                    cached = _kairos_rope_to_helios(
+                        freqs.detach(), _runner_hd
+                    ).to(xi.device)
+                    _rope_cache[ck] = cached
+                rope = cached
+            else:
+                rope = freqs.float().contiguous()
+                if rope.dim() == 3:
+                    rope = rope.squeeze(0)
+        else:
+            rope = torch.empty(0, device=xi.device, dtype=torch.float32)
+
+        ca_len = seq
+
+        # Reset GDN recurrent state before each forward pass
+        ext.reset_gdn_state()
+
+        # CA K/V is static across denoise steps for a fixed prompt/context.
+        # The pointer may change across denoise steps even when the contents do not,
+        # so use a cheap content fingerprint and keep a pointer fast-path.
+        if ctx_ptr_key == first._ca_cache_ptr_key:
+            rebuilt_ca_cache = False
+        else:
+            ctx_content_key = _make_context_content_key(enci)
+            rebuilt_ca_cache = (ctx_content_key != first._ca_cache_key)
+            first._ca_cache_ptr_key = ctx_ptr_key
+        if rebuilt_ca_cache:
+            ext.build_ca_kv_cache(enci)
+            first._ca_cache_key = ctx_content_key
+            first._ca_cache_ctx_rows = int(enci.shape[0])
+            first._ca_cache_rebuilds += 1
+
+        # Warm CA SDPA/GEMM descriptors only when this length is first seen,
+        # or immediately after the CA cache rebuild changed actual_ctx.
+        if rebuilt_ca_cache or ca_len not in _prepared_ca_lens:
+            ext.prepare_ca(ca_len)
+            _prepared_ca_lens.add(ca_len)
+            first._ca_prepare_rebuilds += 1
+
+        xi = ext.forward(xi, enci, ei, ssts_stacked, rope, ca_len, 0, nl)
+        return xi.unsqueeze(0) if x.dim() == 3 else xi
 
     class Runner(nn.Module):
         """Block-level stub. Block 0 runs all layers through the engine.
@@ -552,63 +670,13 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
 
         def forward(self, x, context, t_mod, freqs, grid_size, context_mask=None):
             if self.idx == 0:
-                xi = x.squeeze(0).contiguous() if x.dim() == 3 else x.contiguous()
-                enci = context.squeeze(0).contiguous() if context.dim() == 3 else context.contiguous()
-                seq = xi.shape[0]
-
-                # Prepare temb: [B, 6, D] or [B, seq, 6, D] → [1, 6, D] or [seq, 6, D]
-                ei = t_mod.float().contiguous()
-                while ei.dim() > 3:
-                    ei = ei.squeeze(2) if ei.shape[2] == 1 else ei.squeeze(0)
-                if ei.dim() == 2:
-                    ei = ei.unsqueeze(0)
-
-                # RoPE: Kairos complex → Helios float
-                if freqs is not None and freqs.numel() > 0:
-                    if freqs.is_complex():
-                        ck = (seq, int(freqs.shape[-1]), _runner_hd)
-                        cached = _rope_cache.get(ck)
-                        if cached is None:
-                            cached = _kairos_rope_to_helios(
-                                freqs.detach(), _runner_hd
-                            ).to(xi.device)
-                            _rope_cache[ck] = cached
-                        rope = cached
-                    else:
-                        rope = freqs.float().contiguous()
-                        if rope.dim() == 3:
-                            rope = rope.squeeze(0)
-                else:
-                    rope = torch.empty(0, device=xi.device, dtype=torch.float32)
-
-                ca_len = seq
-
-                # Reset GDN recurrent state before each forward pass
-                ext.reset_gdn_state()
-
-                # Pre-compute CA K/V using stock PyTorch
-                n_ctx = enci.shape[0]
-                with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    for li, blk in enumerate(_orig_blocks):
-                        ca_mod = blk.cross_attn
-                        ck = ca_mod.norm_k(ca_mod.k(enci.unsqueeze(0))).squeeze(0).to(torch.bfloat16).contiguous()
-                        cv = ca_mod.v(enci.unsqueeze(0)).squeeze(0).to(torch.bfloat16).contiguous()
-                        ext.set_ca_kv_cache(li, ck, cv)
-                # Set cache valid FIRST — this updates g_actual_ctx and clears stale SDPA
-                ext.set_ca_kv_cache_valid(True, n_ctx)
-                # THEN prepare CA (builds SDPA with correct kv_len)
-                ext.prepare_ca(ca_len)
-
-                # Run ALL layers through the engine
-                xi = ext.forward(xi, enci, ei, ssts_stacked, rope, ca_len, 0, nl)
-                self._result = xi.unsqueeze(0) if x.dim() == 3 else xi
+                self._result = _run_engine_blocks(
+                    x, context, t_mod, freqs, grid_size, context_mask=context_mask
+                )
 
             if self.idx == nl - 1:
                 return self._first._result
             return x
-
-    # Save original blocks for CA K/V pre-computation (before replacing with Runners)
-    _orig_blocks = list(blocks)
 
     first = Runner(0)
     runners = [first]
@@ -617,7 +685,90 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
         r._first = first
         runners.append(r)
     first._first = first
+    first._ca_cache_key = None
+    first._ca_cache_ptr_key = None
+    first._ca_cache_ctx_rows = None
+    first._ca_cache_rebuilds = 0
+    first._ca_prepare_rebuilds = 0
+    first._engine_forward_calls = 0
     setattr(transformer, block_name, nn.ModuleList(runners))
+    transformer._kairos_engine_run_blocks = _run_engine_blocks
+
+    if not hasattr(transformer, "_kairos_engine_orig_forward"):
+        transformer._kairos_engine_orig_forward = transformer.forward
+
+    def _engine_forward(
+        self,
+        x,
+        timestep,
+        context,
+        context_mask=None,
+        clip_feature=None,
+        y=None,
+        use_gradient_checkpointing=False,
+        use_gradient_checkpointing_offload=False,
+        first_frame_latents=None,
+        **kwargs,
+    ):
+        if self.training or use_gradient_checkpointing or use_gradient_checkpointing_offload:
+            return self._kairos_engine_orig_forward(
+                x,
+                timestep,
+                context,
+                context_mask=context_mask,
+                clip_feature=clip_feature,
+                y=y,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+                first_frame_latents=first_frame_latents,
+                **kwargs,
+            )
+
+        t = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, timestep)
+        )
+        t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
+        context = self.text_embedding(context)
+
+        if first_frame_latents is not None and self.use_first_frame_cond:
+            first_frame_latents = first_frame_latents.to(context.device)
+            img_context = self.image_downsample(first_frame_latents.squeeze(2))
+            _, _, fh, fw = img_context.shape
+            img_context = img_context.flatten(2).transpose(-2, -1)
+            img_context = self.image_embedding(img_context)
+            img_context = self.image_pos_embed(img_context, h=fh, w=fw)
+            context = torch.cat([img_context, context], dim=1)
+            if context_mask is not None:
+                context_mask = torch.cat([
+                    torch.ones(
+                        context.shape[0], img_context.shape[1],
+                        dtype=context_mask.dtype, device=context_mask.device
+                    ),
+                    context_mask
+                ], dim=1)
+
+        if self.has_image_input:
+            x = torch.cat([x, y], dim=1)
+            clip_embdding = self.img_emb(clip_feature)
+            context = torch.cat([clip_embdding, context], dim=1)
+
+        x, (f, h, w) = self.patchify(x)
+        grid_size = (f, h, w)
+
+        freqs = torch.cat([
+            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+
+        x = _run_engine_blocks(
+            x, context, t_mod, freqs, grid_size, context_mask=context_mask
+        )
+        x = self.head(x, t)
+        x = self.unpatchify(x, (f, h, w))
+        return x
+
+    transformer.forward = types.MethodType(_engine_forward, transformer)
 
     if verbose:
         print(f"  Kairos engine ready in {time.time()-t0:.1f}s")

@@ -21,11 +21,23 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <cublasLt.h>
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>
 #include <cudnn_frontend.h>
 #include <nccl.h>
+#include <cute/tensor.hpp>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+#include <cutlass/gemm/device/gemm_universal_adapter.h>
+#include <cutlass/gemm/kernel/gemm_universal.hpp>
+#include <cutlass/gemm/collective/collective_builder.hpp>
+#include <cutlass/epilogue/collective/collective_builder.hpp>
+#include <cutlass/epilogue/dispatch_policy.hpp>
+#include <cutlass/epilogue/fusion/operations.hpp>
+#include <cutlass/epilogue/thread/activation.h>
+#include <cutlass/util/packed_stride.hpp>
 #include <vector>
 #include <unordered_map>
 #include <memory>
@@ -46,6 +58,56 @@ mha_fwd(at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
         bool per_block_mean, bool is_bf16,
         int window_size_left, int window_size_right);
 
+void mha_fwd_contiguous_bf16_raw(
+        void *q_ptr,
+        void *k_ptr,
+        void *v_ptr,
+        void *sfq_ptr,
+        void *sfk_ptr,
+        void *sfv_ptr,
+        void *delta_s_ptr,
+        void *out_ptr,
+        float *softmax_lse_ptr,
+        int *tile_count_semaphore_ptr,
+        int batch_size,
+        int num_heads,
+        int seqlen_q,
+        int seqlen_k,
+        int unpadded_k,
+        int unpacked_head_size,
+        float softmax_scale,
+        bool is_causal,
+        bool per_block_mean,
+        int window_size_left,
+        int window_size_right,
+        cudaStream_t stream);
+void mha_fwd_strided_bf16_raw(
+        void *q_ptr,
+        void *k_ptr,
+        void *v_ptr,
+        void *sfq_ptr,
+        void *sfk_ptr,
+        void *sfv_ptr,
+        void *delta_s_ptr,
+        void *out_ptr,
+        float *softmax_lse_ptr,
+        int *tile_count_semaphore_ptr,
+        int batch_size,
+        int num_heads,
+        int seqlen_q,
+        int seqlen_k,
+        int unpadded_k,
+        int unpacked_head_size,
+        int64_t out_batch_stride,
+        int64_t out_head_stride,
+        int64_t out_row_stride,
+        float softmax_scale,
+        bool is_causal,
+        bool per_block_mean,
+        int window_size_left,
+        int window_size_right,
+        cudaStream_t stream);
+
 void scaled_fp4_quant(torch::Tensor const& input,
                       torch::Tensor const& output,
                       torch::Tensor const& output_sf,
@@ -58,6 +120,73 @@ void scaled_fp4_quant_trans(torch::Tensor const& input,
                             torch::Tensor const& output,
                             torch::Tensor const& output_sf,
                             int tensor_layout);
+
+void scaled_fp4_quant_bf16_raw_contig(
+    const nv_bfloat16* input,
+    uint8_t* output,
+    uint8_t* output_sf,
+    int batch_size,
+    int num_heads,
+    int num_tokens,
+    int head_dim,
+    cudaStream_t stream);
+void scaled_fp4_quant_bf16_raw_strided_groupmean(
+    const nv_bfloat16* input,
+    uint8_t* output,
+    uint8_t* output_sf,
+    nv_bfloat16* output_mean,
+    int batch_size,
+    int num_heads,
+    int num_tokens,
+    int head_dim,
+    int stride_bz_input,
+    int stride_h_input,
+    int stride_seq_input,
+    cudaStream_t stream);
+void scaled_fp4_quant_permute_bf16_raw_contig(
+    const nv_bfloat16* input,
+    uint8_t* output,
+    uint8_t* output_sf,
+    int batch_size,
+    int num_heads,
+    int num_tokens,
+    int head_dim,
+    cudaStream_t stream);
+void scaled_fp4_quant_permute_bf16_raw_strided_centered(
+    const nv_bfloat16* input,
+    uint8_t* output,
+    uint8_t* output_sf,
+    const nv_bfloat16* mean,
+    nv_bfloat16* centered,
+    int batch_size,
+    int num_heads,
+    int num_tokens,
+    int head_dim,
+    int stride_bz_input,
+    int stride_h_input,
+    int stride_seq_input,
+    cudaStream_t stream);
+void scaled_fp4_quant_trans_bf16_raw_contig(
+    const nv_bfloat16* input,
+    uint8_t* output,
+    uint8_t* output_sf,
+    int batch_size,
+    int num_heads,
+    int num_tokens,
+    int head_dim,
+    cudaStream_t stream);
+void scaled_fp4_quant_trans_bf16_raw_strided(
+    const nv_bfloat16* input,
+    uint8_t* output,
+    uint8_t* output_sf,
+    int batch_size,
+    int num_heads,
+    int num_tokens,
+    int head_dim,
+    int stride_bz_input,
+    int stride_h_input,
+    int stride_seq_input,
+    cudaStream_t stream);
 
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { TORCH_CHECK(false, "CUDA ", __LINE__, ": ", cudaGetErrorString(e)); } } while(0)
 #define CKBL(x) do { cublasStatus_t s = (x); if (s != CUBLAS_STATUS_SUCCESS) { TORCH_CHECK(false, "cublasLt ", __LINE__, ": status=", (int)s); } } while(0)
@@ -405,7 +534,7 @@ __global__ void k_bf16_to_fp8(__nv_fp8_e4m3* out, const __nv_bfloat16* in, int n
 
 // Fused SiLU activation + BF16->FP8 conversion (for Kairos FFN activation)
 // Reads bf16 input, writes fp8 output only (bf16 input NOT written back).
-__global__ void k_silu_to_fp8(__nv_bfloat16* __restrict__ io,
+__global__ void k_silu_to_fp8(const __nv_bfloat16* __restrict__ io,
                                __nv_fp8_e4m3* __restrict__ out, int n) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
@@ -418,7 +547,7 @@ __global__ void k_silu_to_fp8(__nv_bfloat16* __restrict__ io,
         #pragma unroll
         for (int k = 0; k < 8; k++) {
             float v = __bfloat162float(p[k]);
-            float s = v / (1.f + expf(-v));  // silu = x * sigmoid(x)
+            float s = __fdividef(v, 1.f + __expf(-v));  // silu = x * sigmoid(x)
             fp8[k] = bf16_to_fp8_byte(__float2bfloat16(s));
         }
         *reinterpret_cast<uint2*>((unsigned char*)out + base) = *reinterpret_cast<uint2*>(fp8);
@@ -426,7 +555,7 @@ __global__ void k_silu_to_fp8(__nv_bfloat16* __restrict__ io,
     // Tail
     for (int i = (n8 << 3) + tid; i < n; i += stride) {
         float v = __bfloat162float(io[i]);
-        float s = v / (1.f + expf(-v));
+        float s = __fdividef(v, 1.f + __expf(-v));
         ((unsigned char*)out)[i] = bf16_to_fp8_byte(__float2bfloat16(s));
     }
 }
@@ -721,6 +850,28 @@ __global__ void k_gdn_l2norm_scale(
 // Global atomic counter for persistent work distribution
 static __device__ int g_gdn_work_counter;
 
+__device__ __forceinline__ void load_bf16x8_to_f32(const __nv_bfloat16* src, float* dst) {
+    int4 packed = *reinterpret_cast<const int4*>(src);
+    const __nv_bfloat162* vals = reinterpret_cast<const __nv_bfloat162*>(&packed);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        float2 pair = __bfloat1622float2(vals[i]);
+        dst[2 * i] = pair.x;
+        dst[2 * i + 1] = pair.y;
+    }
+}
+
+__device__ __forceinline__ void load_bf16x4_to_f32(const __nv_bfloat16* src, float* dst) {
+    int2 packed = *reinterpret_cast<const int2*>(src);
+    const __nv_bfloat162* vals = reinterpret_cast<const __nv_bfloat162*>(&packed);
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        float2 pair = __bfloat1622float2(vals[i]);
+        dst[2 * i] = pair.x;
+        dst[2 * i + 1] = pair.y;
+    }
+}
+
 __global__ void __launch_bounds__(32) k_gdn_recurrent(
     const __nv_bfloat16* __restrict__ q,   // [T, NH, K]
     const __nv_bfloat16* __restrict__ k,   // [T, NH, K]
@@ -762,18 +913,17 @@ __global__ void __launch_bounds__(32) k_gdn_recurrent(
             size_t qk_base = ((size_t)t * NH + h) * K;
             size_t v_base = ((size_t)t * NH + h) * V;
 
-            // Load q, k, v for this token
-            float my_q[GDN_BK], my_k[GDN_BK];
-            #pragma unroll
-            for (int ki = 0; ki < GDN_BK; ki++) {
-                my_q[ki] = __bfloat162float(q[qk_base + k_off + ki]);
-                my_k[ki] = __bfloat162float(k[qk_base + k_off + ki]);
-            }
-            float gt = g[(size_t)t * NH + h];
-            float bt = beta[(size_t)t * NH + h];
+            // Load K once up front. Load Q later, just before the output
+            // reduction, to shorten its live range and ease register pressure.
+            float my_k[GDN_BK];
+            load_bf16x8_to_f32(k + qk_base + k_off, my_k);
+            float gt = (lane == 0) ? g[(size_t)t * NH + h] : 0.0f;
+            float bt = (lane == 0) ? beta[(size_t)t * NH + h] : 0.0f;
+            gt = __shfl_sync(0xffffffff, gt, 0);
+            bt = __shfl_sync(0xffffffff, bt, 0);
 
             // Decay
-            float decay = expf(gt);
+            float decay = __expf(gt);
             #pragma unroll
             for (int ki = 0; ki < GDN_BK; ki++)
                 #pragma unroll
@@ -801,9 +951,7 @@ __global__ void __launch_bounds__(32) k_gdn_recurrent(
 
             // Delta rule + state update
             float v_vals[GDN_BV];
-            #pragma unroll
-            for (int vi = 0; vi < GDN_BV; vi++)
-                v_vals[vi] = __bfloat162float(v[v_base + v_off + vi]);
+            load_bf16x8_to_f32(v + v_base + v_off, v_vals);
             #pragma unroll
             for (int vi = 0; vi < GDN_BV; vi++) {
                 float vn = bt * (v_vals[vi] - hk[vi]);
@@ -813,6 +961,8 @@ __global__ void __launch_bounds__(32) k_gdn_recurrent(
             }
 
             // Output
+            float my_q[GDN_BK];
+            load_bf16x8_to_f32(q + qk_base + k_off, my_q);
             float ov[GDN_BV];
             #pragma unroll
             for (int vi = 0; vi < GDN_BV; vi++) {
@@ -843,6 +993,7 @@ __global__ void __launch_bounds__(32) k_gdn_recurrent(
                 st[(size_t)(k_off + ki) * V + v_off + vi] = hr[ki][vi];
     }
 }
+
 
 // GDN output norm + gate: out[t,v] = rmsnorm(recurrent_out, weight) * silu(gate[t,v])
 // recurrent_out is [T, NH, Vhd], gate is [T, NH*Vhd], weight is [Vhd]
@@ -902,6 +1053,8 @@ __global__ void k_gdn_rmsnorm_silu_gate(
 // ============================================================
 // Computes D = alpha * op(A) @ op(B) + beta * C for each batch element.
 // Supports flexible transpose modes via opA/opB parameters.
+static size_t g_gemm_ws_bytes = 128 * 1024 * 1024;
+
 struct BatchedBF16Gemm {
     cublasLtMatmulDesc_t desc = nullptr;
     cublasLtMatrixLayout_t Ad = nullptr, Bd = nullptr, Cd = nullptr, Dd = nullptr;
@@ -940,7 +1093,7 @@ struct BatchedBF16Gemm {
 
         cublasLtMatmulPreference_t pref;
         CKBL(cublasLtMatmulPreferenceCreate(&pref));
-        size_t mws = 32 * 1024 * 1024;
+        size_t mws = std::min(wss, g_gemm_ws_bytes);
         CKBL(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &mws, sizeof(mws)));
         int ret = 0;
         CKBL(cublasLtMatmulAlgoGetHeuristic(h, desc, Ad, Bd, Cd, Dd, pref, 1, &heur, &ret));
@@ -950,8 +1103,9 @@ struct BatchedBF16Gemm {
 
     void run(cublasLtHandle_t h, void* A, void* B, void* D, void* ws, size_t wss,
              float alpha, float beta, cudaStream_t st) {
+        size_t use_wss = std::min(wss, g_gemm_ws_bytes);
         CKBL(cublasLtMatmul(h, desc, &alpha, A, Ad, B, Bd, &beta, D, Cd, D, Dd,
-                            &heur.algo, ws, wss, st));
+                            &heur.algo, ws, use_wss, st));
     }
 
     void destroy() {
@@ -1271,18 +1425,30 @@ struct ChunkGdnGemms {
 // ============================================================
 // FP8 GEMM descriptor (one per shape)
 // ============================================================
+static bool g_lt_autotune_enabled = true;
+static int g_lt_autotune_topk = 32;
+static bool g_lt_fast_accum_fp8 = false;
+
 struct FP8Gemm {
     cublasLtMatmulDesc_t desc = nullptr;
     cublasLtMatrixLayout_t Ad = nullptr, Bd = nullptr, Cd = nullptr, Dd = nullptr;
-    cublasLtMatmulHeuristicResult_t heur;
+    cublasLtMatmulHeuristicResult_t heur{};
+    std::vector<cublasLtMatmulHeuristicResult_t> heurs;
     bool has_bias_epi = false;
+    bool tuned = false;
+    int M = 0, N = 0, K = 0;
 
     void setup(cublasLtHandle_t h, int M, int N, int K, float* sA, float* sB,
                void* ws, size_t wss, int epi = 0) {
+        this->M = M; this->N = N; this->K = K;
         CKBL(cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
         cublasOperation_t opT = CUBLAS_OP_T, opN = CUBLAS_OP_N;
         CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT)));
         CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)));
+        if (g_lt_fast_accum_fp8) {
+            int32_t fast_accum = 1;
+            CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fast_accum, sizeof(fast_accum)));
+        }
         CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &sA, sizeof(sA)));
         CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sB, sizeof(sB)));
         cublasLtMatmulMatrixScale_t sm_scalar = CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
@@ -1300,34 +1466,365 @@ struct FP8Gemm {
         CKBL(cublasLtMatrixLayoutCreate(&Cd, CUDA_R_16BF, N, M, N));
         CKBL(cublasLtMatrixLayoutCreate(&Dd, CUDA_R_16BF, N, M, N));
         cublasLtMatmulPreference_t pref; CKBL(cublasLtMatmulPreferenceCreate(&pref));
-        size_t mws = 32 * 1024 * 1024;
+        size_t mws = g_gemm_ws_bytes;
         CKBL(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &mws, sizeof(mws)));
-        int ret = 0; CKBL(cublasLtMatmulAlgoGetHeuristic(h, desc, Ad, Bd, Cd, Dd, pref, 1, &heur, &ret));
+        int max_results = std::max(1, g_lt_autotune_topk);
+        heurs.resize(max_results);
+        int ret = 0;
+        CKBL(cublasLtMatmulAlgoGetHeuristic(h, desc, Ad, Bd, Cd, Dd, pref, max_results, heurs.data(), &ret));
         TORCH_CHECK(ret > 0, "no algo for [", M, ",", N, ",", K, "] epi=", epi);
+        heurs.resize(ret);
+        heur = heurs[0];
+        tuned = (ret == 1) || !g_lt_autotune_enabled;
         cublasLtMatmulPreferenceDestroy(pref);
     }
 
     void run(cublasLtHandle_t h, void* wt_fp8, void* act_fp8, void* out,
              void* ws, size_t wss, float alpha, float beta, cudaStream_t st,
              const void* bias = nullptr, void* c_ptr = nullptr) {
+        size_t use_wss = std::min(wss, g_gemm_ws_bytes);
         if (has_bias_epi && bias) {
             CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
         }
         void* c = c_ptr ? c_ptr : out;
+        if (!tuned && beta == 0.0f && heurs.size() > 1) {
+            cudaEvent_t ev0, ev1;
+            CK(cudaEventCreate(&ev0));
+            CK(cudaEventCreate(&ev1));
+            float best_ms = 1.0e30f;
+            int best_idx = 0;
+            for (size_t i = 0; i < heurs.size(); ++i) {
+                auto& cand = heurs[i];
+                cublasStatus_t warm = cublasLtMatmul(h, desc, &alpha, wt_fp8, Ad, act_fp8, Bd, &beta,
+                                                     c, Cd, out, Dd, &cand.algo, ws, use_wss, st);
+                if (warm != CUBLAS_STATUS_SUCCESS) continue;
+                CK(cudaEventRecord(ev0, st));
+                cublasStatus_t timed = cublasLtMatmul(h, desc, &alpha, wt_fp8, Ad, act_fp8, Bd, &beta,
+                                                      c, Cd, out, Dd, &cand.algo, ws, use_wss, st);
+                if (timed != CUBLAS_STATUS_SUCCESS) continue;
+                CK(cudaEventRecord(ev1, st));
+                CK(cudaEventSynchronize(ev1));
+                float ms = 0.0f;
+                CK(cudaEventElapsedTime(&ms, ev0, ev1));
+                if (ms < best_ms) {
+                    best_ms = ms;
+                    best_idx = (int)i;
+                }
+            }
+            CK(cudaEventDestroy(ev0));
+            CK(cudaEventDestroy(ev1));
+            heur = heurs[best_idx];
+            tuned = true;
+        }
         CKBL(cublasLtMatmul(h, desc, &alpha, wt_fp8, Ad, act_fp8, Bd, &beta,
-                            c, Cd, out, Dd, &heur.algo, ws, wss, st));
+                            c, Cd, out, Dd, &heur.algo, ws, use_wss, st));
     }
 };
+
+// CUTLASS fused FFN1 path: FP8 GEMM + bias + SiLU -> FP8 output.
+// This replaces the standalone k_silu_to_fp8 pass when enabled.
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+struct CutlassFusedFfn1 {
+    using ElementA = cutlass::float_e4m3_t;
+    using ElementB = cutlass::float_e4m3_t;
+    using ElementC = cutlass::float_e4m3_t;
+    using ElementD = cutlass::float_e4m3_t;
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+    using ElementBias = cutlass::bfloat16_t;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+
+    static constexpr int AlignA = 16;
+    static constexpr int AlignB = 16;
+    static constexpr int AlignC = 16;
+    static constexpr int AlignD = 16;
+
+    using MmaTileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+    using FusionOperation = cutlass::epilogue::fusion::ScaledLinCombPerColBiasEltAct<
+        cutlass::epilogue::thread::SiLu,
+        ElementD,
+        ElementCompute,
+        ElementBias,
+        ElementC>;
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm120,
+        cutlass::arch::OpClassTensorOp,
+        MmaTileShape,
+        ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator,
+        ElementCompute,
+        ElementC,
+        LayoutC,
+        AlignC,
+        ElementD,
+        LayoutC,
+        AlignD,
+        cutlass::epilogue::collective::EpilogueScheduleAuto,
+        FusionOperation
+    >::CollectiveOp;
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm120,
+        cutlass::arch::OpClassTensorOp,
+        ElementA,
+        LayoutA,
+        AlignA,
+        ElementB,
+        LayoutB,
+        AlignB,
+        ElementAccumulator,
+        MmaTileShape,
+        ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::collective::KernelScheduleAuto
+    >::CollectiveOp;
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        cute::Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+    using Arguments = typename Gemm::Arguments;
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+
+    Gemm gemm{};
+    StrideA stride_A{};
+    StrideB stride_B{};
+    StrideC stride_C{};
+    StrideD stride_D{};
+    void* workspace = nullptr;
+    size_t workspace_size = 0;
+    int M = 0, N = 0, K = 0;
+    bool built = false;
+    bool initialized = false;
+
+    void setup(int M_, int N_, int K_) {
+        if (built && M == M_ && N == N_ && K == K_) return;
+        M = M_;
+        N = N_;
+        K = K_;
+        stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+        stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+        stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
+        stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+        Arguments args{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K, 1},
+            {nullptr, stride_A, nullptr, stride_B},
+            {{}, nullptr, stride_C, nullptr, stride_D}
+        };
+        args.scheduler.max_swizzle_size = 1;
+        workspace_size = Gemm::get_workspace_size(args);
+        if (workspace != nullptr) {
+            CK(cudaFree(workspace));
+            workspace = nullptr;
+        }
+        if (workspace_size > 0) {
+            CK(cudaMalloc(&workspace, workspace_size));
+        }
+        built = true;
+        initialized = false;
+    }
+
+    Arguments make_args(void* wt_fp8, void* act_fp8, void* out_fp8, const __nv_bfloat16* bias) const {
+        Arguments args{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K, 1},
+            {reinterpret_cast<ElementA const*>(act_fp8), stride_A,
+             reinterpret_cast<ElementB const*>(wt_fp8), stride_B},
+            {{}, reinterpret_cast<ElementC const*>(out_fp8), stride_C,
+             reinterpret_cast<ElementD*>(out_fp8), stride_D}
+        };
+        auto& fusion = args.epilogue.thread;
+        fusion.alpha = 1.0f;
+        fusion.beta = 0.0f;
+        fusion.scale_a = 1.0f;
+        fusion.scale_b = 1.0f;
+        fusion.scale_c = 1.0f;
+        fusion.scale_d = 1.0f;
+        fusion.bias_ptr = reinterpret_cast<ElementBias const*>(bias);
+        args.scheduler.max_swizzle_size = 1;
+        return args;
+    }
+
+    void run(void* wt_fp8, void* act_fp8, void* out_fp8, const __nv_bfloat16* bias, cudaStream_t stream) {
+        auto args = make_args(wt_fp8, act_fp8, out_fp8, bias);
+        cutlass::Status st = Gemm::can_implement(args);
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN1 unsupported for current shape");
+        if (!initialized) {
+            st = gemm.initialize(args, workspace, stream);
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN1 initialize failed");
+            initialized = true;
+        } else {
+            st = gemm.update(args);
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN1 update failed");
+        }
+        st = gemm.run(stream);
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN1 launch failed");
+    }
+};
+
+struct CutlassFusedFfn2 {
+    using ElementA = cutlass::float_e4m3_t;
+    using ElementB = cutlass::float_e4m3_t;
+    using ElementC = cutlass::bfloat16_t;
+    using ElementD = cutlass::bfloat16_t;
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+    using ElementBias = cutlass::bfloat16_t;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+
+    static constexpr int AlignA = 16;
+    static constexpr int AlignB = 16;
+    static constexpr int AlignC = 8;
+    static constexpr int AlignD = 8;
+
+    using MmaTileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+    using FusionOperation = cutlass::epilogue::fusion::LinCombPerColBias<
+        ElementD,
+        ElementCompute,
+        ElementBias,
+        ElementC>;
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm120,
+        cutlass::arch::OpClassTensorOp,
+        MmaTileShape,
+        ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator,
+        ElementCompute,
+        ElementC,
+        LayoutC,
+        AlignC,
+        ElementD,
+        LayoutC,
+        AlignD,
+        cutlass::epilogue::collective::EpilogueScheduleAuto,
+        FusionOperation
+    >::CollectiveOp;
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm120,
+        cutlass::arch::OpClassTensorOp,
+        ElementA,
+        LayoutA,
+        AlignA,
+        ElementB,
+        LayoutB,
+        AlignB,
+        ElementAccumulator,
+        MmaTileShape,
+        ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::collective::KernelScheduleAuto
+    >::CollectiveOp;
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        cute::Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+    using Arguments = typename Gemm::Arguments;
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+
+    Gemm gemm{};
+    StrideA stride_A{};
+    StrideB stride_B{};
+    StrideC stride_C{};
+    StrideD stride_D{};
+    void* workspace = nullptr;
+    size_t workspace_size = 0;
+    int M = 0, N = 0, K = 0;
+    bool built = false;
+    bool initialized = false;
+
+    void setup(int M_, int N_, int K_) {
+        if (built && M == M_ && N == N_ && K == K_) return;
+        M = M_;
+        N = N_;
+        K = K_;
+        stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+        stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+        stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
+        stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+        Arguments args{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K, 1},
+            {nullptr, stride_A, nullptr, stride_B},
+            {{}, nullptr, stride_C, nullptr, stride_D}
+        };
+        args.scheduler.max_swizzle_size = 1;
+        workspace_size = Gemm::get_workspace_size(args);
+        if (workspace != nullptr) {
+            CK(cudaFree(workspace));
+            workspace = nullptr;
+        }
+        if (workspace_size > 0) {
+            CK(cudaMalloc(&workspace, workspace_size));
+        }
+        built = true;
+        initialized = false;
+    }
+
+    Arguments make_args(void* wt_fp8, void* act_fp8, void* out_bf16, const __nv_bfloat16* bias) const {
+        Arguments args{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K, 1},
+            {reinterpret_cast<ElementA const*>(act_fp8), stride_A,
+             reinterpret_cast<ElementB const*>(wt_fp8), stride_B},
+            {{}, reinterpret_cast<ElementC const*>(out_bf16), stride_C,
+             reinterpret_cast<ElementD*>(out_bf16), stride_D}
+        };
+        auto& fusion = args.epilogue.thread;
+        fusion.alpha = 1.0f;
+        fusion.beta = 0.0f;
+        fusion.bias_ptr = reinterpret_cast<ElementBias const*>(bias);
+        args.scheduler.max_swizzle_size = 1;
+        return args;
+    }
+
+    void run(void* wt_fp8, void* act_fp8, void* out_bf16, const __nv_bfloat16* bias, cudaStream_t stream) {
+        auto args = make_args(wt_fp8, act_fp8, out_bf16, bias);
+        cutlass::Status st = Gemm::can_implement(args);
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN2 unsupported for current shape");
+        if (!initialized) {
+            st = gemm.initialize(args, workspace, stream);
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN2 initialize failed");
+            initialized = true;
+        } else {
+            st = gemm.update(args);
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN2 update failed");
+        }
+        st = gemm.run(stream);
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN2 launch failed");
+    }
+};
+#endif
 
 // BF16 x BF16 GEMM (for ENGINE_BF16_ATTN=1 mode)
 struct BF16Gemm {
     cublasLtMatmulDesc_t desc = nullptr;
     cublasLtMatrixLayout_t Ad = nullptr, Bd = nullptr, Cd = nullptr, Dd = nullptr;
-    cublasLtMatmulHeuristicResult_t heur;
+    cublasLtMatmulHeuristicResult_t heur{};
+    std::vector<cublasLtMatmulHeuristicResult_t> heurs;
     bool has_bias_epi = false;
+    bool tuned = false;
+    int M = 0, N = 0, K = 0;
 
     void setup(cublasLtHandle_t h, int M, int N, int K,
                void* ws, size_t wss, int epi = 0) {
+        this->M = M; this->N = N; this->K = K;
         CKBL(cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
         cublasOperation_t opT = CUBLAS_OP_T, opN = CUBLAS_OP_N;
         CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT)));
@@ -1344,22 +1841,57 @@ struct BF16Gemm {
         CKBL(cublasLtMatrixLayoutCreate(&Cd, CUDA_R_16BF, N, M, N));
         CKBL(cublasLtMatrixLayoutCreate(&Dd, CUDA_R_16BF, N, M, N));
         cublasLtMatmulPreference_t pref; CKBL(cublasLtMatmulPreferenceCreate(&pref));
-        size_t mws = 32 * 1024 * 1024;
+        size_t mws = std::min(wss, g_gemm_ws_bytes);
         CKBL(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &mws, sizeof(mws)));
+        int max_results = std::max(1, g_lt_autotune_topk);
+        heurs.resize(max_results);
         int nres = 0;
-        CKBL(cublasLtMatmulAlgoGetHeuristic(h, desc, Ad, Bd, Cd, Dd, pref, 1, &heur, &nres));
+        CKBL(cublasLtMatmulAlgoGetHeuristic(h, desc, Ad, Bd, Cd, Dd, pref, max_results, heurs.data(), &nres));
         TORCH_CHECK(nres > 0, "BF16Gemm: no heuristic for M=", M, " N=", N, " K=", K);
+        heurs.resize(nres);
+        heur = heurs[0];
+        tuned = (nres == 1) || !g_lt_autotune_enabled;
         CKBL(cublasLtMatmulPreferenceDestroy(pref));
     }
 
     void run(cublasLtHandle_t h, void* wt_bf16, void* act_bf16, void* out,
              void* ws, size_t wss, float alpha, float beta, cudaStream_t st,
              const void* bias = nullptr) {
+        size_t use_wss = std::min(wss, g_gemm_ws_bytes);
         if (has_bias_epi && bias) {
             CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
         }
+        if (!tuned && beta == 0.0f && heurs.size() > 1) {
+            cudaEvent_t ev0, ev1;
+            CK(cudaEventCreate(&ev0));
+            CK(cudaEventCreate(&ev1));
+            float best_ms = 1.0e30f;
+            int best_idx = 0;
+            for (size_t i = 0; i < heurs.size(); ++i) {
+                auto& cand = heurs[i];
+                cublasStatus_t warm = cublasLtMatmul(h, desc, &alpha, wt_bf16, Ad, act_bf16, Bd, &beta,
+                                                     out, Cd, out, Dd, &cand.algo, ws, use_wss, st);
+                if (warm != CUBLAS_STATUS_SUCCESS) continue;
+                CK(cudaEventRecord(ev0, st));
+                cublasStatus_t timed = cublasLtMatmul(h, desc, &alpha, wt_bf16, Ad, act_bf16, Bd, &beta,
+                                                      out, Cd, out, Dd, &cand.algo, ws, use_wss, st);
+                if (timed != CUBLAS_STATUS_SUCCESS) continue;
+                CK(cudaEventRecord(ev1, st));
+                CK(cudaEventSynchronize(ev1));
+                float ms = 0.0f;
+                CK(cudaEventElapsedTime(&ms, ev0, ev1));
+                if (ms < best_ms) {
+                    best_ms = ms;
+                    best_idx = (int)i;
+                }
+            }
+            CK(cudaEventDestroy(ev0));
+            CK(cudaEventDestroy(ev1));
+            heur = heurs[best_idx];
+            tuned = true;
+        }
         CKBL(cublasLtMatmul(h, desc, &alpha, wt_bf16, Ad, act_bf16, Bd, &beta,
-                            out, Cd, out, Dd, &heur.algo, ws, wss, st));
+                            out, Cd, out, Dd, &heur.algo, ws, use_wss, st));
     }
 };
 
@@ -1525,6 +2057,7 @@ struct Layer {
 // ============================================================
 // Global engine state
 // ============================================================
+static cublasHandle_t g_blasH = nullptr;
 static cublasLtHandle_t g_ltH = nullptr;
 static cudnnHandle_t g_cudnnH = nullptr;
 static float *g_scaleA = nullptr, *g_scaleB = nullptr;
@@ -1644,14 +2177,218 @@ static at::Tensor wrap_seqmajor_bf16(void* ptr, int seq, int nh, int hd) {
     return torch::from_blob(ptr, {1, seq, nh, hd}, opts).permute({0, 2, 1, 3}).contiguous();
 }
 
-static void copy_bhsd_to_seqmajor_bf16(const at::Tensor& o_bhsd, void* o_ptr,
-                                       int sq, int nh, int hd, cudaStream_t stream) {
-    auto o_out = o_bhsd.permute({0, 2, 1, 3}).contiguous().view({sq, nh * hd});
-    CK(cudaMemcpyAsync(o_ptr, o_out.data_ptr(), (size_t)sq * nh * hd * sizeof(__nv_bfloat16),
-                       cudaMemcpyDeviceToDevice, stream));
+static at::Tensor wrap_bhsd_bf16(void* ptr, int seq, int nh, int hd) {
+    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    return torch::from_blob(ptr, {1, nh, seq, hd}, opts);
 }
 
-static void sageattn3_py_bf16(void* q_ptr, void* k_ptr, void* v_ptr, void* o_ptr,
+__global__ void k_seqmajor_to_bhsd_pad(
+    const __nv_bfloat16* __restrict__ in,
+    __nv_bfloat16* __restrict__ out,
+    int in_seq, int out_seq, int nh, int hd) {
+    size_t total = (size_t)out_seq * nh * hd;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += (size_t)blockDim.x * gridDim.x) {
+        int d = idx % hd;
+        size_t tmp = idx / hd;
+        int s = tmp % out_seq;
+        int h = tmp / out_seq;
+        if (s < in_seq) {
+            size_t in_idx = ((size_t)s * nh + h) * hd + d;
+            out[idx] = in[in_idx];
+        } else {
+            out[idx] = __float2bfloat16(0.0f);
+        }
+    }
+}
+
+static void copy_seqmajor_to_bhsd_pad(const __nv_bfloat16* in_ptr, __nv_bfloat16* out_ptr,
+                                      int in_seq, int out_seq, int nh, int hd,
+                                      cudaStream_t stream) {
+    size_t total = (size_t)out_seq * nh * hd;
+    int max_blocks = std::max(1, 8 * g_nsm);
+    int blocks = std::max(1, (int)std::min<size_t>((total + 255) / 256, (size_t)max_blocks));
+    k_seqmajor_to_bhsd_pad<<<blocks, 256, 0, stream>>>(in_ptr, out_ptr, in_seq, out_seq, nh, hd);
+}
+
+__global__ void k_center_k_seqmajor_to_bhsd(
+    const __nv_bfloat16* __restrict__ in,
+    __nv_bfloat16* __restrict__ out,
+    int valid_seq, int padded_seq, int nh, int hd) {
+    int h = blockIdx.x;
+    int d2 = threadIdx.x;
+    int hd2 = hd >> 1;
+    if (d2 >= hd2) return;
+    __nv_bfloat16* head_out = out + (size_t)h * padded_seq * hd;
+    int d = d2 << 1;
+
+    float sum0 = 0.0f, sum1 = 0.0f;
+    for (int s = 0; s < valid_seq; s++) {
+        size_t in_idx = ((size_t)s * nh + h) * hd + d;
+        float2 v = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(in + in_idx));
+        sum0 += v.x;
+        sum1 += v.y;
+    }
+    __nv_bfloat16 mean0_bf = __float2bfloat16(sum0 / valid_seq);
+    __nv_bfloat16 mean1_bf = __float2bfloat16(sum1 / valid_seq);
+    float mean0 = __bfloat162float(mean0_bf);
+    float mean1 = __bfloat162float(mean1_bf);
+
+    for (int s = 0; s < valid_seq; s++) {
+        size_t in_idx = ((size_t)s * nh + h) * hd + d;
+        float2 v = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(in + in_idx));
+        *reinterpret_cast<__nv_bfloat162*>(head_out + (size_t)s * hd + d) =
+            __floats2bfloat162_rn(v.x - mean0, v.y - mean1);
+    }
+    for (int s = valid_seq; s < padded_seq; s++) {
+        *reinterpret_cast<__nv_bfloat162*>(head_out + (size_t)s * hd + d) =
+            __floats2bfloat162_rn(0.0f, 0.0f);
+    }
+}
+
+__global__ void k_mean_k_seqmajor(
+    const __nv_bfloat16* __restrict__ in,
+    __nv_bfloat16* __restrict__ mean_out,
+    int valid_seq, int nh, int hd) {
+    int h = blockIdx.x;
+    int d = threadIdx.x;
+    if (d >= hd) return;
+    float sum = 0.0f;
+    for (int s = 0; s < valid_seq; s++) {
+        size_t in_idx = ((size_t)s * nh + h) * hd + d;
+        sum += __bfloat162float(in[in_idx]);
+    }
+    mean_out[h * hd + d] = __float2bfloat16(sum / valid_seq);
+}
+
+__global__ void k_group_mean_center_q_seqmajor_to_bhsd(
+    const __nv_bfloat16* __restrict__ in,
+    __nv_bfloat16* __restrict__ out_centered,
+    __nv_bfloat16* __restrict__ out_mean,
+    int valid_seq, int groups, int padded_seq, int nh, int hd) {
+    int g = blockIdx.x;
+    int h = blockIdx.y;
+    int d2 = threadIdx.x;
+    int hd2 = hd >> 1;
+    if (d2 >= hd2) return;
+    __nv_bfloat16* head_out = out_centered + (size_t)h * padded_seq * hd;
+    __nv_bfloat16* head_mean = out_mean + ((size_t)h * groups + g) * hd;
+    int base_s = g * 128;
+    int d = d2 << 1;
+
+    float sum0 = 0.0f, sum1 = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 128; j++) {
+        int s = base_s + j;
+        if (s < valid_seq) {
+            size_t in_idx = ((size_t)s * nh + h) * hd + d;
+            float2 v = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(in + in_idx));
+            sum0 += v.x;
+            sum1 += v.y;
+        }
+    }
+    __nv_bfloat16 mean0_bf = __float2bfloat16(sum0 * (1.0f / 128.0f));
+    __nv_bfloat16 mean1_bf = __float2bfloat16(sum1 * (1.0f / 128.0f));
+    float mean0 = __bfloat162float(mean0_bf);
+    float mean1 = __bfloat162float(mean1_bf);
+    *reinterpret_cast<__nv_bfloat162*>(head_mean + d) = __halves2bfloat162(mean0_bf, mean1_bf);
+
+    #pragma unroll
+    for (int j = 0; j < 128; j++) {
+        int s = base_s + j;
+        float out0 = 0.0f, out1 = 0.0f;
+        if (s < valid_seq) {
+            size_t in_idx = ((size_t)s * nh + h) * hd + d;
+            float2 v = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(in + in_idx));
+            out0 = v.x - mean0;
+            out1 = v.y - mean1;
+        }
+        *reinterpret_cast<__nv_bfloat162*>(head_out + (size_t)s * hd + d) =
+            __floats2bfloat162_rn(out0, out1);
+    }
+}
+
+__global__ void k_bhsd_to_seqmajor_bf16(
+    const __nv_bfloat16* __restrict__ in,
+    __nv_bfloat16* __restrict__ out,
+    int in_seq, int out_seq, int nh, int hd) {
+    size_t total = (size_t)out_seq * nh * hd;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += (size_t)blockDim.x * gridDim.x) {
+        int d = idx % hd;
+        size_t tmp = idx / hd;
+        int h = tmp % nh;
+        int s = tmp / nh;
+        size_t in_idx = ((size_t)h * in_seq + s) * hd + d;
+        out[idx] = in[in_idx];
+    }
+}
+
+__global__ void k_bhsd_to_seqmajor_bf16_fp8(
+    const __nv_bfloat16* __restrict__ in,
+    __nv_bfloat16* __restrict__ out_bf16,
+    __nv_fp8_e4m3* __restrict__ out_fp8,
+    int in_seq, int out_seq, int nh, int hd) {
+    size_t total = (size_t)out_seq * nh * hd;
+    auto* out_fp8_bytes = (unsigned char*)out_fp8;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += (size_t)blockDim.x * gridDim.x) {
+        int d = idx % hd;
+        size_t tmp = idx / hd;
+        int h = tmp % nh;
+        int s = tmp / nh;
+        size_t in_idx = ((size_t)h * in_seq + s) * hd + d;
+        __nv_bfloat16 v = in[in_idx];
+        if (out_bf16) out_bf16[idx] = v;
+        if (out_fp8_bytes) out_fp8_bytes[idx] = bf16_to_fp8_byte(v);
+    }
+}
+
+static void copy_bhsd_ptr_to_seqmajor_bf16(const __nv_bfloat16* in_ptr, void* o_ptr,
+                                           int in_seq, int out_seq, int nh, int hd,
+                                           cudaStream_t stream) {
+    auto* out_ptr = (__nv_bfloat16*)o_ptr;
+    size_t total = (size_t)out_seq * nh * hd;
+    int max_blocks = std::max(1, 8 * g_nsm);
+    int blocks = std::max(1, (int)std::min<size_t>((total + 255) / 256, (size_t)max_blocks));
+    k_bhsd_to_seqmajor_bf16<<<blocks, 256, 0, stream>>>(in_ptr, out_ptr, in_seq, out_seq, nh, hd);
+}
+
+static void copy_bhsd_ptr_to_seqmajor_bf16_fp8(const __nv_bfloat16* in_ptr,
+                                               void* o_bf16_ptr,
+                                               __nv_fp8_e4m3* o_fp8_ptr,
+                                               int in_seq, int out_seq, int nh, int hd,
+                                               cudaStream_t stream) {
+    auto* out_bf16 = (__nv_bfloat16*)o_bf16_ptr;
+    size_t total = (size_t)out_seq * nh * hd;
+    int max_blocks = std::max(1, 8 * g_nsm);
+    int blocks = std::max(1, (int)std::min<size_t>((total + 255) / 256, (size_t)max_blocks));
+    k_bhsd_to_seqmajor_bf16_fp8<<<blocks, 256, 0, stream>>>(in_ptr, out_bf16, o_fp8_ptr, in_seq, out_seq, nh, hd);
+}
+
+static void copy_bhsd_to_seqmajor_bf16(const at::Tensor& o_bhsd, void* o_ptr,
+                                       int sq, int nh, int hd, cudaStream_t stream) {
+    auto* in_ptr = (__nv_bfloat16*)o_bhsd.data_ptr();
+    copy_bhsd_ptr_to_seqmajor_bf16(in_ptr, o_ptr, sq, sq, nh, hd, stream);
+}
+
+static void copy_bhsd_to_seqmajor_bf16_fp8(const at::Tensor& o_bhsd,
+                                           void* o_bf16_ptr,
+                                           __nv_fp8_e4m3* o_fp8_ptr,
+                                           int sq, int nh, int hd,
+                                           cudaStream_t stream) {
+    auto* in_ptr = (__nv_bfloat16*)o_bhsd.data_ptr();
+    copy_bhsd_ptr_to_seqmajor_bf16_fp8(in_ptr, o_bf16_ptr, o_fp8_ptr, sq, sq, nh, hd, stream);
+}
+
+static uint8_t *b_sage_q_packed = nullptr, *b_sage_k_packed = nullptr, *b_sage_v_packed = nullptr;
+static uint8_t *b_sage_q_sf = nullptr, *b_sage_k_sf = nullptr, *b_sage_v_sf = nullptr;
+static __nv_bfloat16 *b_sage_q_bhsd = nullptr, *b_sage_k_bhsd = nullptr, *b_sage_v_bhsd = nullptr;
+static __nv_bfloat16 *b_sage_k_centered = nullptr, *b_sage_k_mean = nullptr, *b_sage_q_mean = nullptr;
+static __nv_bfloat16 *b_sage_o = nullptr;
+static float *b_sage_delta_s = nullptr;
+static float *b_sage_softmax_lse = nullptr;
+static int *b_sage_tile_count = nullptr;
+
+static void sageattn3_py_bf16(void* q_ptr, void* k_ptr, void* v_ptr,
+                              void* o_bf16_ptr, __nv_fp8_e4m3* o_fp8_ptr,
                               int sq, int sk, int nh, int hd, cudaStream_t stream) {
     py::gil_scoped_acquire gil;
     static py::object* sage3_fn = nullptr;
@@ -1663,7 +2400,31 @@ static void sageattn3_py_bf16(void* q_ptr, void* k_ptr, void* v_ptr, void* o_ptr
     auto K = wrap_seqmajor_bf16(k_ptr, sk, nh, hd);
     auto V = wrap_seqmajor_bf16(v_ptr, sk, nh, hd);
     auto O = (*sage3_fn)(Q, K, V).cast<at::Tensor>();
-    copy_bhsd_to_seqmajor_bf16(O.narrow(2, 0, sq).contiguous(), o_ptr, sq, nh, hd, stream);
+    copy_bhsd_to_seqmajor_bf16_fp8(O.narrow(2, 0, sq).contiguous(), o_bf16_ptr, o_fp8_ptr, sq, nh, hd, stream);
+}
+
+static void run_sage_delta_s_gemm(const __nv_bfloat16* qm_ptr,
+                                  const __nv_bfloat16* k_centered_ptr,
+                                  float* out_ptr,
+                                  int nh, int q_groups, int k_seq, int hd,
+                                  cudaStream_t stream) {
+    float alpha = 1.0f, beta = 0.0f;
+    long long stride_k = (long long)k_seq * hd;
+    long long stride_qm = (long long)q_groups * hd;
+    long long stride_out = (long long)q_groups * k_seq;
+    CKBL(cublasSetStream(g_blasH, stream));
+    CKBL(cublasGemmStridedBatchedEx(
+        g_blasH,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        k_seq, q_groups, hd,
+        &alpha,
+        k_centered_ptr, CUDA_R_16BF, hd, stride_k,
+        qm_ptr, CUDA_R_16BF, hd, stride_qm,
+        &beta,
+        out_ptr, CUDA_R_32F, k_seq, stride_out,
+        nh,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
 static at::Tensor pad_seq_to_128(const at::Tensor& x) {
@@ -1677,49 +2438,53 @@ static at::Tensor pad_seq_to_128(const at::Tensor& x) {
     return out;
 }
 
-static void sageattn3_cpp_bf16(void* q_ptr, void* k_ptr, void* v_ptr, void* o_ptr,
+static void sageattn3_cpp_bf16(void* q_ptr, void* k_ptr, void* v_ptr,
+                               void* o_bf16_ptr, __nv_fp8_e4m3* o_fp8_ptr,
                                int sq, int sk, int nh, int hd, cudaStream_t stream) {
-    auto Q = wrap_seqmajor_bf16(q_ptr, sq, nh, hd);
-    auto K = wrap_seqmajor_bf16(k_ptr, sk, nh, hd);
-    auto V = wrap_seqmajor_bf16(v_ptr, sk, nh, hd);
-
-    auto k_mean = at::mean(K, std::vector<int64_t>{2}, true).to(K.scalar_type());
-    auto K_centered = (K - k_mean).contiguous();
-
-    auto Q_padded = pad_seq_to_128(Q);
-    auto K_padded = pad_seq_to_128(K_centered);
-    auto V_padded = pad_seq_to_128(V);
-    int64_t q_padded = Q_padded.size(2);
+    TORCH_CHECK(o_bf16_ptr != nullptr, "sageattn3_cpp_bf16 requires a BF16 output buffer");
+    int64_t q_padded = ((int64_t)sq + 127) & ~127LL;
+    int64_t k_padded = ((int64_t)sk + 127) & ~127LL;
     int64_t q_groups = q_padded / 128;
-
-    auto Q_grouped = Q_padded.reshape({1, nh, q_groups, 128, hd});
-    auto qm = at::mean(Q_grouped, std::vector<int64_t>{3}, false).to(Q_padded.scalar_type()).contiguous();
-    auto Q_centered = (Q_grouped - qm.unsqueeze(3)).contiguous().reshape({1, nh, q_padded, hd});
-    auto delta_s = at::matmul(qm, K_padded.transpose(-2, -1)).to(torch::kFloat32).contiguous();
-
-    auto byte_opts = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
-    auto fp8_opts = torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA);
-
-    auto q_packed = torch::empty({1, nh, q_padded, hd / 2}, byte_opts);
-    auto k_packed = torch::empty({1, nh, K_padded.size(2), hd / 2}, byte_opts);
-    auto v_packed = torch::empty({1, nh, hd, V_padded.size(2) / 2}, byte_opts);
-    auto q_sf = torch::empty({1, nh, q_padded, hd / 16}, fp8_opts);
-    auto k_sf = torch::empty({1, nh, K_padded.size(2), hd / 16}, fp8_opts);
-    auto v_sf = torch::empty({1, nh, hd, V_padded.size(2) / 16}, fp8_opts);
-
-    scaled_fp4_quant(Q_centered, q_packed, q_sf, 1);
-    scaled_fp4_quant_permute(K_padded, k_packed, k_sf, 1);
-    scaled_fp4_quant_trans(V_padded, v_packed, v_sf, 1);
-
     float softmax_scale = 1.0f / sqrtf((float)hd);
-    c10::optional<at::Tensor> out_opt = c10::nullopt;
-    auto out_seq = mha_fwd(
-        q_packed, k_packed, v_packed,
-        q_sf, k_sf, v_sf,
-        delta_s, sk, out_opt,
-        softmax_scale, false, true, true, -1, -1);
-    auto O = out_seq[0];
-    copy_bhsd_to_seqmajor_bf16(O.narrow(2, 0, sq).contiguous(), o_ptr, sq, nh, hd, stream);
+
+    k_group_mean_center_q_seqmajor_to_bhsd<<<dim3((unsigned int)q_groups, (unsigned int)nh), 64, 0, stream>>>(
+        (const __nv_bfloat16*)q_ptr, b_sage_q_bhsd, b_sage_q_mean, sq, (int)q_groups, (int)q_padded, nh, hd);
+    k_center_k_seqmajor_to_bhsd<<<nh, 64, 0, stream>>>(
+        (const __nv_bfloat16*)k_ptr, b_sage_k_centered, sk, (int)k_padded, nh, hd);
+
+    scaled_fp4_quant_bf16_raw_contig(
+        reinterpret_cast<const nv_bfloat16*>(b_sage_q_bhsd),
+        b_sage_q_packed, b_sage_q_sf,
+        1, nh, (int)q_padded, hd, stream);
+    scaled_fp4_quant_permute_bf16_raw_contig(
+        reinterpret_cast<const nv_bfloat16*>(b_sage_k_centered),
+        b_sage_k_packed, b_sage_k_sf,
+        1, nh, (int)k_padded, hd, stream);
+    scaled_fp4_quant_trans_bf16_raw_strided(
+        reinterpret_cast<const nv_bfloat16*>(v_ptr),
+        b_sage_v_packed, b_sage_v_sf,
+        1, nh, sk, hd,
+        sk * nh * hd, hd, nh * hd, stream);
+
+    run_sage_delta_s_gemm(
+        b_sage_q_mean,
+        b_sage_k_centered,
+        b_sage_delta_s,
+        nh, (int)q_groups, (int)k_padded, hd, stream);
+
+    CK(cudaMemsetAsync(b_sage_tile_count, 0, sizeof(int), stream));
+    mha_fwd_contiguous_bf16_raw(
+        b_sage_q_packed, b_sage_k_packed, b_sage_v_packed,
+        b_sage_q_sf, b_sage_k_sf, b_sage_v_sf,
+        b_sage_delta_s,
+        b_sage_o, b_sage_softmax_lse, b_sage_tile_count,
+        1, nh, (int)q_padded, (int)k_padded, sk, hd,
+        softmax_scale, false, true, -1, -1, stream);
+    if (o_fp8_ptr) {
+        copy_bhsd_ptr_to_seqmajor_bf16_fp8(b_sage_o, o_bf16_ptr, o_fp8_ptr, (int)q_padded, sq, nh, hd, stream);
+    } else {
+        copy_bhsd_ptr_to_seqmajor_bf16(b_sage_o, o_bf16_ptr, (int)q_padded, sq, nh, hd, stream);
+    }
 }
 #define DO_GEMM  (g_profile_mode == 0 || g_profile_mode == 1 || g_profile_mode == 4 || g_profile_mode == 6)
 #define DO_EWISE (g_profile_mode == 0 || g_profile_mode == 2 || g_profile_mode == 4 || g_profile_mode == 5)
@@ -1764,6 +2529,8 @@ static float *b_gdn_gates_g = nullptr, *b_gdn_gates_beta = nullptr;
 static float *b_gdn_state = nullptr;  // [NL_GDN * NH * K * V]
 static int g_n_gdn_layers = 0;
 static bool g_gdn_use_cublas_chunk = false; // Recurrent (1.27x). Chunk correct but needs MMA fwd_o to beat recurrent.
+static bool g_cutlass_fused_ffn1 = false;
+static bool g_cutlass_fused_ffn2 = false;
 static std::vector<int> g_gdn_layer_indices;  // which layers are GDN
 // Chunk algorithm scratch buffers (allocated in engine_init)
 static float *b_gdn_chunk_w = nullptr;     // [NC, NH, BT, K]
@@ -1772,11 +2539,10 @@ static float *b_gdn_chunk_gcum = nullptr;  // [NC, NH, BT]
 
 // Graph-internal input buffers
 static __nv_bfloat16 *g_x_buf = nullptr, *g_enc_buf = nullptr;
-static float *g_temb_buf = nullptr, *g_ssts_buf = nullptr;
+static float *g_temb_buf = nullptr, *g_ssts_buf = nullptr, *g_rope_buf = nullptr;
 static bool g_use_graph = false;
 static cudaStream_t g_graph_stream = nullptr;
-static std::unordered_map<int, cudaGraphExec_t> g_graphs_by_seq;
-static std::unordered_map<int, int> g_graph_temb_rows;
+static std::unordered_map<uint64_t, cudaGraphExec_t> g_graphs_by_key;
 
 // ============================================================
 // cuBLASLt chunk GDN: helper functions (need globals above)
@@ -1905,6 +2671,12 @@ struct SeqGemms {
     bool fp8_sdpa_built = false;
     bool bf16_attn_built = false;
     bool bf16_ffn_built = false;
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+    CutlassFusedFfn1 f1_fused;
+    bool f1_fused_built = false;
+    CutlassFusedFfn2 f2_fused;
+    bool f2_fused_built = false;
+#endif
 
     // GatedDeltaNet GEMMs
     FP8Gemm gdn_q, gdn_k, gdn_v, gdn_g, gdn_o;
@@ -1959,6 +2731,16 @@ SeqGemms* get_gemms(int seq) {
         g.f2_bf16.setup(g_ltH, seq, D, FFNpr, g_gemm_ws, 32*1024*1024, row_epi);
         g.bf16_ffn_built = true;
     }
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+    if (g_cutlass_fused_ffn1 && !g.f1_fused_built) {
+        g.f1_fused.setup(seq, FFNpr, D);
+        g.f1_fused_built = true;
+    }
+    if (g_cutlass_fused_ffn2 && !g.f2_fused_built) {
+        g.f2_fused.setup(seq, D, FFNpr);
+        g.f2_fused_built = true;
+    }
+#endif
     float scl = 1.f / sqrtf((float)g_HD);
     g.sa_sdpa.build(g_cudnnH, g_NH_per_rank, seq, seq, g_HD, scl);
     if (g_fp8_sdpa_enabled) {
@@ -2048,16 +2830,63 @@ void engine_init(int64_t D, int64_t NH, int64_t HD, int64_t NL,
     CK(cudaGetDeviceProperties(&prop, dev));
     g_nsm = prop.multiProcessorCount;
 
+    CKBL(cublasCreate(&g_blasH));
     CKBL(cublasLtCreate(&g_ltH));
     cudnnCreate(&g_cudnnH);
+
+    const char* lt_autotune_env = getenv("KAIROS_LT_AUTOTUNE");
+    if (lt_autotune_env) {
+        g_lt_autotune_enabled = atoi(lt_autotune_env) != 0;
+    }
+    const char* lt_topk_env = getenv("KAIROS_LT_AUTOTUNE_TOPK");
+    if (lt_topk_env) {
+        g_lt_autotune_topk = std::max(1, atoi(lt_topk_env));
+    }
+    const char* gemm_ws_env = getenv("KAIROS_GEMM_WS_MB");
+    if (gemm_ws_env) {
+        g_gemm_ws_bytes = (size_t)std::max(1, atoi(gemm_ws_env)) * 1024 * 1024;
+    }
+    const char* fast_accum_env = getenv("KAIROS_LT_FAST_ACCUM_FP8");
+    if (fast_accum_env) {
+        g_lt_fast_accum_fp8 = atoi(fast_accum_env) != 0;
+    }
+    const char* fused_ffn1_env = getenv("KAIROS_FUSED_FFN1_CUTLASS");
+    if (fused_ffn1_env) {
+        g_cutlass_fused_ffn1 = atoi(fused_ffn1_env) != 0;
+    }
+    const char* fused_ffn2_env = getenv("KAIROS_FUSED_FFN2_CUTLASS");
+    if (fused_ffn2_env) {
+        g_cutlass_fused_ffn2 = atoi(fused_ffn2_env) != 0;
+    }
+#if !defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) && !defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+    if (g_cutlass_fused_ffn1) {
+        printf("  [CUTLASS FFN1] disabled: SM120 CUTLASS support not compiled in\n");
+        g_cutlass_fused_ffn1 = false;
+    }
+    if (g_cutlass_fused_ffn2) {
+        printf("  [CUTLASS FFN2] disabled: SM120 CUTLASS support not compiled in\n");
+        g_cutlass_fused_ffn2 = false;
+    }
+#endif
+    if (g_cutlass_fused_ffn1) {
+        printf("  [CUTLASS FFN1] enabled via KAIROS_FUSED_FFN1_CUTLASS=1\n");
+    }
+    if (g_cutlass_fused_ffn2) {
+        printf("  [CUTLASS FFN2] enabled via KAIROS_FUSED_FFN2_CUTLASS=1\n");
+    }
+    if (g_lt_fast_accum_fp8) {
+        printf("  [cuBLASLt] FP8 fast accumulation enabled via KAIROS_LT_FAST_ACCUM_FP8=1\n");
+    }
 
     float one = 1.f;
     CK(cudaMalloc(&g_scaleA, 4)); CK(cudaMemcpy(g_scaleA, &one, 4, cudaMemcpyHostToDevice));
     CK(cudaMalloc(&g_scaleB, 4)); CK(cudaMemcpy(g_scaleB, &one, 4, cudaMemcpyHostToDevice));
-    CK(cudaMalloc(&g_gemm_ws, 32 * 1024 * 1024));
+    CK(cudaMalloc(&g_gemm_ws, g_gemm_ws_bytes));
 
     auto abf16 = [](size_t n) { __nv_bfloat16* p; CK(cudaMalloc(&p, n * 2)); return p; };
     auto afp8  = [](size_t n) { __nv_fp8_e4m3* p; CK(cudaMalloc(&p, n)); return p; };
+    auto au8   = [](size_t n) { uint8_t* p; CK(cudaMalloc(&p, n)); return p; };
+    auto af32n = [](size_t n) { float* p; CK(cudaMalloc(&p, n * sizeof(float))); return p; };
 
     b_norm = abf16(max_seq * D); b_q = abf16(max_seq * D); b_k = abf16(max_seq * D); b_v = abf16(max_seq * D);
     b_attn = abf16(max_seq * D); b_sa_out = abf16(max_seq * D);
@@ -2067,6 +2896,27 @@ void engine_init(int64_t D, int64_t NH, int64_t HD, int64_t NL,
     b_norm_fp8 = afp8(max_seq * D); b_ca_norm_fp8 = afp8(max_seq * D); b_ffn_norm_fp8 = afp8(max_seq * D);
     b_sa_out_fp8 = afp8(max_seq * D); b_ca_out_fp8 = afp8(max_seq * D); b_ffn_mid_fp8 = afp8(max_seq * FFN);
     b_enc_fp8 = afp8(ctx * CA_K_DIM);
+    {
+        size_t sage_seq = (size_t)(((int)max_seq + 127) / 128) * 128;
+        size_t nh_hd = (size_t)g_NH_per_rank * (size_t)HD;
+        size_t sage_groups = sage_seq / 128;
+        b_sage_q_bhsd = abf16(nh_hd * sage_seq);
+        b_sage_k_bhsd = abf16(nh_hd * sage_seq);
+        b_sage_v_bhsd = abf16(nh_hd * sage_seq);
+        b_sage_k_centered = abf16(nh_hd * sage_seq);
+        b_sage_o = abf16(nh_hd * sage_seq);
+        b_sage_k_mean = abf16((size_t)g_NH_per_rank * (size_t)HD);
+        b_sage_q_mean = abf16((size_t)g_NH_per_rank * sage_groups * (size_t)HD);
+        b_sage_delta_s = af32n((size_t)g_NH_per_rank * sage_groups * sage_seq);
+        b_sage_q_packed = au8(nh_hd * sage_seq / 2);
+        b_sage_k_packed = au8(nh_hd * sage_seq / 2);
+        b_sage_v_packed = au8(nh_hd * sage_seq / 2);
+        b_sage_q_sf = au8(nh_hd * sage_seq / 16);
+        b_sage_k_sf = au8(nh_hd * sage_seq / 16);
+        b_sage_v_sf = au8(nh_hd * sage_seq / 16);
+        b_sage_softmax_lse = af32n((size_t)g_NH_per_rank * sage_seq);
+        CK(cudaMalloc(&b_sage_tile_count, sizeof(int)));
+    }
 
     // FP8 SDPA (opt-in via ENGINE_FP8_SDPA=1)
     const char* fp8_sdpa_env = getenv("ENGINE_FP8_SDPA");
@@ -2103,6 +2953,7 @@ void engine_init(int64_t D, int64_t NH, int64_t HD, int64_t NL,
     CK(cudaMalloc(&g_enc_buf, (size_t)ctx * CA_K_DIM * sizeof(__nv_bfloat16)));
     CK(cudaMalloc(&g_temb_buf, (size_t)max_seq * 6 * D * sizeof(float)));
     CK(cudaMalloc(&g_ssts_buf, (size_t)NL * 6 * D * sizeof(float)));
+    CK(cudaMalloc(&g_rope_buf, (size_t)max_seq * 2 * HD * sizeof(float)));
     CK(cudaStreamCreateWithFlags(&g_graph_stream, cudaStreamNonBlocking));
 
     // TP RMSNorm scratch buffers
@@ -2200,6 +3051,69 @@ void engine_prepare_seq(int64_t seq) {
 
 void engine_prepare_ca(int64_t ca_len) {
     get_ca_gemms((int)ca_len);
+}
+
+static void update_actual_ctx_and_gemms(int actual_ctx) {
+    if (actual_ctx <= 0) actual_ctx = g_ctx;
+    TORCH_CHECK(actual_ctx <= g_ctx, "actual ctx ", actual_ctx, " > max ctx ", g_ctx);
+    if (actual_ctx == g_actual_ctx) {
+        return;
+    }
+    g_actual_ctx = actual_ctx;
+    g_ck.setup(g_ltH, actual_ctx, g_D_per_rank, g_CA_K_DIM, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
+    g_cv.setup(g_ltH, actual_ctx, g_D_per_rank, g_CA_K_DIM, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
+    g_ck_bf16.setup(g_ltH, actual_ctx, g_D_per_rank, g_CA_K_DIM, g_gemm_ws, 32*1024*1024, 1);
+    g_cv_bf16.setup(g_ltH, actual_ctx, g_D_per_rank, g_CA_K_DIM, g_gemm_ws, 32*1024*1024, 1);
+    g_ck_bf16_built = true;
+    g_ca_gemms_by_len.clear();
+    g_ca_kv_cache_valid = false;
+}
+
+void engine_build_ca_kv_cache(torch::Tensor enc_t) {
+    TORCH_CHECK(g_ready, "engine not initialized");
+    TORCH_CHECK(enc_t.is_cuda(), "enc_t must be CUDA");
+    TORCH_CHECK(enc_t.scalar_type() == torch::kBFloat16, "enc_t must be bfloat16");
+    TORCH_CHECK(enc_t.dim() == 2, "enc_t must have shape [ctx, D]");
+    TORCH_CHECK((int)enc_t.size(1) == g_CA_K_DIM, "enc dim mismatch");
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    int ctx = (int)enc_t.size(0);
+    int Dpr = g_D_per_rank;
+    bool TP = (g_tp_world > 1);
+    update_actual_ctx_and_gemms(ctx);
+
+    auto* enc_ptr = (__nv_bfloat16*)enc_t.data_ptr();
+    if (!g_force_bf16_gemms) {
+        k_bf16_to_fp8<<<g_nsm, 256, 0, stream>>>(b_enc_fp8, enc_ptr, ctx * g_CA_K_DIM);
+    }
+
+    for (int li = 0; li < g_NL; li++) {
+        auto& L = g_layers[li];
+        size_t ca_kv_slot = (size_t)li * (size_t)g_ctx * (size_t)Dpr;
+        size_t bytes = (size_t)ctx * Dpr * sizeof(__nv_bfloat16);
+
+        if (g_force_bf16_gemms) {
+            g_ck_bf16.run(g_ltH, L.ck_w16, enc_ptr, b_ca_k, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.ckb);
+            g_cv_bf16.run(g_ltH, L.cv_w16, enc_ptr, b_ca_v, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.cvb);
+        } else {
+            g_ck.run(g_ltH, L.ck_w8, b_enc_fp8, b_ca_k, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.ckb);
+            g_cv.run(g_ltH, L.cv_w8, b_enc_fp8, b_ca_v, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.cvb);
+        }
+
+        if (!TP) {
+            k_rmsnorm<<<ctx, 256, 0, stream>>>(b_ca_k, L.ca_rms_k, Dpr);
+        } else {
+            k_partial_sumsq<<<ctx, 256, 0, stream>>>(b_ca_k, b_tp_sumsq_ck, Dpr);
+            CKNCCL(ncclAllReduce(b_tp_sumsq_ck, b_tp_sumsq_ck, (size_t)ctx, ncclFloat32, ncclSum, g_nccl_comm, stream));
+            size_t smem_rr = (size_t)Dpr * sizeof(__nv_bfloat16);
+            k_apply_rmsnorm_rope<<<ctx, 256, smem_rr, stream>>>(b_ca_k, L.ca_rms_k, nullptr, b_tp_sumsq_ck, g_D, g_NH_per_rank, g_HD);
+        }
+
+        CK(cudaMemcpyAsync(b_ca_k_cache + ca_kv_slot, b_ca_k, bytes, cudaMemcpyDeviceToDevice, stream));
+        CK(cudaMemcpyAsync(b_ca_v_cache + ca_kv_slot, b_ca_v, bytes, cudaMemcpyDeviceToDevice, stream));
+    }
+
+    g_ca_kv_cache_valid = true;
 }
 
 // ============================================================
@@ -2411,7 +3325,9 @@ static void forward_core(
     int ca_len_Dpr = ca_len * Dpr;
 
     // Convert encoder to FP8 once (skip in force_bf16 mode — use enc directly)
-    if (DO_EWISE && !g_force_bf16_gemms) k_bf16_to_fp8<<<g_nsm, 256, 0, stream>>>(b_enc_fp8, enc, ctx * g_CA_K_DIM);
+    if (DO_EWISE && !g_force_bf16_gemms && !g_ca_kv_cache_valid) {
+        k_bf16_to_fp8<<<g_nsm, 256, 0, stream>>>(b_enc_fp8, enc, ctx * g_CA_K_DIM);
+    }
 
     size_t ssts_layer_stride = (size_t)6 * D;
 
@@ -2687,20 +3603,38 @@ static void forward_core(
                 if (DO_GEMM) gm->f1_bf16.run(g_ltH, L.f1_w16, b_ffn_norm, b_ffn_mid, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f1b);
                 if (DO_EWISE) k_silu_bf16<<<(seq_FFNpr + 255) / 256, 256, 0, stream>>>(b_ffn_mid, seq_FFNpr);
             } else {
-                if (DO_GEMM) gm->f1.run(g_ltH, L.f1_w8, b_ffn_norm_fp8, b_ffn_mid, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f1b);
-                if (DO_EWISE) k_silu_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_ffn_mid, b_ffn_mid_fp8, seq_FFNpr);
+                bool use_fused_ffn1 = g_cutlass_fused_ffn1 && DO_GEMM && DO_EWISE;
+                if (use_fused_ffn1) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+                    gm->f1_fused.run(L.f1_w8, b_ffn_norm_fp8, b_ffn_mid_fp8, L.f1b, stream);
+#else
+                    TORCH_CHECK(false, "CUTLASS fused FFN1 requested without SM120 CUTLASS support");
+#endif
+                } else {
+                    if (DO_GEMM) gm->f1.run(g_ltH, L.f1_w8, b_ffn_norm_fp8, b_ffn_mid, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f1b);
+                    if (DO_EWISE) k_silu_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_ffn_mid, b_ffn_mid_fp8, seq_FFNpr);
+                }
             }
             // FFN2
             if (g_force_bf16_gemms) {
                 if (DO_GEMM) gm->f2_bf16.run(g_ltH, L.f2_w16, b_ffn_mid, b_ffn_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f2b);
             } else {
-                if (DO_GEMM) gm->f2.run(g_ltH, L.f2_w8, b_ffn_mid_fp8, b_ffn_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f2b);
+                bool use_fused_ffn2 = g_cutlass_fused_ffn2 && DO_GEMM;
+                if (use_fused_ffn2) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+                    gm->f2_fused.run(L.f2_w8, b_ffn_mid_fp8, b_ffn_out, L.f2b, stream);
+#else
+                    TORCH_CHECK(false, "CUTLASS fused FFN2 requested without SM120 CUTLASS support");
+#endif
+                } else {
+                    if (DO_GEMM) gm->f2.run(g_ltH, L.f2_w8, b_ffn_mid_fp8, b_ffn_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f2b);
+                }
             }
             if (TP) CKNCCL(ncclAllReduce(b_ffn_out, b_ffn_out, (size_t)seq_D, ncclBfloat16, ncclSum, g_nccl_comm, stream));
             // FFN gate residual (with optional fusion to next layer)
             if (DO_EWISE) {
-                int next_quad = -1;  // DISABLED: force separate gate + LN to debug
-                if (false && next_quad >= 0) {
+                int next_quad = (li + 1 < end_layer && !is_gdn_layer(li + 1)) ? (li + 1) : -1;
+                if (next_quad >= 0) {
                     float* ssts_L_next = ssts_base + next_quad * ssts_layer_stride;
                     float* next_ssts_scale_sa = ssts_L_next + 0 * D;
                     float* next_ssts_shift_sa = ssts_L_next + 1 * D;
@@ -2781,20 +3715,22 @@ static void forward_core(
             // ---- SDPA ----
             if (g_sdpa_backend == SdpaBackend::SageAttn3Py) {
                 if (DO_SDPA) {
-                    sageattn3_py_bf16(b_q, b_k, b_v, b_attn, seq, seq, NHpr, HD, stream);
+                    sageattn3_py_bf16(
+                        b_q, b_k, b_v,
+                        g_force_bf16_gemms ? b_attn : nullptr,
+                        (DO_EWISE && !g_force_bf16_gemms) ? b_sa_out_fp8 : nullptr,
+                        seq, seq, NHpr, HD, stream);
                 }
                 if (DO_TIME) TREC(3);
-                if (DO_EWISE && !g_force_bf16_gemms) {
-                    k_bf16_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_sa_out_fp8, b_attn, seq_Dpr);
-                }
             } else if (g_sdpa_backend == SdpaBackend::SageAttn3Cpp) {
                 if (DO_SDPA) {
-                    sageattn3_cpp_bf16(b_q, b_k, b_v, b_attn, seq, seq, NHpr, HD, stream);
+                    sageattn3_cpp_bf16(
+                        b_q, b_k, b_v,
+                        b_attn,
+                        (DO_EWISE && !g_force_bf16_gemms) ? b_sa_out_fp8 : nullptr,
+                        seq, seq, NHpr, HD, stream);
                 }
                 if (DO_TIME) TREC(3);
-                if (DO_EWISE && !g_force_bf16_gemms) {
-                    k_bf16_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_sa_out_fp8, b_attn, seq_Dpr);
-                }
             } else if (g_fp8_sdpa_enabled && gm->fp8_sdpa_built && !g_force_bf16_gemms) {
                 if (DO_EWISE) {
                     if (!q_fp8_fused) {
@@ -2969,8 +3905,17 @@ static void forward_core(
                 if (DO_GEMM) gm->f1_bf16.run(g_ltH, L.f1_w16, b_ffn_norm, b_ffn_mid, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f1b);
                 if (DO_EWISE) k_silu_bf16<<<(seq_FFNpr + 255) / 256, 256, 0, stream>>>(b_ffn_mid, seq_FFNpr);
             } else {
-                if (DO_GEMM) gm->f1.run(g_ltH, L.f1_w8, b_ffn_norm_fp8, b_ffn_mid, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f1b);
-                if (DO_EWISE) k_silu_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_ffn_mid, b_ffn_mid_fp8, seq_FFNpr);
+                bool use_fused_ffn1 = g_cutlass_fused_ffn1 && DO_GEMM && DO_EWISE;
+                if (use_fused_ffn1) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+                    gm->f1_fused.run(L.f1_w8, b_ffn_norm_fp8, b_ffn_mid_fp8, L.f1b, stream);
+#else
+                    TORCH_CHECK(false, "CUTLASS fused FFN1 requested without SM120 CUTLASS support");
+#endif
+                } else {
+                    if (DO_GEMM) gm->f1.run(g_ltH, L.f1_w8, b_ffn_norm_fp8, b_ffn_mid, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f1b);
+                    if (DO_EWISE) k_silu_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_ffn_mid, b_ffn_mid_fp8, seq_FFNpr);
+                }
             }
             if (DO_TIME) TREC(10);
 
@@ -2978,7 +3923,16 @@ static void forward_core(
             if (g_force_bf16_gemms) {
                 if (DO_GEMM) gm->f2_bf16.run(g_ltH, L.f2_w16, b_ffn_mid, b_ffn_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f2b);
             } else {
-                if (DO_GEMM) gm->f2.run(g_ltH, L.f2_w8, b_ffn_mid_fp8, b_ffn_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f2b);
+                bool use_fused_ffn2 = g_cutlass_fused_ffn2 && DO_GEMM;
+                if (use_fused_ffn2) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+                    gm->f2_fused.run(L.f2_w8, b_ffn_mid_fp8, b_ffn_out, L.f2b, stream);
+#else
+                    TORCH_CHECK(false, "CUTLASS fused FFN2 requested without SM120 CUTLASS support");
+#endif
+                } else {
+                    if (DO_GEMM) gm->f2.run(g_ltH, L.f2_w8, b_ffn_mid_fp8, b_ffn_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f2b);
+                }
             }
             if (TP) {
                 CKNCCL(ncclAllReduce(b_ffn_out, b_ffn_out, (size_t)seq_D, ncclBfloat16, ncclSum, g_nccl_comm, stream));
@@ -2988,9 +3942,8 @@ static void forward_core(
             // Optimization 3: fuse gate_res + next-layer SA LN when the next layer
             // is also in range AND is a quadratic layer (not GatedDeltaNet).
             if (DO_EWISE) {
-                // Find the next quadratic layer in range
-                int next_quad = -1;  // DISABLED: force separate gate + LN to debug
-                if (false && next_quad >= 0) {
+                int next_quad = (li + 1 < end_layer && !is_gdn_layer(li + 1)) ? (li + 1) : -1;
+                if (next_quad >= 0) {
                     // Fused: gate_res + next layer's SA LN
                     float* ssts_L_next = ssts_base + next_quad * ssts_layer_stride;
                     float* next_ssts_scale_sa = ssts_L_next + 0 * D;
@@ -3053,6 +4006,24 @@ static void forward_core(
 // ============================================================
 void set_use_graph(int64_t flag) { g_use_graph = (flag != 0); }
 
+static uint64_t make_graph_key(
+    int seq, int actual_ctx, int ca_len, int temb_rows,
+    int start_layer, int end_layer, bool has_rope)
+{
+    uint64_t key = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) {
+        key ^= v + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
+    };
+    mix((uint64_t)seq);
+    mix((uint64_t)actual_ctx);
+    mix((uint64_t)ca_len);
+    mix((uint64_t)temb_rows);
+    mix((uint64_t)start_layer);
+    mix((uint64_t)end_layer);
+    mix(has_rope ? 1ull : 0ull);
+    return key;
+}
+
 torch::Tensor engine_forward(
     torch::Tensor x_t,      // [seq, D] bf16
     torch::Tensor enc_t,    // [ctx, CA_K_DIM] bf16
@@ -3070,25 +4041,11 @@ torch::Tensor engine_forward(
     if (ca_l <= 0 || ca_l > seq) ca_l = seq;
     // Set actual context size from encoder tensor (may be < g_ctx)
     int actual_ctx = (int)enc_t.size(0);
-    if (actual_ctx != g_actual_ctx) {
-        g_actual_ctx = actual_ctx;
-        // Rebuild CA K/V GEMMs for actual ctx if different from init
-        if (actual_ctx != g_ctx && actual_ctx > 0) {
-            g_ck.setup(g_ltH, actual_ctx, g_D_per_rank, g_CA_K_DIM, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
-            g_cv.setup(g_ltH, actual_ctx, g_D_per_rank, g_CA_K_DIM, g_scaleA, g_scaleB, g_gemm_ws, 32*1024*1024, 1);
-            // Always rebuild BF16 K/V GEMMs (used unconditionally for CA K/V)
-            g_ck_bf16.setup(g_ltH, actual_ctx, g_D_per_rank, g_CA_K_DIM, g_gemm_ws, 32*1024*1024, 1);
-            g_cv_bf16.setup(g_ltH, actual_ctx, g_D_per_rank, g_CA_K_DIM, g_gemm_ws, 32*1024*1024, 1);
-            g_ck_bf16_built = true;
-            // Clear CA SDPA cache so it rebuilds with correct K/V length
-            g_ca_gemms_by_len.clear();
-            g_ca_kv_cache_valid = false;
-        }
-    }
-    TORCH_CHECK(actual_ctx <= g_ctx, "actual ctx ", actual_ctx, " > max ctx ", g_ctx);
+    update_actual_ctx_and_gemms(actual_ctx);
     int temb_rows = temb_t.size(0);
     int temb_row_stride = (temb_rows == 1) ? 0 : (6 * g_D);
-    float* rope_ptr = rope_t.numel() > 0 ? rope_t.data_ptr<float>() : nullptr;
+    bool has_rope = (rope_t.numel() > 0);
+    float* rope_ptr = has_rope ? rope_t.data_ptr<float>() : nullptr;
 
     int sl = (int)start_layer;
     int el = (int)end_layer;
@@ -3107,9 +4064,10 @@ torch::Tensor engine_forward(
 
     // CUDA graph path
     size_t x_bytes = (size_t)seq * g_D * sizeof(__nv_bfloat16);
-    size_t enc_bytes = (size_t)g_ctx * g_CA_K_DIM * sizeof(__nv_bfloat16);
+    size_t enc_bytes = (size_t)actual_ctx * g_CA_K_DIM * sizeof(__nv_bfloat16);
     size_t temb_bytes = (size_t)temb_rows * 6 * g_D * sizeof(float);
     size_t ssts_bytes = (size_t)g_NL * 6 * g_D * sizeof(float);
+    size_t rope_bytes = has_rope ? (size_t)seq * 2 * g_HD * sizeof(float) : 0;
 
     CK(cudaStreamSynchronize(stream));
 
@@ -3117,27 +4075,31 @@ torch::Tensor engine_forward(
     CK(cudaMemcpyAsync(g_enc_buf, enc_t.data_ptr(), enc_bytes, cudaMemcpyDeviceToDevice, g_graph_stream));
     CK(cudaMemcpyAsync(g_temb_buf, temb_t.data_ptr(), temb_bytes, cudaMemcpyDeviceToDevice, g_graph_stream));
     CK(cudaMemcpyAsync(g_ssts_buf, ssts_t.data_ptr(), ssts_bytes, cudaMemcpyDeviceToDevice, g_graph_stream));
+    if (has_rope) {
+        CK(cudaMemcpyAsync(g_rope_buf, rope_t.data_ptr(), rope_bytes, cudaMemcpyDeviceToDevice, g_graph_stream));
+    }
 
-    // Graph key includes seq, start_layer, end_layer
-    int graph_key = seq * 10000 + sl * 100 + el;
-    auto git = g_graphs_by_seq.find(graph_key);
-    if (git == g_graphs_by_seq.end()) {
+    // Graph key includes the dimensions and branch shape that affect capture.
+    uint64_t graph_key = make_graph_key(seq, actual_ctx, ca_l, temb_rows, sl, el, has_rope);
+    float* graph_rope_ptr = has_rope ? g_rope_buf : nullptr;
+    auto git = g_graphs_by_key.find(graph_key);
+    if (git == g_graphs_by_key.end()) {
         // Warmup
-        forward_core(g_x_buf, g_enc_buf, g_temb_buf, g_ssts_buf, rope_ptr,
+        forward_core(g_x_buf, g_enc_buf, g_temb_buf, g_ssts_buf, graph_rope_ptr,
                      seq, ca_l, temb_row_stride, sl, el, g_graph_stream);
         CK(cudaStreamSynchronize(g_graph_stream));
         // Capture
         CK(cudaStreamBeginCapture(g_graph_stream, cudaStreamCaptureModeRelaxed));
-        forward_core(g_x_buf, g_enc_buf, g_temb_buf, g_ssts_buf, rope_ptr,
+        forward_core(g_x_buf, g_enc_buf, g_temb_buf, g_ssts_buf, graph_rope_ptr,
                      seq, ca_l, temb_row_stride, sl, el, g_graph_stream);
         cudaGraph_t graph;
         CK(cudaStreamEndCapture(g_graph_stream, &graph));
         cudaGraphExec_t graph_exec;
         CK(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
         CK(cudaGraphDestroy(graph));
-        g_graphs_by_seq[graph_key] = graph_exec;
-        g_graph_temb_rows[graph_key] = temb_rows;
-        printf("  Built graph for seq=%d layers=[%d,%d)\n", seq, sl, el);
+        g_graphs_by_key[graph_key] = graph_exec;
+        printf("  Built graph for seq=%d ctx=%d ca=%d temb=%d rope=%d layers=[%d,%d)\n",
+               seq, actual_ctx, ca_l, temb_rows, has_rope ? 1 : 0, sl, el);
         CK(cudaGraphLaunch(graph_exec, g_graph_stream));
     } else {
         CK(cudaGraphLaunch(git->second, g_graph_stream));
@@ -3190,6 +4152,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("load", &engine_load, "Load one layer's weights");
     m.def("load_gdn", &engine_load_gdn, "Load GDN weights for one linear attention layer");
     m.def("reset_gdn_state", &engine_reset_gdn_state, "Reset GDN recurrent state (call between inferences)");
+    m.def("build_ca_kv_cache", &engine_build_ca_kv_cache,
+          "Build CA K/V cache inside the engine from encoder states");
     m.def("set_ca_kv_cache", &engine_set_ca_kv_cache,
           "Write pre-computed CA K/V for one layer into the engine cache");
     m.def("set_ca_kv_cache_valid", &engine_set_ca_kv_cache_valid,
@@ -3288,4 +4252,62 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             u_out.reshape({NC, (long)NH, BT, (long)V}),
             g_out.reshape({NC, (long)NH, BT}));
     }, "Run chunk prepare kernel and return w, u, gcum tensors");
+    m.def("run_sage3_cpp", [](torch::Tensor q_t, torch::Tensor k_t, torch::Tensor v_t) {
+        TORCH_CHECK(g_ready, "engine not initialized");
+        TORCH_CHECK(q_t.is_cuda() && k_t.is_cuda() && v_t.is_cuda(), "inputs must be CUDA");
+        TORCH_CHECK(q_t.scalar_type() == torch::kBFloat16 &&
+                    k_t.scalar_type() == torch::kBFloat16 &&
+                    v_t.scalar_type() == torch::kBFloat16, "inputs must be bf16");
+        TORCH_CHECK(q_t.dim() == 3 && k_t.dim() == 3 && v_t.dim() == 3, "inputs must be [T,NH,HD]");
+        int T = (int)q_t.size(0);
+        int NH = (int)q_t.size(1);
+        int HD = (int)q_t.size(2);
+        TORCH_CHECK((int)k_t.size(0) == T && (int)k_t.size(1) == NH && (int)k_t.size(2) == HD, "k shape mismatch");
+        TORCH_CHECK((int)v_t.size(0) == T && (int)v_t.size(1) == NH && (int)v_t.size(2) == HD, "v shape mismatch");
+        auto o_out = torch::zeros({T, NH, HD}, torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        sageattn3_cpp_bf16(
+            q_t.data_ptr(), k_t.data_ptr(), v_t.data_ptr(),
+            o_out.data_ptr(), nullptr,
+            T, T, NH, HD, stream);
+        CK(cudaStreamSynchronize(stream));
+        return o_out;
+    }, "Run native SageAttention3 path directly");
+    m.def("run_gdn_recurrent", [](torch::Tensor q_t, torch::Tensor k_t, torch::Tensor v_t,
+                                   torch::Tensor g_t, torch::Tensor beta_t, double scale) {
+        TORCH_CHECK(g_ready, "engine not initialized");
+        TORCH_CHECK(q_t.is_cuda() && k_t.is_cuda() && v_t.is_cuda() &&
+                    g_t.is_cuda() && beta_t.is_cuda(), "inputs must be CUDA");
+        TORCH_CHECK(q_t.scalar_type() == torch::kBFloat16 &&
+                    k_t.scalar_type() == torch::kBFloat16 &&
+                    v_t.scalar_type() == torch::kBFloat16, "q/k/v must be bf16");
+        TORCH_CHECK(g_t.scalar_type() == torch::kFloat32 &&
+                    beta_t.scalar_type() == torch::kFloat32, "g and beta must be f32");
+        TORCH_CHECK(q_t.dim() == 3 && k_t.dim() == 3 && v_t.dim() == 3, "q/k/v must be [T,NH,K/V]");
+        TORCH_CHECK(g_t.dim() == 2 && beta_t.dim() == 2, "g/beta must be [T,NH]");
+        int T = (int)q_t.size(0);
+        int NH = (int)q_t.size(1);
+        int K = (int)q_t.size(2);
+        int V = (int)v_t.size(2);
+        TORCH_CHECK((int)k_t.size(0) == T && (int)k_t.size(1) == NH && (int)k_t.size(2) == K, "k shape mismatch");
+        TORCH_CHECK((int)v_t.size(0) == T && (int)v_t.size(1) == NH, "v shape mismatch");
+        TORCH_CHECK((int)g_t.size(0) == T && (int)g_t.size(1) == NH, "g shape mismatch");
+        TORCH_CHECK((int)beta_t.size(0) == T && (int)beta_t.size(1) == NH, "beta shape mismatch");
+        TORCH_CHECK(K % GDN_BK == 0 && V % GDN_BV == 0, "K/V must align with GDN tiles");
+        auto o_out = torch::zeros({T, NH, V}, torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+        auto state = torch::zeros({NH, K, V}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        int NV_blocks = V / GDN_BV;
+        int total_tiles = NH * NV_blocks;
+        int zero = 0;
+        CK(cudaMemcpyToSymbolAsync(g_gdn_work_counter, &zero, sizeof(int), 0, cudaMemcpyHostToDevice, stream));
+        int n_persistent = std::min(total_tiles, g_nsm * 8);
+        k_gdn_recurrent<<<n_persistent, 32, 0, stream>>>(
+            (__nv_bfloat16*)q_t.data_ptr(), (__nv_bfloat16*)k_t.data_ptr(), (__nv_bfloat16*)v_t.data_ptr(),
+            (float*)g_t.data_ptr(), (float*)beta_t.data_ptr(),
+            (__nv_bfloat16*)o_out.data_ptr(), (float*)state.data_ptr(),
+            T, NH, K, V, (float)scale, total_tiles);
+        CK(cudaStreamSynchronize(stream));
+        return std::make_tuple(o_out, state);
+    }, "Run fused GDN recurrent kernel directly");
 }

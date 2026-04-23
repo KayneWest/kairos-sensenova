@@ -347,7 +347,11 @@ def main():
     print(f"  Estimated max_seq: {T_lat}×{H_lat}×{W_lat} = {max_seq}")
 
     patch_dit_engine(pipeline_eng, max_seq=max_seq, ctx_len=512)
-    # patch_vae_engine(pipeline_eng)  # disabled — investigating output quality
+    use_vae_patch = os.environ.get("KAIROS_ENGINE_PATCH_VAE", "1").strip().lower() not in {"0", "false", "no", "off"}
+    if use_vae_patch:
+        patch_vae_engine(pipeline_eng)
+    else:
+        print("  VAE patch: disabled")
 
     video_engine, elapsed_engine, nf = generate_video(pipeline_eng, input_args, seed=args.seed)
     fps_engine = nf / elapsed_engine

@@ -1218,30 +1218,42 @@ def model_fn_wan_video(
     if tea_cache_update:
         x = tea_cache.update(x)
     else:
-        def create_custom_forward(module):
-            def custom_forward(*inputs):
-                return module(*inputs)
-            return custom_forward
+        use_engine_fastpath = (
+            hasattr(dit, "_kairos_engine_run_blocks")
+            and not use_gradient_checkpointing
+            and not use_gradient_checkpointing_offload
+            and vace_context is None
+        )
 
-        for block_id, block in enumerate(dit.blocks):
-            if use_gradient_checkpointing_offload:
-                with torch.autograd.graph.save_on_cpu():
+        if use_engine_fastpath:
+            x = dit._kairos_engine_run_blocks(
+                x, context, t_mod, freqs, grid_size, context_mask=context_mask
+            )
+        else:
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+                return custom_forward
+
+            for block_id, block in enumerate(dit.blocks):
+                if use_gradient_checkpointing_offload:
+                    with torch.autograd.graph.save_on_cpu():
+                        x = torch.utils.checkpoint.checkpoint(
+                            create_custom_forward(block),
+                            x, context, t_mod, freqs, grid_size, context_mask,
+                            use_reentrant=False
+                        )
+                elif use_gradient_checkpointing:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
                         x, context, t_mod, freqs, grid_size, context_mask,
-                        use_reentrant=False
+                        use_reentrant=False,
                     )
-            elif use_gradient_checkpointing:
-                x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, context, t_mod, freqs, grid_size, context_mask,
-                    use_reentrant=False,
-                )
-            else:
-                x = block(x, context, t_mod, freqs, grid_size, context_mask=context_mask)
-            if vace_context is not None and block_id in vace.vace_layers_mapping:
-                current_vace_hint = vace_hints[vace.vace_layers_mapping[block_id]]
-                x = x + current_vace_hint * vace_scale
+                else:
+                    x = block(x, context, t_mod, freqs, grid_size, context_mask=context_mask)
+                if vace_context is not None and block_id in vace.vace_layers_mapping:
+                    current_vace_hint = vace_hints[vace.vace_layers_mapping[block_id]]
+                    x = x + current_vace_hint * vace_scale
         if tea_cache is not None:
             tea_cache.store(x)
 

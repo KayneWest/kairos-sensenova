@@ -206,11 +206,19 @@ def profile_engine(dit, x, context, t_mod, freqs, grid_size, seq_len, ctx_len,
     nl = patch_engine(dit, max_seq=seq_len, ctx_len=ctx_len,
                       seq_list=[seq_len], verbose=True)
 
+    engine_runner = getattr(dit, "_kairos_engine_run_blocks", None)
+
+    def run_engine_once(x_in):
+        if engine_runner is not None:
+            return engine_runner(x_in, context, t_mod, freqs, grid_size)
+        for block in dit.blocks:
+            x_in = block(x_in, context, t_mod, freqs, grid_size)
+        return x_in
+
     # Warmup
     for _ in range(warmup):
         x_in = x.clone()
-        for block in dit.blocks:
-            x_in = block(x_in, context, t_mod, freqs, grid_size)
+        x_in = run_engine_once(x_in)
     torch.cuda.synchronize()
 
     # Timed runs
@@ -219,8 +227,7 @@ def profile_engine(dit, x, context, t_mod, freqs, grid_size, seq_len, ctx_len,
         x_in = x.clone()
         torch.cuda.synchronize()
         t0 = time.time()
-        for block in dit.blocks:
-            x_in = block(x_in, context, t_mod, freqs, grid_size)
+        x_in = run_engine_once(x_in)
         torch.cuda.synchronize()
         times.append((time.time() - t0) * 1000)
 
@@ -229,6 +236,129 @@ def profile_engine(dit, x, context, t_mod, freqs, grid_size, seq_len, ctx_len,
     print(f"\n--- Engine timing ---")
     print(f"  avg={avg:.1f} ms, min={mn:.1f} ms ({iters} iters)")
     return avg
+
+
+def _prepare_engine_inputs(x, context, t_mod, freqs, hd):
+    xi = x.squeeze(0).contiguous() if x.dim() == 3 else x.contiguous()
+    enci = context.squeeze(0).contiguous() if context.dim() == 3 else context.contiguous()
+
+    ei = t_mod.float().contiguous()
+    while ei.dim() > 3:
+        ei = ei.squeeze(2) if ei.shape[2] == 1 else ei.squeeze(0)
+    if ei.dim() == 2:
+        ei = ei.unsqueeze(0)
+
+    from kairos_ext.kairos_engine_patch import _kairos_rope_to_helios
+    if freqs is not None and freqs.numel() > 0:
+        if freqs.is_complex():
+            rope = _kairos_rope_to_helios(freqs.detach(), hd).to(xi.device)
+        else:
+            rope = freqs.float().contiguous()
+            if rope.dim() == 3:
+                rope = rope.squeeze(0)
+    else:
+        rope = torch.empty(0, device=xi.device, dtype=torch.float32)
+    return xi, enci, ei, rope
+
+
+@torch.no_grad()
+def profile_engine_breakdown(dit, x, context, t_mod, freqs, grid_size, seq_len, ctx_len,
+                             warmup=1, iters=2, engine_sdpa_backend="cudnn"):
+    del grid_size
+    os.environ["KAIROS_ENGINE_SDPA_BACKEND"] = engine_sdpa_backend
+    from kairos_ext.kairos_engine_patch import patch_engine, get_ext
+
+    pre_blocks = list(dit.blocks)
+    first_nh = getattr(pre_blocks[0].self_attn, "num_heads", 20)
+    hd = x.shape[-1] // first_nh
+    ssts_stacked = torch.stack([b.modulation.data.float().squeeze(0) for b in pre_blocks]).contiguous()
+    gdn_layers = [i for i, b in enumerate(pre_blocks) if getattr(b, "use_linear_attn", False)]
+    quad_layers = [i for i, b in enumerate(pre_blocks) if not getattr(b, "use_linear_attn", False)]
+
+    nl = patch_engine(dit, max_seq=seq_len, ctx_len=ctx_len,
+                      seq_list=[seq_len], verbose=True)
+    ext = get_ext()
+
+    xi, enci, ei, rope = _prepare_engine_inputs(x, context, t_mod, freqs, hd)
+    ca_len = xi.shape[0]
+
+    ext.reset_gdn_state()
+    ext.build_ca_kv_cache(enci)
+    ext.prepare_ca(ca_len)
+
+    def time_range(start_layer, end_layer, profile_mode=0, warmup_local=warmup, iters_local=iters):
+        ext.set_profile_mode(profile_mode)
+        for _ in range(warmup_local):
+            ext.reset_gdn_state()
+            _ = ext.forward(xi.clone(), enci, ei, ssts_stacked, rope, ca_len, start_layer, end_layer)
+        torch.cuda.synchronize()
+
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters_local)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters_local)]
+        times = []
+        for i in range(iters_local):
+            ext.reset_gdn_state()
+            starts[i].record()
+            _ = ext.forward(xi.clone(), enci, ei, ssts_stacked, rope, ca_len, start_layer, end_layer)
+            ends[i].record()
+        torch.cuda.synchronize()
+        for i in range(iters_local):
+            times.append(starts[i].elapsed_time(ends[i]))
+        return sum(times) / len(times), min(times)
+
+    print("\n--- Engine Layer Breakdown ---")
+    full_avg, full_min = time_range(0, nl)
+    print(f"  Full engine: avg={full_avg:.1f} ms, min={full_min:.1f} ms")
+
+    layer_rows = []
+    for li in range(nl):
+        avg_ms, min_ms = time_range(li, li + 1, warmup_local=0, iters_local=1)
+        kind = "GDN" if li in gdn_layers else "QAT"
+        layer_rows.append((avg_ms, min_ms, li, kind))
+
+    layer_rows.sort(reverse=True)
+    print("\n  Slowest individual layers:")
+    for avg_ms, min_ms, li, kind in layer_rows[:8]:
+        print(f"    Layer {li:2d} [{kind}]: {avg_ms:7.2f} ms")
+
+    quad_times = [avg for avg, _, _, kind in layer_rows if kind == "QAT"]
+    gdn_times = [avg for avg, _, _, kind in layer_rows if kind == "GDN"]
+    print("\n  Layer-type averages:")
+    if quad_times:
+        print(f"    QAT avg/layer: {sum(quad_times)/len(quad_times):.2f} ms")
+    if gdn_times:
+        print(f"    GDN avg/layer: {sum(gdn_times)/len(gdn_times):.2f} ms")
+
+    mode_names = {
+        0: "all",
+        1: "gemm_only",
+        2: "ewise_only",
+        3: "sdpa_only",
+        4: "no_sdpa",
+        5: "no_gemm",
+        6: "no_ewise",
+    }
+    rep_quad = next((li for _, _, li, kind in layer_rows if kind == "QAT"), None)
+    rep_gdn = next((li for _, _, li, kind in layer_rows if kind == "GDN"), None)
+
+    for title, li in (("Representative QAT", rep_quad), ("Representative GDN", rep_gdn)):
+        if li is None:
+            continue
+        print(f"\n  {title} layer {li}:")
+        for mode in (0, 1, 2, 3, 4, 5, 6):
+            avg_ms, _ = time_range(li, li + 1, profile_mode=mode, warmup_local=0, iters_local=1)
+            print(f"    {mode_names[mode]:>10}: {avg_ms:7.2f} ms")
+        ext.set_profile_mode(0)
+
+    return {
+        "full_avg_ms": full_avg,
+        "full_min_ms": full_min,
+        "layer_rows": layer_rows,
+        "quad_avg_ms": (sum(quad_times) / len(quad_times)) if quad_times else None,
+        "gdn_avg_ms": (sum(gdn_times) / len(gdn_times)) if gdn_times else None,
+        "rep_quad": rep_quad,
+        "rep_gdn": rep_gdn,
+    }
 
 
 @torch.no_grad()
@@ -362,7 +492,7 @@ def correctness_check(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["stock", "engine", "both", "torch_prof", "correctness"], default="stock")
+    parser.add_argument("--mode", choices=["stock", "engine", "engine_breakdown", "both", "torch_prof", "correctness"], default="stock")
     parser.add_argument("--attn-backend", choices=["sdpa", "flashattention", "sageattention", "sageattention3", "auto"], default="sdpa")
     parser.add_argument("--engine-sdpa-backend", choices=["cudnn", "torch", "sage3_py", "sage3_cpp"], default="cudnn")
     parser.add_argument("--seq-len", type=int, default=7800)
@@ -409,6 +539,12 @@ def main():
                                    engine_sdpa_backend=args.engine_sdpa_backend)
         if args.mode == "both":
             print(f"\n--- Speedup: {stock_ms/engine_ms:.2f}x ---")
+    elif args.mode == "engine_breakdown":
+        profile_engine_breakdown(dit, x, context, t_mod, freqs, grid_size,
+                                 args.seq_len, args.ctx_len,
+                                 warmup=max(1, min(args.warmup, 2)),
+                                 iters=max(1, min(args.iters, 2)),
+                                 engine_sdpa_backend=args.engine_sdpa_backend)
 
 
 if __name__ == "__main__":

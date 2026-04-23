@@ -200,6 +200,249 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     }));
 }
 
+void mha_fwd_contiguous_bf16_raw(
+        void *q_ptr,
+        void *k_ptr,
+        void *v_ptr,
+        void *sfq_ptr,
+        void *sfk_ptr,
+        void *sfv_ptr,
+        void *delta_s_ptr,
+        void *out_ptr,
+        float *softmax_lse_ptr,
+        int *tile_count_semaphore_ptr,
+        int batch_size,
+        int num_heads,
+        int seqlen_q,
+        int seqlen_k,
+        int unpadded_k,
+        int unpacked_head_size,
+        float softmax_scale,
+        bool is_causal,
+        bool per_block_mean,
+        int window_size_left,
+        int window_size_right,
+        cudaStream_t stream) {
+    int dev = -1;
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
+    cudaDeviceProp prop{};
+    C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
+    bool is_sm120 = prop.major == 12 && prop.minor == 0;
+    bool is_sm121 = prop.major == 12 && prop.minor == 1;
+    TORCH_CHECK(is_sm120 || is_sm121, "only supports Blackwell GPUs or newer.");
+    TORCH_CHECK(batch_size > 0, "batch size must be positive");
+    TORCH_CHECK(unpacked_head_size == 64 || unpacked_head_size == 128 || unpacked_head_size == 256,
+                "Only support head size 64, 128, and 256 for now");
+    TORCH_CHECK(num_heads > 0, "num_heads must be positive");
+    TORCH_CHECK(seqlen_q > 0 && seqlen_k > 0, "sequence lengths must be positive");
+    TORCH_CHECK(unpacked_head_size % 8 == 0, "head_size must be a multiple of 8");
+
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    int seqlen_q_rounded = round_multiple(seqlen_q, 128);
+    int seqlen_k_rounded = round_multiple(seqlen_k, 128);
+    int q_groups = seqlen_q / 128;
+
+    Flash_fwd_params params{};
+    params.q_ptr = q_ptr;
+    params.k_ptr = k_ptr;
+    params.v_ptr = v_ptr;
+    params.delta_s_ptr = delta_s_ptr;
+    params.sfq_ptr = sfq_ptr;
+    params.sfk_ptr = sfk_ptr;
+    params.sfv_ptr = sfv_ptr;
+    params.o_ptr = out_ptr;
+    params.softmax_lse_ptr = softmax_lse_ptr;
+    params.tile_count_semaphore = tile_count_semaphore_ptr;
+
+    params.q_batch_stride = (int64_t)num_heads * seqlen_q * unpacked_head_size;
+    params.k_batch_stride = (int64_t)num_heads * seqlen_k * unpacked_head_size;
+    params.v_batch_stride = (int64_t)num_heads * unpacked_head_size * seqlen_k;
+    params.q_row_stride = unpacked_head_size;
+    params.k_row_stride = unpacked_head_size;
+    params.v_row_stride = seqlen_k;
+    params.q_head_stride = (int64_t)seqlen_q * unpacked_head_size;
+    params.k_head_stride = (int64_t)seqlen_k * unpacked_head_size;
+    params.v_head_stride = (int64_t)unpacked_head_size * seqlen_k;
+
+    params.ds_batch_stride = (int64_t)num_heads * q_groups * seqlen_k;
+    params.ds_row_stride = seqlen_k;
+    params.ds_head_stride = (int64_t)q_groups * seqlen_k;
+
+    params.sfq_batch_stride = (int64_t)num_heads * seqlen_q * (unpacked_head_size / 16);
+    params.sfk_batch_stride = (int64_t)num_heads * seqlen_k * (unpacked_head_size / 16);
+    params.sfv_batch_stride = (int64_t)num_heads * unpacked_head_size * (seqlen_k / 16);
+    params.sfq_row_stride = unpacked_head_size / 16;
+    params.sfk_row_stride = unpacked_head_size / 16;
+    params.sfv_row_stride = seqlen_k / 16;
+    params.sfq_head_stride = (int64_t)seqlen_q * (unpacked_head_size / 16);
+    params.sfk_head_stride = (int64_t)seqlen_k * (unpacked_head_size / 16);
+    params.sfv_head_stride = (int64_t)unpacked_head_size * (seqlen_k / 16);
+
+    params.o_batch_stride = (int64_t)num_heads * seqlen_q * unpacked_head_size;
+    params.o_row_stride = unpacked_head_size;
+    params.o_head_stride = (int64_t)seqlen_q * unpacked_head_size;
+
+    params.b = batch_size;
+    params.h = num_heads;
+    params.h_k = num_heads;
+    params.h_h_k_ratio = 1;
+    params.seqlen_q = seqlen_q;
+    params.seqlen_k = seqlen_k;
+    params.unpadded_seqlen_k = unpadded_k;
+    params.seqlen_q_rounded = seqlen_q_rounded;
+    params.seqlen_k_rounded = seqlen_k_rounded;
+    params.d = unpacked_head_size;
+    params.d_rounded = unpacked_head_size;
+    params.head_divmod = cutlass::FastDivmod(num_heads);
+
+    params.scale_softmax = softmax_scale;
+    params.scale_softmax_log2 = softmax_scale * M_LOG2E;
+    __half scale_softmax_log2_half = __float2half(params.scale_softmax_log2);
+    __half2 scale_softmax_log2_half2 = __half2(scale_softmax_log2_half, scale_softmax_log2_half);
+    params.scale_softmax_log2_half2 = reinterpret_cast<uint32_t&>(scale_softmax_log2_half2);
+
+    params.p_dropout = 1.f;
+    params.p_dropout_in_uint8_t = 255;
+    params.rp_dropout = 1.f;
+    params.scale_softmax_rp_dropout = params.scale_softmax;
+
+    if (window_size_left < 0 && window_size_right >= 0) { window_size_left = seqlen_k; }
+    if (window_size_left >= 0 && window_size_right < 0) { window_size_right = seqlen_k; }
+    if (is_causal) { window_size_right = 0; }
+    params.is_causal = is_causal;
+    params.per_block_mean = per_block_mean;
+    params.seqlen_s = per_block_mean ? seqlen_q : 128;
+    params.window_size_left = window_size_left;
+    params.window_size_right = window_size_right;
+    params.is_seqlens_k_cumulative = true;
+    params.is_bf16 = true;
+
+    run_mha_fwd(params, stream);
+}
+
+void mha_fwd_strided_bf16_raw(
+        void *q_ptr,
+        void *k_ptr,
+        void *v_ptr,
+        void *sfq_ptr,
+        void *sfk_ptr,
+        void *sfv_ptr,
+        void *delta_s_ptr,
+        void *out_ptr,
+        float *softmax_lse_ptr,
+        int *tile_count_semaphore_ptr,
+        int batch_size,
+        int num_heads,
+        int seqlen_q,
+        int seqlen_k,
+        int unpadded_k,
+        int unpacked_head_size,
+        int64_t out_batch_stride,
+        int64_t out_head_stride,
+        int64_t out_row_stride,
+        float softmax_scale,
+        bool is_causal,
+        bool per_block_mean,
+        int window_size_left,
+        int window_size_right,
+        cudaStream_t stream) {
+    int dev = -1;
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
+    cudaDeviceProp prop{};
+    C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
+    bool is_sm120 = prop.major == 12 && prop.minor == 0;
+    bool is_sm121 = prop.major == 12 && prop.minor == 1;
+    TORCH_CHECK(is_sm120 || is_sm121, "only supports Blackwell GPUs or newer.");
+    TORCH_CHECK(batch_size > 0, "batch size must be positive");
+    TORCH_CHECK(unpacked_head_size == 64 || unpacked_head_size == 128 || unpacked_head_size == 256,
+                "Only support head size 64, 128, and 256 for now");
+    TORCH_CHECK(num_heads > 0, "num_heads must be positive");
+    TORCH_CHECK(seqlen_q > 0 && seqlen_k > 0, "sequence lengths must be positive");
+    TORCH_CHECK(unpacked_head_size % 8 == 0, "head_size must be a multiple of 8");
+
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    int seqlen_q_rounded = round_multiple(seqlen_q, 128);
+    int seqlen_k_rounded = round_multiple(seqlen_k, 128);
+    int q_groups = seqlen_q / 128;
+
+    Flash_fwd_params params{};
+    params.q_ptr = q_ptr;
+    params.k_ptr = k_ptr;
+    params.v_ptr = v_ptr;
+    params.delta_s_ptr = delta_s_ptr;
+    params.sfq_ptr = sfq_ptr;
+    params.sfk_ptr = sfk_ptr;
+    params.sfv_ptr = sfv_ptr;
+    params.o_ptr = out_ptr;
+    params.softmax_lse_ptr = softmax_lse_ptr;
+    params.tile_count_semaphore = tile_count_semaphore_ptr;
+
+    params.q_batch_stride = (int64_t)num_heads * seqlen_q * unpacked_head_size;
+    params.k_batch_stride = (int64_t)num_heads * seqlen_k * unpacked_head_size;
+    params.v_batch_stride = (int64_t)num_heads * unpacked_head_size * seqlen_k;
+    params.q_row_stride = unpacked_head_size;
+    params.k_row_stride = unpacked_head_size;
+    params.v_row_stride = seqlen_k;
+    params.q_head_stride = (int64_t)seqlen_q * unpacked_head_size;
+    params.k_head_stride = (int64_t)seqlen_k * unpacked_head_size;
+    params.v_head_stride = (int64_t)unpacked_head_size * seqlen_k;
+
+    params.ds_batch_stride = (int64_t)num_heads * q_groups * seqlen_k;
+    params.ds_row_stride = seqlen_k;
+    params.ds_head_stride = (int64_t)q_groups * seqlen_k;
+
+    params.sfq_batch_stride = (int64_t)num_heads * seqlen_q * (unpacked_head_size / 16);
+    params.sfk_batch_stride = (int64_t)num_heads * seqlen_k * (unpacked_head_size / 16);
+    params.sfv_batch_stride = (int64_t)num_heads * unpacked_head_size * (seqlen_k / 16);
+    params.sfq_row_stride = unpacked_head_size / 16;
+    params.sfk_row_stride = unpacked_head_size / 16;
+    params.sfv_row_stride = seqlen_k / 16;
+    params.sfq_head_stride = (int64_t)seqlen_q * (unpacked_head_size / 16);
+    params.sfk_head_stride = (int64_t)seqlen_k * (unpacked_head_size / 16);
+    params.sfv_head_stride = (int64_t)unpacked_head_size * (seqlen_k / 16);
+
+    params.o_batch_stride = out_batch_stride;
+    params.o_row_stride = out_row_stride;
+    params.o_head_stride = out_head_stride;
+
+    params.b = batch_size;
+    params.h = num_heads;
+    params.h_k = num_heads;
+    params.h_h_k_ratio = 1;
+    params.seqlen_q = seqlen_q;
+    params.seqlen_k = seqlen_k;
+    params.unpadded_seqlen_k = unpadded_k;
+    params.seqlen_q_rounded = seqlen_q_rounded;
+    params.seqlen_k_rounded = seqlen_k_rounded;
+    params.d = unpacked_head_size;
+    params.d_rounded = unpacked_head_size;
+    params.head_divmod = cutlass::FastDivmod(num_heads);
+
+    params.scale_softmax = softmax_scale;
+    params.scale_softmax_log2 = softmax_scale * M_LOG2E;
+    __half scale_softmax_log2_half = __float2half(params.scale_softmax_log2);
+    __half2 scale_softmax_log2_half2 = __half2(scale_softmax_log2_half, scale_softmax_log2_half);
+    params.scale_softmax_log2_half2 = reinterpret_cast<uint32_t&>(scale_softmax_log2_half2);
+
+    params.p_dropout = 1.f;
+    params.p_dropout_in_uint8_t = 255;
+    params.rp_dropout = 1.f;
+    params.scale_softmax_rp_dropout = params.scale_softmax;
+
+    if (window_size_left < 0 && window_size_right >= 0) { window_size_left = seqlen_k; }
+    if (window_size_left >= 0 && window_size_right < 0) { window_size_right = seqlen_k; }
+    if (is_causal) { window_size_right = 0; }
+    params.is_causal = is_causal;
+    params.per_block_mean = per_block_mean;
+    params.seqlen_s = per_block_mean ? seqlen_q : 128;
+    params.window_size_left = window_size_left;
+    params.window_size_right = window_size_right;
+    params.is_seqlens_k_cumulative = true;
+    params.is_bf16 = true;
+
+    run_mha_fwd(params, stream);
+}
+
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size // 2)
         const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x (head_size // 2)
