@@ -21,6 +21,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
+#include <cuda_pipeline_primitives.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <cuda_fp8.h>
@@ -1125,6 +1126,8 @@ __global__ void __launch_bounds__(32) k_gdn_recurrent(
     int total_tiles) {                     // NH * (V/BV)
     int lane = threadIdx.x;  // 0..31
     int k_off = lane * GDN_BK;
+    __shared__ __align__(16) __nv_bfloat16 s_q_pipe[2][256];
+    __shared__ __align__(16) __nv_bfloat16 s_k_pipe[2][256];
 
     // Persistent work loop: each block grabs the next (V_tile, head) pair
     while (true) {
@@ -1149,19 +1152,48 @@ __global__ void __launch_bounds__(32) k_gdn_recurrent(
             for (int vi = 0; vi < GDN_BV; vi++)
                 hr[ki][vi] = st[(size_t)(k_off + ki) * V + v_off + vi];
 
+        size_t qk_base0 = (size_t)h * K;
+        __pipeline_memcpy_async(reinterpret_cast<void*>(s_q_pipe[0] + k_off),
+                                reinterpret_cast<const void*>(q + qk_base0 + k_off),
+                                sizeof(int4));
+        __pipeline_memcpy_async(reinterpret_cast<void*>(s_k_pipe[0] + k_off),
+                                reinterpret_cast<const void*>(k + qk_base0 + k_off),
+                                sizeof(int4));
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncwarp();
+
         // Process ALL T tokens for this tile
         for (int t = 0; t < T; t++) {
-            size_t qk_base = ((size_t)t * NH + h) * K;
             size_t v_base = ((size_t)t * NH + h) * V;
 
-            // Load K once up front. Load Q later, just before the output
-            // reduction, to shorten its live range and ease register pressure.
             float my_k[GDN_BK];
-            load_bf16x8_to_f32(k + qk_base + k_off, my_k);
+            float my_q[GDN_BK];
+            int curr_buf = t & 1;
+            int next_buf = curr_buf ^ 1;
+            if (t + 1 < T) {
+                size_t qk_next_base = ((size_t)(t + 1) * NH + h) * K;
+                __pipeline_memcpy_async(reinterpret_cast<void*>(s_q_pipe[next_buf] + k_off),
+                                        reinterpret_cast<const void*>(q + qk_next_base + k_off),
+                                        sizeof(int4));
+                __pipeline_memcpy_async(reinterpret_cast<void*>(s_k_pipe[next_buf] + k_off),
+                                        reinterpret_cast<const void*>(k + qk_next_base + k_off),
+                                        sizeof(int4));
+                __pipeline_commit();
+            }
+            load_bf16x8_to_f32(s_k_pipe[curr_buf] + k_off, my_k);
+            load_bf16x8_to_f32(s_q_pipe[curr_buf] + k_off, my_q);
             float gt = (lane == 0) ? g[(size_t)t * NH + h] : 0.0f;
             float bt = (lane == 0) ? beta[(size_t)t * NH + h] : 0.0f;
             gt = __shfl_sync(0xffffffff, gt, 0);
             bt = __shfl_sync(0xffffffff, bt, 0);
+
+            float qk_dot = 0.0f;
+            #pragma unroll
+            for (int ki = 0; ki < GDN_BK; ki++)
+                qk_dot += my_q[ki] * my_k[ki];
+            qk_dot = warp_reduce(qk_dot);
+            qk_dot = __shfl_sync(0xffffffff, qk_dot, 0);
 
             // Decay
             float decay = __expf(gt);
@@ -1171,58 +1203,56 @@ __global__ void __launch_bounds__(32) k_gdn_recurrent(
                 for (int vi = 0; vi < GDN_BV; vi++)
                     hr[ki][vi] *= decay;
 
-            // h@k reduction
             float hk[GDN_BV];
+            float hq[GDN_BV];
             #pragma unroll
             for (int vi = 0; vi < GDN_BV; vi++) {
-                float acc = 0;
+                float acc_k = 0.0f;
+                float acc_q = 0.0f;
                 #pragma unroll
                 for (int ki = 0; ki < GDN_BK; ki++)
-                    acc += hr[ki][vi] * my_k[ki];
-                hk[vi] = acc;
+                {
+                    float hval = hr[ki][vi];
+                    acc_k += hval * my_k[ki];
+                    acc_q += hval * my_q[ki];
+                }
+                hk[vi] = acc_k;
+                hq[vi] = acc_q;
             }
             #pragma unroll
             for (int off = 16; off > 0; off >>= 1)
                 #pragma unroll
-                for (int vi = 0; vi < GDN_BV; vi++)
+                for (int vi = 0; vi < GDN_BV; vi++) {
                     hk[vi] += __shfl_down_sync(0xffffffff, hk[vi], off);
+                    hq[vi] += __shfl_down_sync(0xffffffff, hq[vi], off);
+                }
             #pragma unroll
-            for (int vi = 0; vi < GDN_BV; vi++)
+            for (int vi = 0; vi < GDN_BV; vi++) {
                 hk[vi] = __shfl_sync(0xffffffff, hk[vi], 0);
+                hq[vi] = __shfl_sync(0xffffffff, hq[vi], 0);
+            }
 
-            // Delta rule + state update
             float v_vals[GDN_BV];
             load_bf16x8_to_f32(v + v_base + v_off, v_vals);
+            float ov[GDN_BV];
             #pragma unroll
             for (int vi = 0; vi < GDN_BV; vi++) {
                 float vn = bt * (v_vals[vi] - hk[vi]);
+                ov[vi] = hq[vi] + qk_dot * vn;
                 #pragma unroll
                 for (int ki = 0; ki < GDN_BK; ki++)
                     hr[ki][vi] += my_k[ki] * vn;
             }
 
-            // Output
-            float my_q[GDN_BK];
-            load_bf16x8_to_f32(q + qk_base + k_off, my_q);
-            float ov[GDN_BV];
-            #pragma unroll
-            for (int vi = 0; vi < GDN_BV; vi++) {
-                float acc = 0;
-                #pragma unroll
-                for (int ki = 0; ki < GDN_BK; ki++)
-                    acc += hr[ki][vi] * my_q[ki];
-                ov[vi] = acc;
-            }
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1)
-                #pragma unroll
-                for (int vi = 0; vi < GDN_BV; vi++)
-                    ov[vi] += __shfl_down_sync(0xffffffff, ov[vi], off);
             if (lane == 0) {
                 size_t o_base = ((size_t)t * NH + h) * V;
                 #pragma unroll
                 for (int vi = 0; vi < GDN_BV; vi++)
                     o[o_base + v_off + vi] = __float2bfloat16(ov[vi]);
+            }
+            if (t + 1 < T) {
+                __pipeline_wait_prior(0);
+                __syncwarp();
             }
         }
 
@@ -4833,7 +4863,7 @@ static void forward_core(
                     int zero = 0;
                     cudaMemcpyToSymbolAsync(g_gdn_work_counter, &zero, sizeof(int), 0,
                                             cudaMemcpyHostToDevice, stream);
-                    int n_persistent = std::min(total_tiles, g_nsm * 8);
+                    int n_persistent = std::min(total_tiles, g_nsm * 12);
                     k_gdn_recurrent<<<n_persistent, 32, 0, stream>>>(
                         b_gdn_q, b_gdn_k, b_gdn_v,
                         b_gdn_gates_g, b_gdn_gates_beta,
@@ -6350,7 +6380,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         int total_tiles = NH * NV_blocks;
         int zero = 0;
         CK(cudaMemcpyToSymbolAsync(g_gdn_work_counter, &zero, sizeof(int), 0, cudaMemcpyHostToDevice, stream));
-        int n_persistent = std::min(total_tiles, g_nsm * 8);
+        int n_persistent = std::min(total_tiles, g_nsm * 12);
         k_gdn_recurrent<<<n_persistent, 32, 0, stream>>>(
             (__nv_bfloat16*)q_t.data_ptr(), (__nv_bfloat16*)k_t.data_ptr(), (__nv_bfloat16*)v_t.data_ptr(),
             (float*)g_t.data_ptr(), (float*)beta_t.data_ptr(),
