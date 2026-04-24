@@ -18,11 +18,16 @@ def init_ext(seq_len: int, nh: int, kdim: int, vdim: int):
     gdn_pb = int(os.environ.get("GDN_ONLY_PERSISTENT_BLOCKS", "8"))
     gdn_warp_cta = int(os.environ.get("GDN_ONLY_WARPS_PER_CTA", "1"))
     gdn_pipe_qk = int(os.environ.get("GDN_ONLY_PIPELINE_QK", "0"))
+    gdn_pipe_gbeta = int(os.environ.get("GDN_ONLY_PIPELINE_GBETA", "0"))
+    gdn_lineinfo = int(os.environ.get("GDN_ONLY_LINEINFO", "0"))
     prev_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
     os.environ["TORCH_CUDA_ARCH_LIST"] = "12.0a"
     try:
         ext = load(
-            name=f"gdn_recurrent_only_bv{gdn_bv}_pb{gdn_pb}_wcta{gdn_warp_cta}_pipe{gdn_pipe_qk}",
+            name=(
+                f"gdn_recurrent_only_bv{gdn_bv}_pb{gdn_pb}_wcta{gdn_warp_cta}"
+                f"_pipe{gdn_pipe_qk}_pgb{gdn_pipe_gbeta}_li{gdn_lineinfo}"
+            ),
             sources=[src],
             extra_include_paths=include_paths,
             extra_cuda_cflags=[
@@ -41,6 +46,8 @@ def init_ext(seq_len: int, nh: int, kdim: int, vdim: int):
                 f"-DGDN_PERSISTENT_BLOCKS_PER_SM={gdn_pb}",
                 f"-DGDN_WARPS_PER_CTA={gdn_warp_cta}",
                 f"-DGDN_PIPELINE_QK={gdn_pipe_qk}",
+                f"-DGDN_PIPELINE_GBETA={gdn_pipe_gbeta}",
+                *(["-lineinfo"] if gdn_lineinfo else []),
             ],
             verbose=False,
         )

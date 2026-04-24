@@ -1183,20 +1183,21 @@ __global__ void __launch_bounds__(32) k_gdn_recurrent(
             }
             load_bf16x8_to_f32(s_k_pipe[curr_buf] + k_off, my_k);
             load_bf16x8_to_f32(s_q_pipe[curr_buf] + k_off, my_q);
-            float gt = (lane == 0) ? g[(size_t)t * NH + h] : 0.0f;
-            float bt = (lane == 0) ? beta[(size_t)t * NH + h] : 0.0f;
-            gt = __shfl_sync(0xffffffff, gt, 0);
-            bt = __shfl_sync(0xffffffff, bt, 0);
+            float curr_gt = (lane == 0) ? g[(size_t)t * NH + h] : 0.0f;
+            float curr_bt = (lane == 0) ? beta[(size_t)t * NH + h] : 0.0f;
+            curr_gt = __shfl_sync(0xffffffff, curr_gt, 0);
+            curr_bt = __shfl_sync(0xffffffff, curr_bt, 0);
 
             float qk_dot = 0.0f;
             #pragma unroll
             for (int ki = 0; ki < GDN_BK; ki++)
                 qk_dot += my_q[ki] * my_k[ki];
-            qk_dot = warp_reduce(qk_dot);
-            qk_dot = __shfl_sync(0xffffffff, qk_dot, 0);
+            #pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1)
+                qk_dot += __shfl_xor_sync(0xffffffff, qk_dot, mask);
 
             // Decay
-            float decay = __expf(gt);
+            float decay = __expf(curr_gt);
             #pragma unroll
             for (int ki = 0; ki < GDN_BK; ki++)
                 #pragma unroll
@@ -1220,24 +1221,19 @@ __global__ void __launch_bounds__(32) k_gdn_recurrent(
                 hq[vi] = acc_q;
             }
             #pragma unroll
-            for (int off = 16; off > 0; off >>= 1)
+            for (int mask = 16; mask > 0; mask >>= 1)
                 #pragma unroll
                 for (int vi = 0; vi < GDN_BV; vi++) {
-                    hk[vi] += __shfl_down_sync(0xffffffff, hk[vi], off);
-                    hq[vi] += __shfl_down_sync(0xffffffff, hq[vi], off);
+                    hk[vi] += __shfl_xor_sync(0xffffffff, hk[vi], mask);
+                    hq[vi] += __shfl_xor_sync(0xffffffff, hq[vi], mask);
                 }
-            #pragma unroll
-            for (int vi = 0; vi < GDN_BV; vi++) {
-                hk[vi] = __shfl_sync(0xffffffff, hk[vi], 0);
-                hq[vi] = __shfl_sync(0xffffffff, hq[vi], 0);
-            }
 
             float v_vals[GDN_BV];
             load_bf16x8_to_f32(v + v_base + v_off, v_vals);
             float ov[GDN_BV];
             #pragma unroll
             for (int vi = 0; vi < GDN_BV; vi++) {
-                float vn = bt * (v_vals[vi] - hk[vi]);
+                float vn = curr_bt * (v_vals[vi] - hk[vi]);
                 ov[vi] = hq[vi] + qk_dot * vn;
                 #pragma unroll
                 for (int ki = 0; ki < GDN_BK; ki++)
