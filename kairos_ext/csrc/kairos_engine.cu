@@ -24,6 +24,7 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <cuda_fp8.h>
+#include <cuda_fp4.h>
 #include <cuda_bf16.h>
 #include <cudnn_frontend.h>
 #include <nccl.h>
@@ -33,11 +34,13 @@
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/gemm/collective/collective_builder.hpp>
+#include <cutlass/detail/sm100_blockscaled_layout.hpp>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
 #include <cutlass/epilogue/dispatch_policy.hpp>
 #include <cutlass/epilogue/fusion/operations.hpp>
 #include <cutlass/epilogue/thread/activation.h>
 #include <cutlass/util/packed_stride.hpp>
+#include <cutlass/util/host_tensor.h>
 #include <vector>
 #include <unordered_map>
 #include <memory>
@@ -121,6 +124,9 @@ void scaled_fp4_quant_trans(torch::Tensor const& input,
                             torch::Tensor const& output_sf,
                             int tensor_layout);
 
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+quantize_fp4_rowwise_bf16(torch::Tensor in_t);
+
 void scaled_fp4_quant_bf16_raw_contig(
     const nv_bfloat16* input,
     uint8_t* output,
@@ -202,9 +208,174 @@ __device__ __forceinline__ unsigned char bf16_to_fp8_byte(__nv_bfloat16 v) {
     return *reinterpret_cast<unsigned char*>(&fp8);
 }
 
+__device__ __forceinline__ unsigned char float_to_ue4m3_byte(float v) {
+    cutlass::float_ue4m3_t fp8(v);
+    return fp8.raw();
+}
+
+__device__ __forceinline__ float ue4m3_byte_to_float(unsigned char v) {
+    return static_cast<float>(cutlass::float_ue4m3_t::bitcast(v));
+}
+
 __device__ __forceinline__ float warp_reduce(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o);
     return v;
+}
+
+static inline int round_up_int(int x, int m) {
+    return ((x + m - 1) / m) * m;
+}
+
+static inline int fp4_scale_rows(int rows) {
+    return round_up_int(rows, 128);
+}
+
+static inline int fp4_scale_cols(int cols) {
+    TORCH_CHECK(cols % 16 == 0, "FP4 requires inner dimension divisible by 16, got ", cols);
+    return round_up_int(cols / 16, 4);
+}
+
+static inline unsigned char fp4_scale_one_byte() {
+    return cutlass::float_ue4m3_t(1.0f).raw();
+}
+
+static inline torch::Tensor swizzle_fp4_scales_rowwise(const torch::Tensor& scales) {
+    TORCH_CHECK(scales.is_cuda(), "scales must be CUDA");
+    TORCH_CHECK(scales.scalar_type() == torch::kUInt8, "scales must be uint8/E4M3 bytes");
+    TORCH_CHECK(scales.dim() == 2, "scales must be rank-2");
+    int rows = (int)scales.size(0);
+    int cols = (int)scales.size(1);
+    TORCH_CHECK(rows % 128 == 0, "FP4 scale rows must be padded to 128, got ", rows);
+    TORCH_CHECK(cols % 4 == 0, "FP4 scale cols must be padded to 4, got ", cols);
+    return scales.view({rows / 128, 4, 32, cols / 4, 4})
+        .permute({0, 3, 2, 1, 4})
+        .contiguous()
+        .view_as(scales);
+}
+
+__device__ __forceinline__ size_t fp4_swizzled_scale_index(int row, int scale_col, int scale_cols) {
+    int a = row >> 7;
+    int b = (row >> 5) & 3;
+    int c = row & 31;
+    int d = scale_col >> 2;
+    int e = scale_col & 3;
+    return ((((size_t)a * (size_t)(scale_cols >> 2) + d) * 32 + c) * 4 + b) * 4 + e;
+}
+
+__global__ void k_quantize_rowwise_bf16_to_fp4(
+    const __nv_bfloat16* __restrict__ in,
+    uint8_t* __restrict__ out_packed,
+    uint8_t* __restrict__ out_scales,
+    int rows,
+    int cols,
+    int scales_ld)
+{
+    constexpr float FP4_MAX = 6.0f;
+    int row = blockIdx.y;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warps_per_block = blockDim.x >> 5;
+    if (row >= rows) return;
+
+    int group32 = blockIdx.x * warps_per_block + warp;
+    int col_base = group32 * 32;
+    if (col_base >= cols) return;
+    int block16_0 = group32 * 2;
+    int block16_1 = block16_0 + 1;
+    bool valid0 = (col_base + 15) < cols;
+    bool valid1 = (col_base + 31) < cols;
+
+    float v = 0.0f;
+    int col = col_base + lane;
+    if (col < cols) {
+        v = __bfloat162float(in[(size_t)row * cols + col]);
+    }
+    float amax = fabsf(v);
+    for (int off = 8; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+    }
+    float amax0 = __shfl_sync(0xffffffff, amax, 0);
+    float amax1 = __shfl_sync(0xffffffff, amax, 16);
+
+    float decode_scale0 = (amax0 > 0.0f) ? (amax0 / FP4_MAX) : 1.0f;
+    float decode_scale1 = (amax1 > 0.0f) ? (amax1 / FP4_MAX) : 1.0f;
+    float encode_scale0 = 1.0f / decode_scale0;
+    float encode_scale1 = 1.0f / decode_scale1;
+
+    if (lane == 0) {
+        out_scales[(size_t)row * scales_ld + block16_0] = float_to_ue4m3_byte(decode_scale0);
+    }
+    if (lane == 16 && valid1) {
+        out_scales[(size_t)row * scales_ld + block16_1] = float_to_ue4m3_byte(decode_scale1);
+    }
+
+    int pair_lane = lane & 7;
+    float g0x = __shfl_sync(0xffffffff, v, pair_lane * 2 + 0) * encode_scale0;
+    float g0y = __shfl_sync(0xffffffff, v, pair_lane * 2 + 1) * encode_scale0;
+    float g1x = __shfl_sync(0xffffffff, v, 16 + pair_lane * 2 + 0) * encode_scale1;
+    float g1y = __shfl_sync(0xffffffff, v, 16 + pair_lane * 2 + 1) * encode_scale1;
+
+    if (lane < 8) {
+        float2 in_pair{g0x, g0y};
+        __nv_fp4x2_storage_t packed = __nv_cvt_float2_to_fp4x2(in_pair, __NV_E2M1, cudaRoundNearest);
+        out_packed[(size_t)row * (cols / 2) + block16_0 * 8 + lane] = packed;
+    } else if (lane < 16 && valid1) {
+        float2 in_pair{g1x, g1y};
+        __nv_fp4x2_storage_t packed = __nv_cvt_float2_to_fp4x2(in_pair, __NV_E2M1, cudaRoundNearest);
+        out_packed[(size_t)row * (cols / 2) + block16_1 * 8 + (lane - 8)] = packed;
+    }
+}
+
+// Quantize a logical [rows, cols] row-major BF16 matrix into packed FP4 bytes
+// laid out as a ColumnMajor operand. Unlike the older 2-pass path, this computes
+// the per-row block scale and the packed bytes from the same exact amax so it
+// matches CUTLASS host packing.
+__global__ void k_quantize_colmajor_bf16_to_fp4(
+    const __nv_bfloat16* __restrict__ in,
+    uint8_t* __restrict__ out_packed,
+    uint8_t* __restrict__ out_scales,
+    int rows,
+    int cols,
+    int scales_ld)
+{
+    constexpr float FP4_MAX = 6.0f;
+    int row_pair = blockIdx.y;
+    int block16 = blockIdx.x;
+    int lane = threadIdx.x & 31;
+    int row0 = row_pair * 2;
+    int row1 = row0 + 1;
+    if (row1 >= rows) return;
+
+    int col0 = block16 * 16;
+    if (col0 >= cols || lane >= 16) return;
+
+    float v0 = __bfloat162float(in[(size_t)row0 * cols + col0 + lane]);
+    float v1 = __bfloat162float(in[(size_t)row1 * cols + col0 + lane]);
+    float amax0 = fabsf(v0);
+    float amax1 = fabsf(v1);
+    for (int off = 8; off > 0; off >>= 1) {
+        amax0 = fmaxf(amax0, __shfl_xor_sync(0xFFFF, amax0, off, 16));
+        amax1 = fmaxf(amax1, __shfl_xor_sync(0xFFFF, amax1, off, 16));
+    }
+    amax0 = __shfl_sync(0xFFFF, amax0, 0, 16);
+    amax1 = __shfl_sync(0xFFFF, amax1, 0, 16);
+
+    float scale0 = (amax0 > 0.0f) ? (amax0 / FP4_MAX) : 1.0f;
+    float scale1 = (amax1 > 0.0f) ? (amax1 / FP4_MAX) : 1.0f;
+    float inv0 = 1.0f / scale0;
+    float inv1 = 1.0f / scale1;
+
+    if (lane == 0) {
+        out_scales[(size_t)row0 * scales_ld + block16] = float_to_ue4m3_byte(scale0);
+        out_scales[(size_t)row1 * scales_ld + block16] = float_to_ue4m3_byte(scale1);
+    }
+
+    int col = col0 + lane;
+    float2 in_pair;
+    in_pair.x = v0 * inv0;
+    in_pair.y = v1 * inv1;
+    __nv_fp4x2_storage_t packed = __nv_cvt_float2_to_fp4x2(in_pair, __NV_E2M1, cudaRoundNearest);
+    out_packed[(size_t)col * (rows / 2) + row_pair] = packed;
 }
 
 // On-the-fly AdaLN LN kernel. 256 threads/block.
@@ -557,6 +728,76 @@ __global__ void k_silu_to_fp8(const __nv_bfloat16* __restrict__ io,
         float v = __bfloat162float(io[i]);
         float s = __fdividef(v, 1.f + __expf(-v));
         ((unsigned char*)out)[i] = bf16_to_fp8_byte(__float2bfloat16(s));
+    }
+}
+
+// Fused SiLU activation + BF16->FP4 conversion with direct write into the
+// CUTLASS SM120 rowwise packed-data + swizzled-scale layout expected by FFN2.
+// Grid: dim3(cols/16, rows), block: 32 threads (one warp per 16-wide block).
+__global__ void k_silu_to_fp4_rowwise_swizzled(
+    const __nv_bfloat16* __restrict__ io,
+    uint8_t* __restrict__ out_packed,
+    uint8_t* __restrict__ out_scales_swizzled,
+    int rows,
+    int cols,
+    int scale_cols)
+{
+    constexpr float FP4_MAX = 6.0f;
+    int row = blockIdx.y;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warps_per_block = blockDim.x >> 5;
+    if (row >= rows) return;
+
+    int group32 = blockIdx.x * warps_per_block + warp;
+    int col_base = group32 * 32;
+    if (col_base >= cols) return;
+    int block16_0 = group32 * 2;
+    int block16_1 = block16_0 + 1;
+    bool valid0 = (col_base + 15) < cols;
+    bool valid1 = (col_base + 31) < cols;
+
+    float s = 0.0f;
+    int col = col_base + lane;
+    if (col < cols) {
+        float v = __bfloat162float(io[(size_t)row * cols + col]);
+        s = __fdividef(v, 1.f + __expf(-v));
+    }
+    float amax = fabsf(s);
+    for (int off = 8; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+    }
+    float amax0 = __shfl_sync(0xffffffff, amax, 0);
+    float amax1 = __shfl_sync(0xffffffff, amax, 16);
+
+    float decode_scale0 = (amax0 > 0.0f) ? (amax0 / FP4_MAX) : 1.0f;
+    float decode_scale1 = (amax1 > 0.0f) ? (amax1 / FP4_MAX) : 1.0f;
+    float encode_scale0 = 1.0f / decode_scale0;
+    float encode_scale1 = 1.0f / decode_scale1;
+
+    if (lane == 0) {
+        size_t scale_idx = fp4_swizzled_scale_index(row, block16_0, scale_cols);
+        out_scales_swizzled[scale_idx] = float_to_ue4m3_byte(decode_scale0);
+    }
+    if (lane == 16 && valid1) {
+        size_t scale_idx = fp4_swizzled_scale_index(row, block16_1, scale_cols);
+        out_scales_swizzled[scale_idx] = float_to_ue4m3_byte(decode_scale1);
+    }
+
+    int pair_lane = lane & 7;
+    float s0x = __shfl_sync(0xffffffff, s, pair_lane * 2 + 0) * encode_scale0;
+    float s0y = __shfl_sync(0xffffffff, s, pair_lane * 2 + 1) * encode_scale0;
+    float s1x = __shfl_sync(0xffffffff, s, 16 + pair_lane * 2 + 0) * encode_scale1;
+    float s1y = __shfl_sync(0xffffffff, s, 16 + pair_lane * 2 + 1) * encode_scale1;
+
+    if (lane < 8) {
+        float2 pair{s0x, s0y};
+        __nv_fp4x2_storage_t packed = __nv_cvt_float2_to_fp4x2(pair, __NV_E2M1, cudaRoundNearest);
+        out_packed[(size_t)row * (cols / 2) + block16_0 * 8 + lane] = packed;
+    } else if (lane < 16 && valid1) {
+        float2 pair{s1x, s1y};
+        __nv_fp4x2_storage_t packed = __nv_cvt_float2_to_fp4x2(pair, __NV_E2M1, cudaRoundNearest);
+        out_packed[(size_t)row * (cols / 2) + block16_1 * 8 + (lane - 8)] = packed;
     }
 }
 
@@ -1521,6 +1762,88 @@ struct FP8Gemm {
     }
 };
 
+struct FP4Gemm {
+    cublasLtMatmulDesc_t desc = nullptr;
+    cublasLtMatrixLayout_t Ad = nullptr, Bd = nullptr, Cd = nullptr, Dd = nullptr;
+    cublasLtMatmulHeuristicResult_t heur{};
+    std::vector<cublasLtMatmulHeuristicResult_t> heurs;
+    bool tuned = false;
+    int M = 0, N = 0, K = 0;
+
+    void setup(cublasLtHandle_t h, int M, int N, int K, uint8_t* sA, uint8_t* sB,
+               void* ws, size_t wss) {
+        this->M = M; this->N = N; this->K = K;
+        CKBL(cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        cublasOperation_t opT = CUBLAS_OP_T, opN = CUBLAS_OP_N;
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT)));
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)));
+        cudaDataType_t scale_type = CUDA_R_32F;
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_SCALE_TYPE, &scale_type, sizeof(scale_type)));
+        cublasLtPointerMode_t pointer_mode = CUBLASLT_POINTER_MODE_DEVICE;
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointer_mode, sizeof(pointer_mode)));
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &sA, sizeof(sA)));
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sB, sizeof(sB)));
+        cublasLtMatmulMatrixScale_t sm_vec16 = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &sm_vec16, sizeof(sm_vec16)));
+        CKBL(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &sm_vec16, sizeof(sm_vec16)));
+
+        CKBL(cublasLtMatrixLayoutCreate(&Ad, CUDA_R_4F_E2M1, K, N, K));
+        CKBL(cublasLtMatrixLayoutCreate(&Bd, CUDA_R_4F_E2M1, K, M, K));
+        CKBL(cublasLtMatrixLayoutCreate(&Cd, CUDA_R_16BF, N, M, N));
+        CKBL(cublasLtMatrixLayoutCreate(&Dd, CUDA_R_16BF, N, M, N));
+
+        cublasLtMatmulPreference_t pref;
+        CKBL(cublasLtMatmulPreferenceCreate(&pref));
+        size_t mws = std::min(wss, g_gemm_ws_bytes);
+        CKBL(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &mws, sizeof(mws)));
+        int max_results = std::max(1, g_lt_autotune_topk);
+        heurs.resize(max_results);
+        int nres = 0;
+        CKBL(cublasLtMatmulAlgoGetHeuristic(h, desc, Ad, Bd, Cd, Dd, pref, max_results, heurs.data(), &nres));
+        TORCH_CHECK(nres > 0, "FP4Gemm: no heuristic for M=", M, " N=", N, " K=", K);
+        heurs.resize(nres);
+        heur = heurs[0];
+        tuned = (nres == 1) || !g_lt_autotune_enabled;
+        CKBL(cublasLtMatmulPreferenceDestroy(pref));
+    }
+
+    void run(cublasLtHandle_t h, void* wt_fp4, void* act_fp4, void* out,
+             void* ws, size_t wss, float* alpha_dev, float* beta_dev, cudaStream_t st) {
+        size_t use_wss = std::min(wss, g_gemm_ws_bytes);
+        if (!tuned && heurs.size() > 1) {
+            cudaEvent_t ev0, ev1;
+            CK(cudaEventCreate(&ev0));
+            CK(cudaEventCreate(&ev1));
+            float best_ms = 1.0e30f;
+            int best_idx = 0;
+            for (size_t i = 0; i < heurs.size(); ++i) {
+                auto& cand = heurs[i];
+                cublasStatus_t warm = cublasLtMatmul(h, desc, alpha_dev, wt_fp4, Ad, act_fp4, Bd, beta_dev,
+                                                     out, Cd, out, Dd, &cand.algo, ws, use_wss, st);
+                if (warm != CUBLAS_STATUS_SUCCESS) continue;
+                CK(cudaEventRecord(ev0, st));
+                cublasStatus_t timed = cublasLtMatmul(h, desc, alpha_dev, wt_fp4, Ad, act_fp4, Bd, beta_dev,
+                                                      out, Cd, out, Dd, &cand.algo, ws, use_wss, st);
+                if (timed != CUBLAS_STATUS_SUCCESS) continue;
+                CK(cudaEventRecord(ev1, st));
+                CK(cudaEventSynchronize(ev1));
+                float ms = 0.0f;
+                CK(cudaEventElapsedTime(&ms, ev0, ev1));
+                if (ms < best_ms) {
+                    best_ms = ms;
+                    best_idx = (int)i;
+                }
+            }
+            CK(cudaEventDestroy(ev0));
+            CK(cudaEventDestroy(ev1));
+            heur = heurs[best_idx];
+            tuned = true;
+        }
+        CKBL(cublasLtMatmul(h, desc, alpha_dev, wt_fp4, Ad, act_fp4, Bd, beta_dev,
+                            out, Cd, out, Dd, &heur.algo, ws, use_wss, st));
+    }
+};
+
 // CUTLASS fused FFN1 path: FP8 GEMM + bias + SiLU -> FP8 output.
 // This replaces the standalone k_silu_to_fp8 pass when enabled.
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
@@ -1670,6 +1993,688 @@ struct CutlassFusedFfn1 {
     }
 };
 
+struct CutlassFusedFfn1Fp4 {
+    using ElementA = cutlass::float_e4m3_t;
+    using ElementB = cutlass::float_e4m3_t;
+    using ElementC = cutlass::bfloat16_t;
+    using ElementD = cutlass::float_e2m1_t;
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+    using ElementBias = cutlass::bfloat16_t;
+    using ElementBlockScaleFactor = cutlass::float_ue4m3_t;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+    using LayoutD = cutlass::layout::RowMajor;
+
+    static constexpr int AlignA = 16;
+    static constexpr int AlignB = 16;
+    static constexpr int AlignC = 8;
+    static constexpr int AlignD = 32;
+    static constexpr int OutputSFVectorSize = 16;
+
+    using MmaTileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+    using FusionOperation = cutlass::epilogue::fusion::LinCombPerColBiasEltActBlockScaleFactor<
+        cutlass::epilogue::thread::SiLu,
+        OutputSFVectorSize,
+        ElementD,
+        ElementCompute,
+        ElementBlockScaleFactor,
+        cutlass::layout::RowMajor,
+        ElementBias,
+        ElementC>;
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm120,
+        cutlass::arch::OpClassTensorOp,
+        MmaTileShape,
+        ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator,
+        ElementCompute,
+        ElementC,
+        LayoutC,
+        AlignC,
+        ElementD,
+        LayoutD,
+        AlignD,
+        cutlass::epilogue::collective::EpilogueScheduleAuto,
+        FusionOperation
+    >::CollectiveOp;
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm120,
+        cutlass::arch::OpClassTensorOp,
+        ElementA,
+        LayoutA,
+        AlignA,
+        ElementB,
+        LayoutB,
+        AlignB,
+        ElementAccumulator,
+        MmaTileShape,
+        ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::collective::KernelScheduleAuto
+    >::CollectiveOp;
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        cute::Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+    using Arguments = typename Gemm::Arguments;
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+    using SfdOutputCfg = cutlass::detail::Sm1xxBlockScaledOutputConfig<OutputSFVectorSize>;
+    using LayoutSFD = typename SfdOutputCfg::LayoutSF;
+
+    Gemm gemm{};
+    StrideA stride_A{};
+    StrideB stride_B{};
+    StrideC stride_C{};
+    StrideD stride_D{};
+    LayoutSFD layout_SFD{};
+    void* workspace = nullptr;
+    size_t workspace_size = 0;
+    int M = 0, N = 0, K = 0;
+    bool built = false;
+    bool initialized = false;
+
+    void setup(int M_, int N_, int K_) {
+        if (built && M == M_ && N == N_ && K == K_) return;
+        M = M_;
+        N = N_;
+        K = K_;
+        stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+        stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+        stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
+        stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+        layout_SFD = SfdOutputCfg::tile_atom_to_shape_SFD(cute::make_shape(M, N, K, 1));
+        size_t expected_scale_bytes = (size_t)fp4_scale_rows(M) * (size_t)fp4_scale_cols(N);
+        TORCH_CHECK(
+            cute::size(cute::filter_zeros(layout_SFD)) == expected_scale_bytes,
+            "CUTLASS fused FFN1 FP4 scale layout size mismatch: got ",
+            cute::size(cute::filter_zeros(layout_SFD)),
+            " expected ", expected_scale_bytes);
+        Arguments args{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K, 1},
+            {nullptr, stride_A, nullptr, stride_B},
+            {{1.0f, 0.0f}, nullptr, stride_C, nullptr, stride_D}
+        };
+        args.scheduler.max_swizzle_size = 1;
+        args.epilogue.thread.block_scale_factor_ptr = nullptr;
+        args.epilogue.thread.norm_constant_ptr = nullptr;
+        workspace_size = Gemm::get_workspace_size(args);
+        if (workspace != nullptr) {
+            CK(cudaFree(workspace));
+            workspace = nullptr;
+        }
+        if (workspace_size > 0) {
+            CK(cudaMalloc(&workspace, workspace_size));
+        }
+        built = true;
+        initialized = false;
+    }
+
+    Arguments make_args(
+        void* wt_fp8,
+        void* act_fp8,
+        const __nv_bfloat16* src_bf16,
+        void* out_fp4,
+        void* out_scales,
+        const __nv_bfloat16* bias,
+        const float* norm_constant_dev) const {
+        Arguments args{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K, 1},
+            {reinterpret_cast<ElementA const*>(act_fp8), stride_A,
+             reinterpret_cast<ElementB const*>(wt_fp8), stride_B},
+            {{1.0f, 0.0f},
+             reinterpret_cast<ElementC const*>(src_bf16), stride_C,
+             reinterpret_cast<ElementD*>(out_fp4), stride_D}
+        };
+        auto& fusion = args.epilogue.thread;
+        fusion.alpha = 1.0f;
+        fusion.beta = 0.0f;
+        fusion.bias_ptr = reinterpret_cast<ElementBias const*>(bias);
+        fusion.block_scale_factor_ptr = reinterpret_cast<ElementBlockScaleFactor*>(out_scales);
+        fusion.norm_constant_ptr = norm_constant_dev;
+        args.scheduler.max_swizzle_size = 1;
+        return args;
+    }
+
+    void run(
+        void* wt_fp8,
+        void* act_fp8,
+        const __nv_bfloat16* src_bf16,
+        void* out_fp4,
+        void* out_scales,
+        const __nv_bfloat16* bias,
+        const float* norm_constant_dev,
+        cudaStream_t stream) {
+        auto args = make_args(wt_fp8, act_fp8, src_bf16, out_fp4, out_scales, bias, norm_constant_dev);
+        cutlass::Status st = Gemm::can_implement(args);
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN1 FP4 unsupported for current shape");
+        if (!initialized) {
+            st = gemm.initialize(args, workspace, stream);
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN1 FP4 initialize failed");
+            initialized = true;
+        } else {
+            st = gemm.update(args);
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN1 FP4 update failed");
+        }
+        st = gemm.run(stream);
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN1 FP4 launch failed");
+    }
+};
+
+struct CutlassFusedFfn1Fp4Identity {
+    using ElementA = cutlass::float_e4m3_t;
+    using ElementB = cutlass::float_e4m3_t;
+    using ElementC = cutlass::bfloat16_t;
+    using ElementD = cutlass::float_e2m1_t;
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+    using ElementBias = cutlass::bfloat16_t;
+    using ElementBlockScaleFactor = cutlass::float_ue4m3_t;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+    using LayoutD = cutlass::layout::RowMajor;
+
+    static constexpr int AlignA = 16;
+    static constexpr int AlignB = 16;
+    static constexpr int AlignC = 8;
+    static constexpr int AlignD = 32;
+    static constexpr int OutputSFVectorSize = 16;
+
+    using MmaTileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+    using FusionOperation = cutlass::epilogue::fusion::LinCombPerColBiasEltActBlockScaleFactor<
+        cutlass::epilogue::thread::Identity,
+        OutputSFVectorSize,
+        ElementD,
+        ElementCompute,
+        ElementBlockScaleFactor,
+        cutlass::layout::RowMajor,
+        ElementBias,
+        ElementC>;
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm120,
+        cutlass::arch::OpClassTensorOp,
+        MmaTileShape,
+        ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator,
+        ElementCompute,
+        ElementC,
+        LayoutC,
+        AlignC,
+        ElementD,
+        LayoutD,
+        AlignD,
+        cutlass::epilogue::collective::EpilogueScheduleAuto,
+        FusionOperation
+    >::CollectiveOp;
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm120,
+        cutlass::arch::OpClassTensorOp,
+        ElementA,
+        LayoutA,
+        AlignA,
+        ElementB,
+        LayoutB,
+        AlignB,
+        ElementAccumulator,
+        MmaTileShape,
+        ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::collective::KernelScheduleAuto
+    >::CollectiveOp;
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        cute::Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+    using Arguments = typename Gemm::Arguments;
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+    using SfdOutputCfg = cutlass::detail::Sm1xxBlockScaledOutputConfig<OutputSFVectorSize>;
+    using LayoutSFD = typename SfdOutputCfg::LayoutSF;
+
+    Gemm gemm{};
+    StrideA stride_A{};
+    StrideB stride_B{};
+    StrideC stride_C{};
+    StrideD stride_D{};
+    LayoutSFD layout_SFD{};
+    void* workspace = nullptr;
+    size_t workspace_size = 0;
+    int M = 0, N = 0, K = 0;
+    bool built = false;
+    bool initialized = false;
+
+    void setup(int M_, int N_, int K_) {
+        if (built && M == M_ && N == N_ && K == K_) return;
+        M = M_;
+        N = N_;
+        K = K_;
+        stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+        stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+        stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
+        stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+        layout_SFD = SfdOutputCfg::tile_atom_to_shape_SFD(cute::make_shape(M, N, K, 1));
+        Arguments args{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K, 1},
+            {nullptr, stride_A, nullptr, stride_B},
+            {{1.0f, 0.0f}, nullptr, stride_C, nullptr, stride_D}
+        };
+        args.scheduler.max_swizzle_size = 1;
+        args.epilogue.thread.block_scale_factor_ptr = nullptr;
+        args.epilogue.thread.norm_constant_ptr = nullptr;
+        workspace_size = Gemm::get_workspace_size(args);
+        if (workspace != nullptr) {
+            CK(cudaFree(workspace));
+            workspace = nullptr;
+        }
+        if (workspace_size > 0) {
+            CK(cudaMalloc(&workspace, workspace_size));
+        }
+        built = true;
+        initialized = false;
+    }
+
+    Arguments make_args(
+        void* wt_fp8,
+        void* act_fp8,
+        const __nv_bfloat16* src_bf16,
+        void* out_fp4,
+        void* out_scales,
+        const __nv_bfloat16* bias,
+        const float* norm_constant_dev) const {
+        Arguments args{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K, 1},
+            {reinterpret_cast<ElementA const*>(act_fp8), stride_A,
+             reinterpret_cast<ElementB const*>(wt_fp8), stride_B},
+            {{1.0f, 0.0f},
+             reinterpret_cast<ElementC const*>(src_bf16), stride_C,
+             reinterpret_cast<ElementD*>(out_fp4), stride_D}
+        };
+        auto& fusion = args.epilogue.thread;
+        fusion.alpha = 1.0f;
+        fusion.beta = 0.0f;
+        fusion.bias_ptr = reinterpret_cast<ElementBias const*>(bias);
+        fusion.block_scale_factor_ptr = reinterpret_cast<ElementBlockScaleFactor*>(out_scales);
+        fusion.norm_constant_ptr = norm_constant_dev;
+        args.scheduler.max_swizzle_size = 1;
+        return args;
+    }
+
+    void run(
+        void* wt_fp8,
+        void* act_fp8,
+        const __nv_bfloat16* src_bf16,
+        void* out_fp4,
+        void* out_scales,
+        const __nv_bfloat16* bias,
+        const float* norm_constant_dev,
+        cudaStream_t stream) {
+        auto args = make_args(wt_fp8, act_fp8, src_bf16, out_fp4, out_scales, bias, norm_constant_dev);
+        cutlass::Status st = Gemm::can_implement(args);
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN1 FP4 identity unsupported for current shape");
+        if (!initialized) {
+            st = gemm.initialize(args, workspace, stream);
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN1 FP4 identity initialize failed");
+            initialized = true;
+        } else {
+            st = gemm.update(args);
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN1 FP4 identity update failed");
+        }
+        st = gemm.run(stream);
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN1 FP4 identity launch failed");
+    }
+};
+
+struct CutlassFfn1Fp4BlockScaleOnly {
+    using ElementA = cutlass::float_e4m3_t;
+    using ElementB = cutlass::float_e4m3_t;
+    using ElementC = cutlass::bfloat16_t;
+    using ElementD = cutlass::float_e2m1_t;
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+    using ElementBlockScaleFactor = cutlass::float_ue4m3_t;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+    using LayoutD = cutlass::layout::RowMajor;
+
+    static constexpr int AlignA = 16;
+    static constexpr int AlignB = 16;
+    static constexpr int AlignC = 8;
+    static constexpr int AlignD = 32;
+    static constexpr int OutputSFVectorSize = 16;
+
+    using MmaTileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+    using FusionOperation = cutlass::epilogue::fusion::LinCombBlockScaleFactor<
+        OutputSFVectorSize,
+        ElementD,
+        ElementCompute,
+        ElementBlockScaleFactor,
+        cutlass::layout::RowMajor,
+        ElementC>;
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm120,
+        cutlass::arch::OpClassTensorOp,
+        MmaTileShape,
+        ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator,
+        ElementCompute,
+        ElementC,
+        LayoutC,
+        AlignC,
+        ElementD,
+        LayoutD,
+        AlignD,
+        cutlass::epilogue::collective::EpilogueScheduleAuto,
+        FusionOperation
+    >::CollectiveOp;
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm120,
+        cutlass::arch::OpClassTensorOp,
+        ElementA,
+        LayoutA,
+        AlignA,
+        ElementB,
+        LayoutB,
+        AlignB,
+        ElementAccumulator,
+        MmaTileShape,
+        ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::collective::KernelScheduleAuto
+    >::CollectiveOp;
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        cute::Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+    using Arguments = typename Gemm::Arguments;
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+    using SfdOutputCfg = cutlass::detail::Sm1xxBlockScaledOutputConfig<OutputSFVectorSize>;
+    using LayoutSFD = typename SfdOutputCfg::LayoutSF;
+
+    Gemm gemm{};
+    StrideA stride_A{};
+    StrideB stride_B{};
+    StrideC stride_C{};
+    StrideD stride_D{};
+    LayoutSFD layout_SFD{};
+    void* workspace = nullptr;
+    size_t workspace_size = 0;
+    int M = 0, N = 0, K = 0;
+    bool built = false;
+    bool initialized = false;
+
+    void setup(int M_, int N_, int K_) {
+        if (built && M == M_ && N == N_ && K == K_) return;
+        M = M_;
+        N = N_;
+        K = K_;
+        stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+        stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+        stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
+        stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+        layout_SFD = SfdOutputCfg::tile_atom_to_shape_SFD(cute::make_shape(M, N, K, 1));
+        Arguments args{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K, 1},
+            {nullptr, stride_A, nullptr, stride_B},
+            {{1.0f, 0.0f}, nullptr, stride_C, nullptr, stride_D}
+        };
+        args.scheduler.max_swizzle_size = 1;
+        args.epilogue.thread.block_scale_factor_ptr = nullptr;
+        args.epilogue.thread.norm_constant_ptr = nullptr;
+        workspace_size = Gemm::get_workspace_size(args);
+        if (workspace != nullptr) {
+            CK(cudaFree(workspace));
+            workspace = nullptr;
+        }
+        if (workspace_size > 0) {
+            CK(cudaMalloc(&workspace, workspace_size));
+        }
+        built = true;
+        initialized = false;
+    }
+
+    Arguments make_args(
+        void* wt_fp8,
+        void* act_fp8,
+        const __nv_bfloat16* src_bf16,
+        void* out_fp4,
+        void* out_scales,
+        const float* norm_constant_dev) const {
+        Arguments args{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K, 1},
+            {reinterpret_cast<ElementA const*>(act_fp8), stride_A,
+             reinterpret_cast<ElementB const*>(wt_fp8), stride_B},
+            {{1.0f, 0.0f},
+             reinterpret_cast<ElementC const*>(src_bf16), stride_C,
+             reinterpret_cast<ElementD*>(out_fp4), stride_D}
+        };
+        auto& fusion = args.epilogue.thread;
+        fusion.alpha = 1.0f;
+        fusion.beta = 0.0f;
+        fusion.block_scale_factor_ptr = reinterpret_cast<ElementBlockScaleFactor*>(out_scales);
+        fusion.norm_constant_ptr = norm_constant_dev;
+        args.scheduler.max_swizzle_size = 1;
+        return args;
+    }
+
+    void run(
+        void* wt_fp8,
+        void* act_fp8,
+        const __nv_bfloat16* src_bf16,
+        void* out_fp4,
+        void* out_scales,
+        const float* norm_constant_dev,
+        cudaStream_t stream) {
+        auto args = make_args(wt_fp8, act_fp8, src_bf16, out_fp4, out_scales, norm_constant_dev);
+        cutlass::Status st = Gemm::can_implement(args);
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS FP4 blockscale-only unsupported for current shape");
+        if (!initialized) {
+            st = gemm.initialize(args, workspace, stream);
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS FP4 blockscale-only initialize failed");
+            initialized = true;
+        } else {
+            st = gemm.update(args);
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS FP4 blockscale-only update failed");
+        }
+        st = gemm.run(stream);
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS FP4 blockscale-only launch failed");
+    }
+};
+
+struct CutlassFfn1Fp4BlockScaleOnlyE8M0 {
+    using ElementA = cutlass::float_e4m3_t;
+    using ElementB = cutlass::float_e4m3_t;
+    using ElementC = cutlass::bfloat16_t;
+    using ElementD = cutlass::float_e2m1_t;
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+    using ElementBlockScaleFactor = cutlass::float_ue8m0_t;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+    using LayoutD = cutlass::layout::RowMajor;
+
+    static constexpr int AlignA = 16;
+    static constexpr int AlignB = 16;
+    static constexpr int AlignC = 8;
+    static constexpr int AlignD = 32;
+    static constexpr int OutputSFVectorSize = 16;
+
+    using MmaTileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+    using FusionOperation = cutlass::epilogue::fusion::LinCombBlockScaleFactor<
+        OutputSFVectorSize,
+        ElementD,
+        ElementCompute,
+        ElementBlockScaleFactor,
+        cutlass::layout::RowMajor,
+        ElementC>;
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm120,
+        cutlass::arch::OpClassTensorOp,
+        MmaTileShape,
+        ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator,
+        ElementCompute,
+        ElementC,
+        LayoutC,
+        AlignC,
+        ElementD,
+        LayoutD,
+        AlignD,
+        cutlass::epilogue::collective::EpilogueScheduleAuto,
+        FusionOperation
+    >::CollectiveOp;
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm120,
+        cutlass::arch::OpClassTensorOp,
+        ElementA,
+        LayoutA,
+        AlignA,
+        ElementB,
+        LayoutB,
+        AlignB,
+        ElementAccumulator,
+        MmaTileShape,
+        ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::collective::KernelScheduleAuto
+    >::CollectiveOp;
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        cute::Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+    using Arguments = typename Gemm::Arguments;
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+    using SfdOutputCfg = cutlass::detail::Sm1xxBlockScaledOutputConfig<OutputSFVectorSize>;
+    using LayoutSFD = typename SfdOutputCfg::LayoutSF;
+
+    Gemm gemm{};
+    StrideA stride_A{};
+    StrideB stride_B{};
+    StrideC stride_C{};
+    StrideD stride_D{};
+    LayoutSFD layout_SFD{};
+    void* workspace = nullptr;
+    size_t workspace_size = 0;
+    int M = 0, N = 0, K = 0;
+    bool built = false;
+    bool initialized = false;
+
+    void setup(int M_, int N_, int K_) {
+        if (built && M == M_ && N == N_ && K == K_) return;
+        M = M_;
+        N = N_;
+        K = K_;
+        stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+        stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+        stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
+        stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+        layout_SFD = SfdOutputCfg::tile_atom_to_shape_SFD(cute::make_shape(M, N, K, 1));
+        Arguments args{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K, 1},
+            {nullptr, stride_A, nullptr, stride_B},
+            {{1.0f, 0.0f}, nullptr, stride_C, nullptr, stride_D}
+        };
+        args.scheduler.max_swizzle_size = 1;
+        args.epilogue.thread.block_scale_factor_ptr = nullptr;
+        args.epilogue.thread.norm_constant_ptr = nullptr;
+        workspace_size = Gemm::get_workspace_size(args);
+        if (workspace != nullptr) {
+            CK(cudaFree(workspace));
+            workspace = nullptr;
+        }
+        if (workspace_size > 0) {
+            CK(cudaMalloc(&workspace, workspace_size));
+        }
+        built = true;
+        initialized = false;
+    }
+
+    Arguments make_args(
+        void* wt_fp8,
+        void* act_fp8,
+        const __nv_bfloat16* src_bf16,
+        void* out_fp4,
+        void* out_scales,
+        const float* norm_constant_dev) const {
+        Arguments args{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K, 1},
+            {reinterpret_cast<ElementA const*>(act_fp8), stride_A,
+             reinterpret_cast<ElementB const*>(wt_fp8), stride_B},
+            {{1.0f, 0.0f},
+             reinterpret_cast<ElementC const*>(src_bf16), stride_C,
+             reinterpret_cast<ElementD*>(out_fp4), stride_D}
+        };
+        auto& fusion = args.epilogue.thread;
+        fusion.alpha = 1.0f;
+        fusion.beta = 0.0f;
+        fusion.block_scale_factor_ptr = reinterpret_cast<ElementBlockScaleFactor*>(out_scales);
+        fusion.norm_constant_ptr = norm_constant_dev;
+        args.scheduler.max_swizzle_size = 1;
+        return args;
+    }
+
+    void run(
+        void* wt_fp8,
+        void* act_fp8,
+        const __nv_bfloat16* src_bf16,
+        void* out_fp4,
+        void* out_scales,
+        const float* norm_constant_dev,
+        cudaStream_t stream) {
+        auto args = make_args(wt_fp8, act_fp8, src_bf16, out_fp4, out_scales, norm_constant_dev);
+        cutlass::Status st = Gemm::can_implement(args);
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS FP4 blockscale-only E8M0 unsupported for current shape");
+        if (!initialized) {
+            st = gemm.initialize(args, workspace, stream);
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS FP4 blockscale-only E8M0 initialize failed");
+            initialized = true;
+        } else {
+            st = gemm.update(args);
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS FP4 blockscale-only E8M0 update failed");
+        }
+        st = gemm.run(stream);
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS FP4 blockscale-only E8M0 launch failed");
+    }
+};
+
 struct CutlassFusedFfn2 {
     using ElementA = cutlass::float_e4m3_t;
     using ElementB = cutlass::float_e4m3_t;
@@ -1810,6 +2815,269 @@ struct CutlassFusedFfn2 {
         TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS fused FFN2 launch failed");
     }
 };
+
+struct CutlassFp4RowwiseGemm {
+    using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+    using ElementB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+    using ElementC = cutlass::bfloat16_t;
+    using ElementD = cutlass::bfloat16_t;
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+    using LayoutD = cutlass::layout::RowMajor;
+    using ArchTag = cutlass::arch::Sm120;
+    using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+
+    static constexpr int AlignA = 32;
+    static constexpr int AlignB = 32;
+    static constexpr int AlignC = 8;
+    static constexpr int AlignD = 8;
+
+    using MmaTileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        ArchTag,
+        OperatorClass,
+        MmaTileShape,
+        ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator,
+        ElementCompute,
+        ElementC,
+        LayoutC,
+        AlignC,
+        ElementD,
+        LayoutD,
+        AlignD,
+        cutlass::epilogue::collective::EpilogueScheduleAuto
+    >::CollectiveOp;
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        ArchTag,
+        OperatorClass,
+        ElementA,
+        LayoutA,
+        AlignA,
+        ElementB,
+        LayoutB,
+        AlignB,
+        ElementAccumulator,
+        MmaTileShape,
+        ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::collective::KernelScheduleAuto
+    >::CollectiveOp;
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        cute::Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue,
+        void>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+    using Arguments = typename Gemm::Arguments;
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+    using TensorLayoutA = decltype(cute::make_layout(cute::make_shape(0, 0, 0), StrideA{}));
+    using TensorLayoutB = decltype(cute::make_layout(cute::make_shape(0, 0, 0), StrideB{}));
+    using LayoutSFA = typename Gemm::GemmKernel::CollectiveMainloop::LayoutSFA;
+    using LayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::LayoutSFB;
+    using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+
+    Gemm gemm{};
+    StrideA stride_A{};
+    StrideB stride_B{};
+    StrideC stride_C{};
+    StrideD stride_D{};
+    TensorLayoutA layout_A{};
+    TensorLayoutB layout_B{};
+    LayoutSFA layout_SFA{};
+    LayoutSFB layout_SFB{};
+    void* workspace = nullptr;
+    size_t workspace_size = 0;
+    int M = 0, N = 0, K = 0;
+    bool built = false;
+    bool initialized = false;
+
+    void setup(int M_, int N_, int K_) {
+        if (built && M == M_ && N == N_ && K == K_) return;
+        M = M_;
+        N = N_;
+        K = K_;
+        stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+        stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+        stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
+        stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+        layout_A = cute::make_layout(cute::make_shape(M, K, 1), stride_A);
+        layout_B = cute::make_layout(cute::make_shape(N, K, 1), stride_B);
+        layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
+        layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
+        Arguments args{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K, 1},
+            {nullptr, stride_A, nullptr, stride_B, nullptr, layout_SFA, nullptr, layout_SFB},
+            {{1.0f, 0.0f}, nullptr, stride_C, nullptr, stride_D}
+        };
+        args.scheduler.max_swizzle_size = 1;
+        workspace_size = Gemm::get_workspace_size(args);
+        if (workspace != nullptr) {
+            CK(cudaFree(workspace));
+            workspace = nullptr;
+        }
+        if (workspace_size > 0) {
+            CK(cudaMalloc(&workspace, workspace_size));
+        }
+        built = true;
+        initialized = false;
+    }
+
+    Arguments make_args(
+        void* wt_fp4,
+        void* wt_scales,
+        void* act_fp4,
+        void* act_scales,
+        void* out_bf16) const {
+        Arguments args{
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K, 1},
+            {
+                reinterpret_cast<typename ElementA::DataType const*>(act_fp4), stride_A,
+                reinterpret_cast<typename ElementB::DataType const*>(wt_fp4), stride_B,
+                reinterpret_cast<typename ElementA::ScaleFactorType const*>(act_scales), layout_SFA,
+                reinterpret_cast<typename ElementB::ScaleFactorType const*>(wt_scales), layout_SFB
+            },
+            {
+                {1.0f, 0.0f},
+                reinterpret_cast<ElementC const*>(out_bf16), stride_C,
+                reinterpret_cast<ElementD*>(out_bf16), stride_D
+            }
+        };
+        args.scheduler.max_swizzle_size = 1;
+        return args;
+    }
+
+    void run(
+        void* wt_fp4,
+        void* wt_scales,
+        void* act_fp4,
+        void* act_scales,
+        void* out_bf16,
+        cudaStream_t stream) {
+        auto args = make_args(wt_fp4, wt_scales, act_fp4, act_scales, out_bf16);
+        cutlass::Status st = Gemm::can_implement(args);
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS FP4 rowwise GEMM unsupported for current shape");
+        if (!initialized) {
+            st = gemm.initialize(args, workspace, stream);
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS FP4 rowwise GEMM initialize failed");
+            initialized = true;
+        } else {
+            st = gemm.update(args);
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS FP4 rowwise GEMM update failed");
+        }
+        st = gemm.run(stream);
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS FP4 rowwise GEMM launch failed");
+    }
+};
+
+template <class LayoutSF>
+static torch::Tensor pack_cutlass_scales_from_rowwise_host(
+    const torch::Tensor& rowwise_scales_cuda,
+    LayoutSF layout_sf,
+    int logical_rows,
+    int logical_cols) {
+    TORCH_CHECK(rowwise_scales_cuda.is_cuda(), "rowwise scales must be CUDA");
+    TORCH_CHECK(rowwise_scales_cuda.scalar_type() == torch::kUInt8, "rowwise scales must be uint8");
+    TORCH_CHECK(rowwise_scales_cuda.dim() == 2, "rowwise scales must be rank-2");
+    TORCH_CHECK(logical_cols % 16 == 0, "logical cols must be divisible by 16");
+
+    auto rowwise_cpu = rowwise_scales_cuda.to(torch::kCPU);
+    auto packed_cpu = torch::zeros(
+        {(int64_t)cute::size(cute::filter_zeros(layout_sf))},
+        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+
+    auto* rowwise_ptr = rowwise_cpu.data_ptr<uint8_t>();
+    int rowwise_ld = (int)rowwise_cpu.size(1);
+    auto tensor_sf = cute::make_tensor(
+        reinterpret_cast<cutlass::float_ue4m3_t*>(packed_cpu.data_ptr<uint8_t>()),
+        layout_sf);
+
+    for (int row = 0; row < logical_rows; ++row) {
+        for (int block16 = 0; block16 < logical_cols / 16; ++block16) {
+            cutlass::float_ue4m3_t scale = cutlass::float_ue4m3_t::bitcast(
+                rowwise_ptr[(size_t)row * rowwise_ld + block16]);
+            for (int kk = 0; kk < 16; ++kk) {
+                tensor_sf(cute::make_coord(row, block16 * 16 + kk, 0)) = scale;
+            }
+        }
+    }
+    return packed_cpu.to(torch::kCUDA);
+}
+
+template <class Element, class LayoutData, class LayoutSF>
+static void pack_cutlass_operand_host(
+    cutlass::HostTensor<typename Element::DataType, cutlass::layout::PackedVectorLayout>& block_data,
+    cutlass::HostTensor<typename Element::ScaleFactorType, cutlass::layout::PackedVectorLayout>& block_sf,
+    LayoutData layout_data,
+    LayoutSF layout_sf,
+    const at::BFloat16* src,
+    int rows,
+    int cols,
+    int ld) {
+    constexpr float FP4_MAX = 6.0f;
+    block_data.reset(cutlass::make_Coord(cute::size(layout_data)));
+    block_sf.reset(cutlass::make_Coord(cute::size(cute::filter_zeros(layout_sf))));
+
+    auto tensor_data = cute::make_tensor(cute::recast_ptr<typename Element::DataType>(block_data.host_data()), layout_data);
+    auto tensor_sf = cute::make_tensor(block_sf.host_data(), layout_sf);
+
+    for (int row = 0; row < rows; ++row) {
+        for (int block16 = 0; block16 < cols / 16; ++block16) {
+            float amax = 0.0f;
+            for (int kk = 0; kk < 16; ++kk) {
+                float v = (float)src[(size_t)row * ld + block16 * 16 + kk];
+                amax = std::max(amax, std::abs(v));
+            }
+            float scale = (amax > 0.0f) ? (amax / FP4_MAX) : 1.0f;
+            float inv_scale = 1.0f / scale;
+            typename Element::ScaleFactorType sf(scale);
+            for (int kk = 0; kk < 16; ++kk) {
+                int k = block16 * 16 + kk;
+                float v = (float)src[(size_t)row * ld + k] * inv_scale;
+                tensor_data(cute::make_coord(row, k, 0)) = typename Element::DataType(v);
+                tensor_sf(cute::make_coord(row, k, 0)) = sf;
+            }
+        }
+    }
+
+    block_data.sync_device();
+    block_sf.sync_device();
+}
+
+template <class Element, class LayoutData, class LayoutSF>
+static std::tuple<torch::Tensor, torch::Tensor> pack_cutlass_operand_host_tensors(
+    torch::Tensor in_t,
+    LayoutData layout_data,
+    LayoutSF layout_sf,
+    int rows,
+    int cols) {
+    auto in_cpu = in_t.contiguous().to(torch::kCPU);
+    cutlass::HostTensor<typename Element::DataType, cutlass::layout::PackedVectorLayout> block_data;
+    cutlass::HostTensor<typename Element::ScaleFactorType, cutlass::layout::PackedVectorLayout> block_sf;
+    pack_cutlass_operand_host<Element>(
+        block_data, block_sf, layout_data, layout_sf,
+        in_cpu.data_ptr<at::BFloat16>(), rows, cols, cols);
+
+    size_t data_bytes = (block_data.size() * cutlass::sizeof_bits<typename Element::DataType>::value + 7) / 8;
+    size_t scale_bytes = block_sf.size() * sizeof(typename Element::ScaleFactorType);
+    auto opts_cpu = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
+    auto packed = torch::empty({(long)data_bytes}, opts_cpu);
+    auto scales = torch::empty({(long)scale_bytes}, opts_cpu);
+    std::memcpy(packed.data_ptr(), reinterpret_cast<uint8_t*>(block_data.host_data()), data_bytes);
+    std::memcpy(scales.data_ptr(), reinterpret_cast<uint8_t*>(block_sf.host_data()), scale_bytes);
+    return {packed, scales};
+}
 #endif
 
 // BF16 x BF16 GEMM (for ENGINE_BF16_ATTN=1 mode)
@@ -2010,6 +3278,7 @@ struct Layer {
     void *sq_w8 = nullptr, *sk_w8 = nullptr, *sv_w8 = nullptr, *so_w8 = nullptr;
     void *cq_w8 = nullptr, *ck_w8 = nullptr, *cv_w8 = nullptr, *co_w8 = nullptr;
     void *f1_w8 = nullptr, *f2_w8 = nullptr;
+    uint8_t *f2_w4 = nullptr, *f2_s4 = nullptr;
     // BF16 bias pointers (persistent copies)
     __nv_bfloat16 *sqb = nullptr, *skb = nullptr, *svb = nullptr, *sob = nullptr;
     __nv_bfloat16 *cqb = nullptr, *ckb = nullptr, *cvb = nullptr, *cob = nullptr;
@@ -2060,12 +3329,33 @@ struct Layer {
 static cublasHandle_t g_blasH = nullptr;
 static cublasLtHandle_t g_ltH = nullptr;
 static cudnnHandle_t g_cudnnH = nullptr;
-static float *g_scaleA = nullptr, *g_scaleB = nullptr;
+static float *g_scaleA = nullptr, *g_scaleB = nullptr, *g_scaleZero = nullptr;
 static void *g_gemm_ws = nullptr;
 static int g_D, g_NH, g_HD, g_NL, g_FFN, g_CA_K_DIM, g_nsm;
 static int g_max_seq = 0, g_ctx = 0;
 static int g_actual_ctx = 0;  // actual encoder token count (may be < g_ctx)
 static bool g_ready = false;
+
+static void ensure_gemm_runtime() {
+    if (!g_blasH) CKBL(cublasCreate(&g_blasH));
+    if (!g_ltH) CKBL(cublasLtCreate(&g_ltH));
+    if (!g_gemm_ws) {
+        CK(cudaMalloc(&g_gemm_ws, g_gemm_ws_bytes));
+    }
+    float one = 1.f, zero = 0.f;
+    if (!g_scaleA) {
+        CK(cudaMalloc(&g_scaleA, sizeof(float)));
+        CK(cudaMemcpy(g_scaleA, &one, sizeof(float), cudaMemcpyHostToDevice));
+    }
+    if (!g_scaleB) {
+        CK(cudaMalloc(&g_scaleB, sizeof(float)));
+        CK(cudaMemcpy(g_scaleB, &one, sizeof(float), cudaMemcpyHostToDevice));
+    }
+    if (!g_scaleZero) {
+        CK(cudaMalloc(&g_scaleZero, sizeof(float)));
+        CK(cudaMemcpy(g_scaleZero, &zero, sizeof(float), cudaMemcpyHostToDevice));
+    }
+}
 
 // FP8 SDPA feature flag
 static bool g_fp8_sdpa_enabled = false;
@@ -2531,6 +3821,8 @@ static int g_n_gdn_layers = 0;
 static bool g_gdn_use_cublas_chunk = false; // Recurrent (1.27x). Chunk correct but needs MMA fwd_o to beat recurrent.
 static bool g_cutlass_fused_ffn1 = false;
 static bool g_cutlass_fused_ffn2 = false;
+static bool g_fp4_ffn2 = false;
+static bool g_cutlass_fused_ffn1_fp4 = false;
 static std::vector<int> g_gdn_layer_indices;  // which layers are GDN
 // Chunk algorithm scratch buffers (allocated in engine_init)
 static float *b_gdn_chunk_w = nullptr;     // [NC, NH, BT, K]
@@ -2543,6 +3835,10 @@ static float *g_temb_buf = nullptr, *g_ssts_buf = nullptr, *g_rope_buf = nullptr
 static bool g_use_graph = false;
 static cudaStream_t g_graph_stream = nullptr;
 static std::unordered_map<uint64_t, cudaGraphExec_t> g_graphs_by_key;
+static uint8_t *b_ffn_mid_fp4 = nullptr;
+static uint8_t *b_ffn_mid_fp4_scales = nullptr;
+static uint8_t *b_ffn_mid_fp4_scales_swizzled = nullptr;
+static float *g_fp4_normconst = nullptr;
 
 // ============================================================
 // cuBLASLt chunk GDN: helper functions (need globals above)
@@ -2674,8 +3970,12 @@ struct SeqGemms {
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
     CutlassFusedFfn1 f1_fused;
     bool f1_fused_built = false;
+    CutlassFusedFfn1Fp4 f1_fused_fp4;
+    bool f1_fused_fp4_built = false;
     CutlassFusedFfn2 f2_fused;
     bool f2_fused_built = false;
+    CutlassFp4RowwiseGemm f2_fp4;
+    bool f2_fp4_built = false;
 #endif
 
     // GatedDeltaNet GEMMs
@@ -2736,9 +4036,17 @@ SeqGemms* get_gemms(int seq) {
         g.f1_fused.setup(seq, FFNpr, D);
         g.f1_fused_built = true;
     }
+    if (g_fp4_ffn2 && g_cutlass_fused_ffn1_fp4 && !g.f1_fused_fp4_built) {
+        g.f1_fused_fp4.setup(seq, FFNpr, D);
+        g.f1_fused_fp4_built = true;
+    }
     if (g_cutlass_fused_ffn2 && !g.f2_fused_built) {
         g.f2_fused.setup(seq, D, FFNpr);
         g.f2_fused_built = true;
+    }
+    if (g_fp4_ffn2 && !g.f2_fp4_built) {
+        g.f2_fp4.setup(seq, D, FFNpr);
+        g.f2_fp4_built = true;
     }
 #endif
     float scl = 1.f / sqrtf((float)g_HD);
@@ -2810,6 +4118,22 @@ CaGemms* get_ca_gemms(int ca_len) {
     return &g;
 }
 
+static void run_ffn2_fp4(const Layer& L, SeqGemms* gm, int seq, cudaStream_t stream) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+    TORCH_CHECK(L.f2_w4 && L.f2_s4, "FFN2 FP4 weights not loaded");
+    gm->f2_fp4.run(
+        L.f2_w4,
+        L.f2_s4,
+        b_ffn_mid_fp4,
+        b_ffn_mid_fp4_scales_swizzled,
+        b_ffn_out,
+        stream);
+    k_add_bias_vec<<<8 * g_nsm, 256, 0, stream>>>(b_ffn_out, L.f2b, seq, g_D);
+#else
+    TORCH_CHECK(false, "FFN2 FP4 path requested without SM120 CUTLASS support");
+#endif
+}
+
 // ============================================================
 // Init: allocate buffers
 // ============================================================
@@ -2829,10 +4153,6 @@ void engine_init(int64_t D, int64_t NH, int64_t HD, int64_t NL,
     cudaDeviceProp prop; int dev; CK(cudaGetDevice(&dev));
     CK(cudaGetDeviceProperties(&prop, dev));
     g_nsm = prop.multiProcessorCount;
-
-    CKBL(cublasCreate(&g_blasH));
-    CKBL(cublasLtCreate(&g_ltH));
-    cudnnCreate(&g_cudnnH);
 
     const char* lt_autotune_env = getenv("KAIROS_LT_AUTOTUNE");
     if (lt_autotune_env) {
@@ -2858,6 +4178,18 @@ void engine_init(int64_t D, int64_t NH, int64_t HD, int64_t NL,
     if (fused_ffn2_env) {
         g_cutlass_fused_ffn2 = atoi(fused_ffn2_env) != 0;
     }
+    const char* fp4_ffn2_env = getenv("KAIROS_FP4_FFN2");
+    if (fp4_ffn2_env) {
+        g_fp4_ffn2 = atoi(fp4_ffn2_env) != 0;
+    }
+    const char* fused_ffn1_fp4_env = getenv("KAIROS_FUSED_FFN1_FP4");
+    if (fused_ffn1_fp4_env) {
+        g_cutlass_fused_ffn1_fp4 = atoi(fused_ffn1_fp4_env) != 0;
+    }
+    ensure_gemm_runtime();
+    if (!g_cudnnH) {
+        cudnnCreate(&g_cudnnH);
+    }
 #if !defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) && !defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
     if (g_cutlass_fused_ffn1) {
         printf("  [CUTLASS FFN1] disabled: SM120 CUTLASS support not compiled in\n");
@@ -2874,14 +4206,25 @@ void engine_init(int64_t D, int64_t NH, int64_t HD, int64_t NL,
     if (g_cutlass_fused_ffn2) {
         printf("  [CUTLASS FFN2] enabled via KAIROS_FUSED_FFN2_CUTLASS=1\n");
     }
+    if (g_fp4_ffn2) {
+        printf("  [FP4 FFN2] requested via KAIROS_FP4_FFN2=1\n");
+    }
+    if (g_cutlass_fused_ffn1_fp4) {
+        printf("  [CUTLASS FFN1 FP4] enabled via KAIROS_FUSED_FFN1_FP4=1\n");
+    }
     if (g_lt_fast_accum_fp8) {
         printf("  [cuBLASLt] FP8 fast accumulation enabled via KAIROS_LT_FAST_ACCUM_FP8=1\n");
     }
 
-    float one = 1.f;
-    CK(cudaMalloc(&g_scaleA, 4)); CK(cudaMemcpy(g_scaleA, &one, 4, cudaMemcpyHostToDevice));
-    CK(cudaMalloc(&g_scaleB, 4)); CK(cudaMemcpy(g_scaleB, &one, 4, cudaMemcpyHostToDevice));
-    CK(cudaMalloc(&g_gemm_ws, g_gemm_ws_bytes));
+#if !defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) && !defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+    if (g_fp4_ffn2) {
+        printf("  [FP4 FFN2] disabled: SM120 CUTLASS support not compiled in\n");
+        g_fp4_ffn2 = false;
+    }
+#endif
+    if (g_fp4_ffn2) {
+        TORCH_CHECK(g_FFN_per_rank % 32 == 0, "FP4 FFN2 requires FFN per rank divisible by 32, got ", g_FFN_per_rank);
+    }
 
     auto abf16 = [](size_t n) { __nv_bfloat16* p; CK(cudaMalloc(&p, n * 2)); return p; };
     auto afp8  = [](size_t n) { __nv_fp8_e4m3* p; CK(cudaMalloc(&p, n)); return p; };
@@ -2893,9 +4236,22 @@ void engine_init(int64_t D, int64_t NH, int64_t HD, int64_t NL,
     b_ca_norm = abf16(max_seq * D); b_ca_q = abf16(max_seq * D);
     b_ca_k = abf16(ctx * D); b_ca_v = abf16(ctx * D); b_ca_out = abf16(max_seq * D);
     b_ffn_norm = abf16(max_seq * D); b_ffn_mid = abf16(max_seq * FFN); b_ffn_out = abf16(max_seq * D);
+    CK(cudaMemset(b_ffn_mid, 0, max_seq * FFN * sizeof(__nv_bfloat16)));
     b_norm_fp8 = afp8(max_seq * D); b_ca_norm_fp8 = afp8(max_seq * D); b_ffn_norm_fp8 = afp8(max_seq * D);
     b_sa_out_fp8 = afp8(max_seq * D); b_ca_out_fp8 = afp8(max_seq * D); b_ffn_mid_fp8 = afp8(max_seq * FFN);
     b_enc_fp8 = afp8(ctx * CA_K_DIM);
+    if (g_fp4_ffn2) {
+        size_t rows_padded = (size_t)fp4_scale_rows((int)max_seq);
+        size_t scale_cols = (size_t)fp4_scale_cols(g_FFN_per_rank);
+        CK(cudaMalloc((void**)&b_ffn_mid_fp4, rows_padded * (size_t)g_FFN_per_rank / 2));
+        CK(cudaMalloc((void**)&b_ffn_mid_fp4_scales, rows_padded * scale_cols));
+        CK(cudaMalloc((void**)&b_ffn_mid_fp4_scales_swizzled, rows_padded * scale_cols));
+        if (g_cutlass_fused_ffn1_fp4 && g_fp4_normconst == nullptr) {
+            float h_normconst = 6.0f;
+            CK(cudaMalloc((void**)&g_fp4_normconst, sizeof(float)));
+            CK(cudaMemcpy(g_fp4_normconst, &h_normconst, sizeof(float), cudaMemcpyHostToDevice));
+        }
+    }
     {
         size_t sage_seq = (size_t)(((int)max_seq + 127) / 128) * 128;
         size_t nh_hd = (size_t)g_NH_per_rank * (size_t)HD;
@@ -3140,6 +4496,16 @@ void engine_load(int64_t li,
         conv(sq, &L.sq_w8); conv(sk, &L.sk_w8); conv(sv, &L.sv_w8); conv(so, &L.so_w8);
         conv(cq, &L.cq_w8); conv(ck, &L.ck_w8); conv(cv, &L.cv_w8); conv(co, &L.co_w8);
         conv(f1, &L.f1_w8); conv(f2, &L.f2_w8);
+    }
+
+    if (g_fp4_ffn2) {
+        auto f2_bf16 = f2.to(torch::kBFloat16).contiguous();
+        TORCH_CHECK(f2_bf16.is_cuda(), "FP4 FFN2 expects CUDA weights");
+        auto [packed, _scales, swizzled] = quantize_fp4_rowwise_bf16(f2_bf16);
+        CK(cudaMalloc((void**)&L.f2_w4, packed.nbytes()));
+        CK(cudaMalloc((void**)&L.f2_s4, swizzled.nbytes()));
+        CK(cudaMemcpy(L.f2_w4, packed.data_ptr(), packed.nbytes(), cudaMemcpyDeviceToDevice));
+        CK(cudaMemcpy(L.f2_s4, swizzled.data_ptr(), swizzled.nbytes(), cudaMemcpyDeviceToDevice));
     }
 
     // BF16 weight copies for force_bf16_gemms mode (CA K/V now pre-computed in Python)
@@ -3603,8 +4969,24 @@ static void forward_core(
                 if (DO_GEMM) gm->f1_bf16.run(g_ltH, L.f1_w16, b_ffn_norm, b_ffn_mid, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f1b);
                 if (DO_EWISE) k_silu_bf16<<<(seq_FFNpr + 255) / 256, 256, 0, stream>>>(b_ffn_mid, seq_FFNpr);
             } else {
-                bool use_fused_ffn1 = g_cutlass_fused_ffn1 && DO_GEMM && DO_EWISE;
-                if (use_fused_ffn1) {
+                bool use_fp4_ffn2 = g_fp4_ffn2 && DO_GEMM && DO_EWISE;
+                bool use_fused_ffn1_fp4 = use_fp4_ffn2 && g_cutlass_fused_ffn1_fp4;
+                bool use_fused_ffn1 = g_cutlass_fused_ffn1 && DO_GEMM && DO_EWISE && !use_fused_ffn1_fp4;
+                if (use_fused_ffn1_fp4) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+                    gm->f1_fused_fp4.run(
+                        L.f1_w8,
+                        b_ffn_norm_fp8,
+                        b_ffn_mid,
+                        b_ffn_mid_fp4,
+                        b_ffn_mid_fp4_scales_swizzled,
+                        L.f1b,
+                        g_fp4_normconst,
+                        stream);
+#else
+                    TORCH_CHECK(false, "CUTLASS fused FFN1 FP4 requested without SM120 CUTLASS support");
+#endif
+                } else if (use_fused_ffn1) {
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
                     gm->f1_fused.run(L.f1_w8, b_ffn_norm_fp8, b_ffn_mid_fp8, L.f1b, stream);
 #else
@@ -3612,15 +4994,43 @@ static void forward_core(
 #endif
                 } else {
                     if (DO_GEMM) gm->f1.run(g_ltH, L.f1_w8, b_ffn_norm_fp8, b_ffn_mid, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f1b);
-                    if (DO_EWISE) k_silu_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_ffn_mid, b_ffn_mid_fp8, seq_FFNpr);
+                    if (DO_EWISE) {
+                        if (g_fp4_ffn2 && DO_GEMM) {
+                            int rows_padded = fp4_scale_rows(seq);
+                            int scale_cols = fp4_scale_cols(g_FFN_per_rank);
+                            size_t packed_bytes = (size_t)rows_padded * (size_t)g_FFN_per_rank / 2;
+                            size_t scale_bytes = (size_t)rows_padded * (size_t)scale_cols;
+                            if (rows_padded != seq) {
+                                CK(cudaMemsetAsync(b_ffn_mid_fp4, 0, packed_bytes, stream));
+                            }
+                            if (rows_padded != seq || scale_cols != (g_FFN_per_rank / 16)) {
+                                CK(cudaMemsetAsync(b_ffn_mid_fp4_scales_swizzled, fp4_scale_one_byte(), scale_bytes, stream));
+                            }
+                            constexpr int FP4_WARPS_PER_BLOCK = 4;
+                            constexpr int FP4_THREADS = FP4_WARPS_PER_BLOCK * 32;
+                            int fp4_grid_x = (g_FFN_per_rank + (FP4_WARPS_PER_BLOCK * 32 - 1)) / (FP4_WARPS_PER_BLOCK * 32);
+                            k_silu_to_fp4_rowwise_swizzled<<<dim3(fp4_grid_x, seq), FP4_THREADS, 0, stream>>>(
+                                b_ffn_mid,
+                                b_ffn_mid_fp4,
+                                b_ffn_mid_fp4_scales_swizzled,
+                                seq,
+                                g_FFN_per_rank,
+                                scale_cols);
+                        } else {
+                            k_silu_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_ffn_mid, b_ffn_mid_fp8, seq_FFNpr);
+                        }
+                    }
                 }
             }
             // FFN2
             if (g_force_bf16_gemms) {
                 if (DO_GEMM) gm->f2_bf16.run(g_ltH, L.f2_w16, b_ffn_mid, b_ffn_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f2b);
             } else {
+                bool use_fp4_ffn2 = g_fp4_ffn2 && DO_GEMM && DO_EWISE;
                 bool use_fused_ffn2 = g_cutlass_fused_ffn2 && DO_GEMM;
-                if (use_fused_ffn2) {
+                if (use_fp4_ffn2) {
+                    run_ffn2_fp4(L, gm, seq, stream);
+                } else if (use_fused_ffn2) {
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
                     gm->f2_fused.run(L.f2_w8, b_ffn_mid_fp8, b_ffn_out, L.f2b, stream);
 #else
@@ -3905,8 +5315,24 @@ static void forward_core(
                 if (DO_GEMM) gm->f1_bf16.run(g_ltH, L.f1_w16, b_ffn_norm, b_ffn_mid, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f1b);
                 if (DO_EWISE) k_silu_bf16<<<(seq_FFNpr + 255) / 256, 256, 0, stream>>>(b_ffn_mid, seq_FFNpr);
             } else {
-                bool use_fused_ffn1 = g_cutlass_fused_ffn1 && DO_GEMM && DO_EWISE;
-                if (use_fused_ffn1) {
+                bool use_fp4_ffn2 = g_fp4_ffn2 && DO_GEMM && DO_EWISE;
+                bool use_fused_ffn1_fp4 = use_fp4_ffn2 && g_cutlass_fused_ffn1_fp4;
+                bool use_fused_ffn1 = g_cutlass_fused_ffn1 && DO_GEMM && DO_EWISE && !use_fused_ffn1_fp4;
+                if (use_fused_ffn1_fp4) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+                    gm->f1_fused_fp4.run(
+                        L.f1_w8,
+                        b_ffn_norm_fp8,
+                        b_ffn_mid,
+                        b_ffn_mid_fp4,
+                        b_ffn_mid_fp4_scales_swizzled,
+                        L.f1b,
+                        g_fp4_normconst,
+                        stream);
+#else
+                    TORCH_CHECK(false, "CUTLASS fused FFN1 FP4 requested without SM120 CUTLASS support");
+#endif
+                } else if (use_fused_ffn1) {
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
                     gm->f1_fused.run(L.f1_w8, b_ffn_norm_fp8, b_ffn_mid_fp8, L.f1b, stream);
 #else
@@ -3914,7 +5340,32 @@ static void forward_core(
 #endif
                 } else {
                     if (DO_GEMM) gm->f1.run(g_ltH, L.f1_w8, b_ffn_norm_fp8, b_ffn_mid, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f1b);
-                    if (DO_EWISE) k_silu_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_ffn_mid, b_ffn_mid_fp8, seq_FFNpr);
+                    if (DO_EWISE) {
+                        if (g_fp4_ffn2 && DO_GEMM) {
+                            int rows_padded = fp4_scale_rows(seq);
+                            int scale_cols = fp4_scale_cols(g_FFN_per_rank);
+                            size_t packed_bytes = (size_t)rows_padded * (size_t)g_FFN_per_rank / 2;
+                            size_t scale_bytes = (size_t)rows_padded * (size_t)scale_cols;
+                            if (rows_padded != seq) {
+                                CK(cudaMemsetAsync(b_ffn_mid_fp4, 0, packed_bytes, stream));
+                            }
+                            if (rows_padded != seq || scale_cols != (g_FFN_per_rank / 16)) {
+                                CK(cudaMemsetAsync(b_ffn_mid_fp4_scales_swizzled, fp4_scale_one_byte(), scale_bytes, stream));
+                            }
+                            constexpr int FP4_WARPS_PER_BLOCK = 4;
+                            constexpr int FP4_THREADS = FP4_WARPS_PER_BLOCK * 32;
+                            int fp4_grid_x = (g_FFN_per_rank + (FP4_WARPS_PER_BLOCK * 32 - 1)) / (FP4_WARPS_PER_BLOCK * 32);
+                            k_silu_to_fp4_rowwise_swizzled<<<dim3(fp4_grid_x, seq), FP4_THREADS, 0, stream>>>(
+                                b_ffn_mid,
+                                b_ffn_mid_fp4,
+                                b_ffn_mid_fp4_scales_swizzled,
+                                seq,
+                                g_FFN_per_rank,
+                                scale_cols);
+                        } else {
+                            k_silu_to_fp8<<<8*g_nsm, 256, 0, stream>>>(b_ffn_mid, b_ffn_mid_fp8, seq_FFNpr);
+                        }
+                    }
                 }
             }
             if (DO_TIME) TREC(10);
@@ -3923,8 +5374,11 @@ static void forward_core(
             if (g_force_bf16_gemms) {
                 if (DO_GEMM) gm->f2_bf16.run(g_ltH, L.f2_w16, b_ffn_mid, b_ffn_out, g_gemm_ws, 32*1024*1024, 1.f, 0.f, stream, L.f2b);
             } else {
+                bool use_fp4_ffn2 = g_fp4_ffn2 && DO_GEMM && DO_EWISE;
                 bool use_fused_ffn2 = g_cutlass_fused_ffn2 && DO_GEMM;
-                if (use_fused_ffn2) {
+                if (use_fp4_ffn2) {
+                    run_ffn2_fp4(L, gm, seq, stream);
+                } else if (use_fused_ffn2) {
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
                     gm->f2_fused.run(L.f2_w8, b_ffn_mid_fp8, b_ffn_out, L.f2b, stream);
 #else
@@ -4139,6 +5593,528 @@ torch::Tensor get_buf(std::string name, int64_t seq) {
     return torch::from_blob(p, {n_rows, n_cols}, opts).clone();
 }
 
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+quantize_fp4_rowwise_bf16(torch::Tensor in_t) {
+    TORCH_CHECK(in_t.is_cuda(), "input must be CUDA");
+    TORCH_CHECK(in_t.scalar_type() == torch::kBFloat16, "input must be bf16");
+    TORCH_CHECK(in_t.dim() == 2, "input must be rank-2 [rows, cols]");
+    auto in_c = in_t.contiguous();
+    int rows = (int)in_c.size(0);
+    int cols = (int)in_c.size(1);
+    TORCH_CHECK(cols % 16 == 0, "FP4 quantization requires cols divisible by 16, got ", cols);
+    auto opts_u8 = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+    auto packed = torch::zeros({rows, cols / 2}, opts_u8);
+    auto scales = torch::zeros({fp4_scale_rows(rows), fp4_scale_cols(cols)}, opts_u8);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    constexpr int FP4_WARPS_PER_BLOCK = 4;
+    constexpr int FP4_THREADS = FP4_WARPS_PER_BLOCK * 32;
+    int grid_x = (cols + (FP4_WARPS_PER_BLOCK * 32 - 1)) / (FP4_WARPS_PER_BLOCK * 32);
+    k_quantize_rowwise_bf16_to_fp4<<<dim3(grid_x, rows), FP4_THREADS, 0, stream>>>(
+        (__nv_bfloat16*)in_c.data_ptr(),
+        (uint8_t*)packed.data_ptr(),
+        (uint8_t*)scales.data_ptr(),
+        rows, cols, (int)scales.size(1));
+    auto swizzled = swizzle_fp4_scales_rowwise(scales);
+    return {packed, scales, swizzled};
+}
+
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+quantize_fp4_colmajor_bf16(torch::Tensor in_t) {
+    TORCH_CHECK(in_t.is_cuda(), "input must be CUDA");
+    TORCH_CHECK(in_t.scalar_type() == torch::kBFloat16, "input must be bf16");
+    TORCH_CHECK(in_t.dim() == 2, "input must be rank-2 [rows, cols]");
+    auto in_c = in_t.contiguous();
+    int rows = (int)in_c.size(0);
+    int cols = (int)in_c.size(1);
+    TORCH_CHECK(rows % 2 == 0, "ColumnMajor FP4 packing requires even row count, got ", rows);
+    TORCH_CHECK(cols % 16 == 0, "FP4 quantization requires cols divisible by 16, got ", cols);
+    auto opts_u8 = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+    auto packed = torch::zeros({cols, rows / 2}, opts_u8);
+    auto scales = torch::zeros({fp4_scale_rows(rows), fp4_scale_cols(cols)}, opts_u8);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    k_quantize_colmajor_bf16_to_fp4<<<dim3(cols / 16, rows / 2), 32, 0, stream>>>(
+        (__nv_bfloat16*)in_c.data_ptr(),
+        (uint8_t*)packed.data_ptr(),
+        (uint8_t*)scales.data_ptr(),
+        rows, cols, (int)scales.size(1));
+    auto swizzled = swizzle_fp4_scales_rowwise(scales);
+    return {packed, scales, swizzled};
+}
+
+static torch::Tensor run_fp4_gemm_rowwise_cublas(torch::Tensor w_t, torch::Tensor act_t) {
+    TORCH_CHECK(w_t.is_cuda() && act_t.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(w_t.scalar_type() == torch::kBFloat16 && act_t.scalar_type() == torch::kBFloat16,
+                "inputs must be bf16");
+    TORCH_CHECK(w_t.dim() == 2 && act_t.dim() == 2, "inputs must be rank-2");
+    int N = (int)w_t.size(0);
+    int K = (int)w_t.size(1);
+    int M = (int)act_t.size(0);
+    TORCH_CHECK((int)act_t.size(1) == K, "K mismatch");
+    TORCH_CHECK(K % 32 == 0, "FP4 GEMM requires K divisible by 32, got ", K);
+
+    ensure_gemm_runtime();
+    auto [w_packed, w_scales, w_swizzled] = quantize_fp4_colmajor_bf16(w_t);
+    auto [a_packed, a_scales, a_swizzled] = quantize_fp4_rowwise_bf16(act_t);
+    (void)w_scales;
+    (void)a_scales;
+
+    auto out = torch::zeros({M, N}, torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    FP4Gemm gemm;
+    gemm.setup(g_ltH, M, N, K,
+               (uint8_t*)w_swizzled.data_ptr(),
+               (uint8_t*)a_swizzled.data_ptr(),
+               g_gemm_ws, g_gemm_ws_bytes);
+    gemm.run(g_ltH,
+             w_packed.data_ptr(),
+             a_packed.data_ptr(),
+             out.data_ptr(),
+             g_gemm_ws, g_gemm_ws_bytes,
+             g_scaleA, g_scaleZero, stream);
+    return out;
+}
+
+static torch::Tensor run_fp4_gemm_rowwise_packed_cublas(
+    torch::Tensor w_packed,
+    torch::Tensor w_swizzled,
+    torch::Tensor act_packed,
+    torch::Tensor act_swizzled,
+    int64_t M,
+    int64_t N,
+    int64_t K) {
+    TORCH_CHECK(w_packed.is_cuda() && w_swizzled.is_cuda() && act_packed.is_cuda() && act_swizzled.is_cuda(),
+                "all tensors must be CUDA");
+    TORCH_CHECK(w_packed.scalar_type() == torch::kUInt8 &&
+                w_swizzled.scalar_type() == torch::kUInt8 &&
+                act_packed.scalar_type() == torch::kUInt8 &&
+                act_swizzled.scalar_type() == torch::kUInt8,
+                "packed/scales must be uint8 tensors");
+    TORCH_CHECK(K % 32 == 0, "FP4 GEMM requires K divisible by 32, got ", K);
+    ensure_gemm_runtime();
+    auto out = torch::zeros({M, N}, torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    FP4Gemm gemm;
+    gemm.setup(g_ltH, (int)M, (int)N, (int)K,
+               (uint8_t*)w_swizzled.data_ptr(),
+               (uint8_t*)act_swizzled.data_ptr(),
+               g_gemm_ws, g_gemm_ws_bytes);
+    gemm.run(g_ltH,
+             w_packed.data_ptr(),
+             act_packed.data_ptr(),
+             out.data_ptr(),
+             g_gemm_ws, g_gemm_ws_bytes,
+             g_scaleA, g_scaleZero, stream);
+    return out;
+}
+
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+static torch::Tensor run_fp4_gemm_rowwise_cutlass(torch::Tensor w_t, torch::Tensor act_t) {
+    TORCH_CHECK(w_t.is_cuda() && act_t.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(w_t.scalar_type() == torch::kBFloat16 && act_t.scalar_type() == torch::kBFloat16,
+                "inputs must be bf16");
+    TORCH_CHECK(w_t.dim() == 2 && act_t.dim() == 2, "inputs must be rank-2");
+    int N = (int)w_t.size(0);
+    int K = (int)w_t.size(1);
+    int M = (int)act_t.size(0);
+    TORCH_CHECK((int)act_t.size(1) == K, "K mismatch");
+    TORCH_CHECK(K % 32 == 0, "FP4 GEMM requires K divisible by 32, got ", K);
+    auto out = torch::zeros({M, N}, torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CutlassFp4RowwiseGemm gemm;
+    gemm.setup(M, N, K);
+    auto [w_packed, _w_scales, w_swizzled] = quantize_fp4_rowwise_bf16(w_t);
+    auto [a_packed, _a_scales, a_swizzled] = quantize_fp4_rowwise_bf16(act_t);
+
+    gemm.run(
+        w_packed.data_ptr(),
+        w_swizzled.data_ptr(),
+        a_packed.data_ptr(),
+        a_swizzled.data_ptr(),
+        out.data_ptr(),
+        stream);
+    return out;
+}
+
+static torch::Tensor run_fp4_gemm_rowwise_packed_cutlass(
+    torch::Tensor w_packed,
+    torch::Tensor w_swizzled,
+    torch::Tensor act_packed,
+    torch::Tensor act_swizzled,
+    int64_t M,
+    int64_t N,
+    int64_t K) {
+    TORCH_CHECK(w_packed.is_cuda() && w_swizzled.is_cuda() && act_packed.is_cuda() && act_swizzled.is_cuda(),
+                "all tensors must be CUDA");
+    TORCH_CHECK(w_packed.scalar_type() == torch::kUInt8 &&
+                w_swizzled.scalar_type() == torch::kUInt8 &&
+                act_packed.scalar_type() == torch::kUInt8 &&
+                act_swizzled.scalar_type() == torch::kUInt8,
+                "packed/scales must be uint8 tensors");
+    TORCH_CHECK(K % 32 == 0, "FP4 GEMM requires K divisible by 32, got ", K);
+    auto out = torch::zeros({M, N}, torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CutlassFp4RowwiseGemm gemm;
+    gemm.setup((int)M, (int)N, (int)K);
+    gemm.run(
+        w_packed.data_ptr(),
+        w_swizzled.data_ptr(),
+        act_packed.data_ptr(),
+        act_swizzled.data_ptr(),
+        out.data_ptr(),
+        stream);
+    return out;
+}
+#endif
+
+static torch::Tensor run_fp4_gemm_rowwise(torch::Tensor w_t, torch::Tensor act_t) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+    return run_fp4_gemm_rowwise_cutlass(w_t, act_t);
+#else
+    return run_fp4_gemm_rowwise_cublas(w_t, act_t);
+#endif
+}
+
+static torch::Tensor run_fp4_gemm_rowwise_packed(
+    torch::Tensor w_packed,
+    torch::Tensor w_swizzled,
+    torch::Tensor act_packed,
+    torch::Tensor act_swizzled,
+    int64_t M,
+    int64_t N,
+    int64_t K) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+    return run_fp4_gemm_rowwise_packed_cutlass(
+        w_packed, w_swizzled, act_packed, act_swizzled, M, N, K);
+#else
+    return run_fp4_gemm_rowwise_packed_cublas(
+        w_packed, w_swizzled, act_packed, act_swizzled, M, N, K);
+#endif
+}
+
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+template <class LayoutSF>
+static torch::Tensor debug_scale_layout_map(LayoutSF layout_sf, int rows, int cols) {
+    TORCH_CHECK(cols % 16 == 0, "cols must be divisible by 16");
+    auto map = torch::full(
+        {(long)cute::size(cute::filter_zeros(layout_sf))},
+        -1,
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
+    auto* ptr = map.data_ptr<int32_t>();
+    int blocks = cols / 16;
+    for (int row = 0; row < rows; ++row) {
+        for (int block16 = 0; block16 < blocks; ++block16) {
+            int32_t logical_id = row * blocks + block16;
+            size_t idx0 = (size_t)layout_sf(cute::make_coord(row, block16 * 16, 0));
+            for (int kk = 1; kk < 16; ++kk) {
+                size_t idxk = (size_t)layout_sf(cute::make_coord(row, block16 * 16 + kk, 0));
+                TORCH_CHECK(idxk == idx0,
+                            "scale layout maps one 16-wide block to multiple indices at row=", row,
+                            " block16=", block16, " kk=", kk, " idx0=", idx0, " idxk=", idxk);
+            }
+            TORCH_CHECK(idx0 < (size_t)map.numel(), "scale layout index out of range");
+            TORCH_CHECK(ptr[idx0] == -1 || ptr[idx0] == logical_id,
+                        "scale layout alias mismatch at raw index ", idx0,
+                        " existing=", ptr[idx0], " new=", logical_id);
+            ptr[idx0] = logical_id;
+        }
+    }
+    return map;
+}
+
+static std::tuple<torch::Tensor, torch::Tensor> debug_ffn1_ffn2_scale_layout_maps(
+    int64_t seq, int64_t d, int64_t ffn) {
+    TORCH_CHECK(seq > 0 && d > 0 && ffn > 0, "seq/d/ffn must be positive");
+    TORCH_CHECK(ffn % 16 == 0, "ffn must be divisible by 16");
+    CutlassFusedFfn1Fp4 producer;
+    producer.setup((int)seq, (int)ffn, (int)d);
+    CutlassFp4RowwiseGemm consumer;
+    consumer.setup((int)seq, (int)d, (int)ffn);
+    auto producer_map = debug_scale_layout_map(producer.layout_SFD, (int)seq, (int)ffn);
+    auto consumer_map = debug_scale_layout_map(consumer.layout_SFA, (int)seq, (int)ffn);
+    return {producer_map, consumer_map};
+}
+
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+debug_compare_ffn1_fp4_producers_impl(
+    torch::Tensor w_t,
+    torch::Tensor act_t,
+    torch::Tensor bias_t,
+    float norm_constant) {
+    TORCH_CHECK(w_t.is_cuda() && act_t.is_cuda() && bias_t.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(w_t.scalar_type() == torch::kBFloat16 &&
+                act_t.scalar_type() == torch::kBFloat16 &&
+                bias_t.scalar_type() == torch::kBFloat16,
+                "inputs must be bf16");
+    TORCH_CHECK(w_t.dim() == 2 && act_t.dim() == 2 && bias_t.dim() == 1,
+                "expected w[N,K], act[M,K], bias[N]");
+    auto w_bf16 = w_t.contiguous();
+    auto act_bf16 = act_t.contiguous();
+    auto bias_bf16 = bias_t.contiguous();
+    int N = (int)w_bf16.size(0);
+    int K = (int)w_bf16.size(1);
+    int M = (int)act_bf16.size(0);
+    TORCH_CHECK((int)act_bf16.size(1) == K, "K mismatch");
+    TORCH_CHECK((int)bias_bf16.numel() == N, "bias size mismatch");
+    TORCH_CHECK(N % 16 == 0, "FFN output dim must be divisible by 16, got ", N);
+
+    ensure_gemm_runtime();
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    auto opts_u8 = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+
+    auto w_fp8 = w_bf16.to(torch::kFloat8_e4m3fn).contiguous();
+    auto act_fp8 = act_bf16.to(torch::kFloat8_e4m3fn).contiguous();
+
+    auto ref_mid = torch::zeros({M, N}, opts_bf16);
+    FP8Gemm ref_gemm;
+    ref_gemm.setup(g_ltH, M, N, K, g_scaleA, g_scaleB, g_gemm_ws, g_gemm_ws_bytes, 0);
+    ref_gemm.run(g_ltH,
+                 w_fp8.data_ptr(),
+                 act_fp8.data_ptr(),
+                 ref_mid.data_ptr(),
+                 g_gemm_ws, g_gemm_ws_bytes,
+                 1.f, 0.f, stream,
+                 bias_bf16.data_ptr());
+
+    int rows_padded = fp4_scale_rows(M);
+    int scale_cols = fp4_scale_cols(N);
+    auto ref_packed = torch::zeros({rows_padded, N / 2}, opts_u8);
+    auto ref_scales = torch::empty({rows_padded, scale_cols}, opts_u8);
+    CK(cudaMemsetAsync(ref_scales.data_ptr(), fp4_scale_one_byte(), ref_scales.nbytes(), stream));
+    k_silu_to_fp4_rowwise_swizzled<<<dim3(N / 16, M), 32, 0, stream>>>(
+        (__nv_bfloat16*)ref_mid.data_ptr(),
+        (uint8_t*)ref_packed.data_ptr(),
+        (uint8_t*)ref_scales.data_ptr(),
+        M, N, scale_cols);
+
+    auto fused_src = torch::zeros({M, N}, opts_bf16);
+    auto fused_packed = torch::zeros({rows_padded, N / 2}, opts_u8);
+    auto fused_scales = torch::empty({rows_padded, scale_cols}, opts_u8);
+    CK(cudaMemsetAsync(fused_scales.data_ptr(), fp4_scale_one_byte(), fused_scales.nbytes(), stream));
+    auto normconst = torch::full({1}, norm_constant, opts_f32);
+
+    CutlassFusedFfn1Fp4 fused;
+    fused.setup(M, N, K);
+    fused.run(
+        w_fp8.data_ptr(),
+        act_fp8.data_ptr(),
+        (__nv_bfloat16*)fused_src.data_ptr(),
+        fused_packed.data_ptr(),
+        fused_scales.data_ptr(),
+        (__nv_bfloat16*)bias_bf16.data_ptr(),
+        normconst.data_ptr<float>(),
+        stream);
+
+    CK(cudaStreamSynchronize(stream));
+    return {ref_mid, ref_packed, ref_scales, fused_packed, fused_scales};
+}
+
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+debug_compare_ffn1_fp4_producers(torch::Tensor w_t, torch::Tensor act_t, torch::Tensor bias_t) {
+    return debug_compare_ffn1_fp4_producers_impl(w_t, act_t, bias_t, 6.0f);
+}
+
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+debug_compare_ffn1_fp4_producers_norm(
+    torch::Tensor w_t,
+    torch::Tensor act_t,
+    torch::Tensor bias_t,
+    double norm_constant) {
+    return debug_compare_ffn1_fp4_producers_impl(w_t, act_t, bias_t, (float)norm_constant);
+}
+
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+debug_compare_ffn1_fp4_identity_producer(
+    torch::Tensor w_t,
+    torch::Tensor act_t,
+    torch::Tensor bias_t,
+    double norm_constant) {
+    TORCH_CHECK(w_t.is_cuda() && act_t.is_cuda() && bias_t.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(w_t.scalar_type() == torch::kBFloat16 &&
+                act_t.scalar_type() == torch::kBFloat16 &&
+                bias_t.scalar_type() == torch::kBFloat16,
+                "inputs must be bf16");
+    TORCH_CHECK(w_t.dim() == 2 && act_t.dim() == 2 && bias_t.dim() == 1,
+                "expected w[N,K], act[M,K], bias[N]");
+    auto w_bf16 = w_t.contiguous();
+    auto act_bf16 = act_t.contiguous();
+    auto bias_bf16 = bias_t.contiguous();
+    int N = (int)w_bf16.size(0);
+    int K = (int)w_bf16.size(1);
+    int M = (int)act_bf16.size(0);
+    TORCH_CHECK((int)act_bf16.size(1) == K, "K mismatch");
+    TORCH_CHECK((int)bias_bf16.numel() == N, "bias size mismatch");
+    TORCH_CHECK(N % 16 == 0, "FFN output dim must be divisible by 16, got ", N);
+
+    ensure_gemm_runtime();
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    auto opts_u8 = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+
+    auto w_fp8 = w_bf16.to(torch::kFloat8_e4m3fn).contiguous();
+    auto act_fp8 = act_bf16.to(torch::kFloat8_e4m3fn).contiguous();
+
+    auto ref_mid = torch::zeros({M, N}, opts_bf16);
+    FP8Gemm ref_gemm;
+    ref_gemm.setup(g_ltH, M, N, K, g_scaleA, g_scaleB, g_gemm_ws, g_gemm_ws_bytes, 0);
+    ref_gemm.run(g_ltH,
+                 w_fp8.data_ptr(),
+                 act_fp8.data_ptr(),
+                 ref_mid.data_ptr(),
+                 g_gemm_ws, g_gemm_ws_bytes,
+                 1.f, 0.f, stream,
+                 bias_bf16.data_ptr());
+
+    int rows_padded = fp4_scale_rows(M);
+    int scale_cols = fp4_scale_cols(N);
+    auto fused_src = torch::zeros({M, N}, opts_bf16);
+    auto fused_packed = torch::zeros({rows_padded, N / 2}, opts_u8);
+    auto fused_scales = torch::empty({rows_padded, scale_cols}, opts_u8);
+    CK(cudaMemsetAsync(fused_scales.data_ptr(), fp4_scale_one_byte(), fused_scales.nbytes(), stream));
+    auto normconst = torch::full({1}, (float)norm_constant, opts_f32);
+
+    CutlassFusedFfn1Fp4Identity fused;
+    fused.setup(M, N, K);
+    fused.run(
+        w_fp8.data_ptr(),
+        act_fp8.data_ptr(),
+        (__nv_bfloat16*)fused_src.data_ptr(),
+        fused_packed.data_ptr(),
+        fused_scales.data_ptr(),
+        (__nv_bfloat16*)bias_bf16.data_ptr(),
+        normconst.data_ptr<float>(),
+        stream);
+
+    CK(cudaStreamSynchronize(stream));
+    return {ref_mid, fused_packed, fused_scales};
+}
+
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+debug_compare_ffn1_fp4_blockscale_only(
+    torch::Tensor w_t,
+    torch::Tensor act_t,
+    double norm_constant) {
+    TORCH_CHECK(w_t.is_cuda() && act_t.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(w_t.scalar_type() == torch::kBFloat16 &&
+                act_t.scalar_type() == torch::kBFloat16,
+                "inputs must be bf16");
+    TORCH_CHECK(w_t.dim() == 2 && act_t.dim() == 2,
+                "expected w[N,K], act[M,K]");
+    auto w_bf16 = w_t.contiguous();
+    auto act_bf16 = act_t.contiguous();
+    int N = (int)w_bf16.size(0);
+    int K = (int)w_bf16.size(1);
+    int M = (int)act_bf16.size(0);
+    TORCH_CHECK((int)act_bf16.size(1) == K, "K mismatch");
+    TORCH_CHECK(N % 16 == 0, "FFN output dim must be divisible by 16, got ", N);
+
+    ensure_gemm_runtime();
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    auto opts_u8 = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+
+    auto w_fp8 = w_bf16.to(torch::kFloat8_e4m3fn).contiguous();
+    auto act_fp8 = act_bf16.to(torch::kFloat8_e4m3fn).contiguous();
+
+    auto ref_mid = torch::zeros({M, N}, opts_bf16);
+    FP8Gemm ref_gemm;
+    ref_gemm.setup(g_ltH, M, N, K, g_scaleA, g_scaleB, g_gemm_ws, g_gemm_ws_bytes, 0);
+    ref_gemm.run(g_ltH,
+                 w_fp8.data_ptr(),
+                 act_fp8.data_ptr(),
+                 ref_mid.data_ptr(),
+                 g_gemm_ws, g_gemm_ws_bytes,
+                 1.f, 0.f, stream,
+                 nullptr);
+
+    int rows_padded = fp4_scale_rows(M);
+    int scale_cols = fp4_scale_cols(N);
+    auto fused_src = torch::zeros({M, N}, opts_bf16);
+    auto fused_packed = torch::zeros({rows_padded, N / 2}, opts_u8);
+    auto fused_scales = torch::empty({rows_padded, scale_cols}, opts_u8);
+    CK(cudaMemsetAsync(fused_scales.data_ptr(), fp4_scale_one_byte(), fused_scales.nbytes(), stream));
+    auto normconst = torch::full({1}, (float)norm_constant, opts_f32);
+
+    CutlassFfn1Fp4BlockScaleOnly fused;
+    fused.setup(M, N, K);
+    fused.run(
+        w_fp8.data_ptr(),
+        act_fp8.data_ptr(),
+        (__nv_bfloat16*)fused_src.data_ptr(),
+        fused_packed.data_ptr(),
+        fused_scales.data_ptr(),
+        normconst.data_ptr<float>(),
+        stream);
+
+    CK(cudaStreamSynchronize(stream));
+    return {ref_mid, fused_packed, fused_scales};
+}
+
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+debug_compare_ffn1_fp4_blockscale_only_e8m0(
+    torch::Tensor w_t,
+    torch::Tensor act_t,
+    double norm_constant) {
+    TORCH_CHECK(w_t.is_cuda() && act_t.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(w_t.scalar_type() == torch::kBFloat16 &&
+                act_t.scalar_type() == torch::kBFloat16,
+                "inputs must be bf16");
+    TORCH_CHECK(w_t.dim() == 2 && act_t.dim() == 2,
+                "expected w[N,K], act[M,K]");
+    auto w_bf16 = w_t.contiguous();
+    auto act_bf16 = act_t.contiguous();
+    int N = (int)w_bf16.size(0);
+    int K = (int)w_bf16.size(1);
+    int M = (int)act_bf16.size(0);
+    TORCH_CHECK((int)act_bf16.size(1) == K, "K mismatch");
+    TORCH_CHECK(N % 16 == 0, "FFN output dim must be divisible by 16, got ", N);
+
+    ensure_gemm_runtime();
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    auto opts_u8 = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+
+    auto w_fp8 = w_bf16.to(torch::kFloat8_e4m3fn).contiguous();
+    auto act_fp8 = act_bf16.to(torch::kFloat8_e4m3fn).contiguous();
+
+    auto ref_mid = torch::zeros({M, N}, opts_bf16);
+    FP8Gemm ref_gemm;
+    ref_gemm.setup(g_ltH, M, N, K, g_scaleA, g_scaleB, g_gemm_ws, g_gemm_ws_bytes, 0);
+    ref_gemm.run(g_ltH,
+                 w_fp8.data_ptr(),
+                 act_fp8.data_ptr(),
+                 ref_mid.data_ptr(),
+                 g_gemm_ws, g_gemm_ws_bytes,
+                 1.f, 0.f, stream,
+                 nullptr);
+
+    int rows_padded = fp4_scale_rows(M);
+    int scale_cols = fp4_scale_cols(N);
+    auto fused_src = torch::zeros({M, N}, opts_bf16);
+    auto fused_packed = torch::zeros({rows_padded, N / 2}, opts_u8);
+    auto fused_scales = torch::zeros({rows_padded, scale_cols}, opts_u8);
+    auto normconst = torch::full({1}, (float)norm_constant, opts_f32);
+
+    CutlassFfn1Fp4BlockScaleOnlyE8M0 fused;
+    fused.setup(M, N, K);
+    fused.run(
+        w_fp8.data_ptr(),
+        act_fp8.data_ptr(),
+        (__nv_bfloat16*)fused_src.data_ptr(),
+        fused_packed.data_ptr(),
+        fused_scales.data_ptr(),
+        normconst.data_ptr<float>(),
+        stream);
+
+    CK(cudaStreamSynchronize(stream));
+    return {ref_mid, fused_packed, fused_scales};
+}
+#endif
+
 // ============================================================
 // PYBIND11 module
 // ============================================================
@@ -4273,6 +6249,79 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         CK(cudaStreamSynchronize(stream));
         return o_out;
     }, "Run native SageAttention3 path directly");
+    m.def("run_fp4_gemm", [](torch::Tensor w_t, torch::Tensor act_t) {
+        auto out = run_fp4_gemm_rowwise(w_t, act_t);
+        CK(cudaStreamSynchronize(at::cuda::getCurrentCUDAStream()));
+        return out;
+    }, "Run standalone SM120 rowwise FP4 GEMM [N,K] x [M,K] -> [M,N]");
+    m.def("quantize_fp4_rowwise", [](torch::Tensor in_t) {
+        auto [packed, scales, swizzled] = quantize_fp4_rowwise_bf16(in_t);
+        CK(cudaStreamSynchronize(at::cuda::getCurrentCUDAStream()));
+        return std::make_tuple(packed, scales, swizzled);
+    }, "Quantize a bf16 [rows,cols] matrix into rowwise FP4 packed data and scales");
+    m.def("debug_quantize_fp4_colmajor_custom", [](torch::Tensor in_t) {
+        auto [packed, scales, swizzled] = quantize_fp4_colmajor_bf16(in_t);
+        CK(cudaStreamSynchronize(at::cuda::getCurrentCUDAStream()));
+        return std::make_tuple(packed, scales, swizzled);
+    }, "Debug helper: current custom ColumnMajor FP4 packer");
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+    m.def("debug_quantize_fp4_rowmajor_cutlass_host", [](torch::Tensor in_t) {
+        TORCH_CHECK(in_t.dim() == 2 && in_t.scalar_type() == torch::kBFloat16, "input must be bf16 rank-2");
+        int M = (int)in_t.size(0), K = (int)in_t.size(1);
+        CutlassFp4RowwiseGemm gemm;
+        gemm.setup(M, 128, K);
+        auto [packed, scales] = pack_cutlass_operand_host_tensors<CutlassFp4RowwiseGemm::ElementA>(
+            in_t, gemm.layout_A, gemm.layout_SFA, M, K);
+        return std::make_tuple(packed, scales);
+    }, "Debug helper: CUTLASS-native RowMajor FP4 host pack");
+    m.def("debug_quantize_fp4_colmajor_cutlass_host", [](torch::Tensor in_t) {
+        TORCH_CHECK(in_t.dim() == 2 && in_t.scalar_type() == torch::kBFloat16, "input must be bf16 rank-2");
+        int N = (int)in_t.size(0), K = (int)in_t.size(1);
+        CutlassFp4RowwiseGemm gemm;
+        gemm.setup(128, N, K);
+        auto [packed, scales] = pack_cutlass_operand_host_tensors<CutlassFp4RowwiseGemm::ElementB>(
+            in_t, gemm.layout_B, gemm.layout_SFB, N, K);
+        return std::make_tuple(packed, scales);
+    }, "Debug helper: CUTLASS-native ColumnMajor FP4 host pack");
+    m.def("debug_ffn1_ffn2_scale_layout_maps", [](int64_t seq, int64_t d, int64_t ffn) {
+        return debug_ffn1_ffn2_scale_layout_maps(seq, d, ffn);
+    }, "Debug helper: compare raw scale-slot maps for FFN1 fused SFD vs FFN2 activation SFA");
+    m.def("debug_compare_ffn1_fp4_producers",
+          [](torch::Tensor w_t, torch::Tensor act_t, torch::Tensor bias_t) {
+              return debug_compare_ffn1_fp4_producers(w_t, act_t, bias_t);
+          },
+          "Debug helper: compare fused FFN1 FP4 producer vs engine-style FP8 GEMM + SiLU->FP4 reference");
+    m.def("debug_compare_ffn1_fp4_producers_norm",
+          [](torch::Tensor w_t, torch::Tensor act_t, torch::Tensor bias_t, double norm_constant) {
+              return debug_compare_ffn1_fp4_producers_norm(w_t, act_t, bias_t, norm_constant);
+          },
+          "Debug helper: compare fused FFN1 FP4 producer vs reference with custom norm_constant");
+    m.def("debug_compare_ffn1_fp4_identity_producer",
+          [](torch::Tensor w_t, torch::Tensor act_t, torch::Tensor bias_t, double norm_constant) {
+              return debug_compare_ffn1_fp4_identity_producer(w_t, act_t, bias_t, norm_constant);
+          },
+          "Debug helper: compare identity-activation fused FFN1 FP4 producer vs raw GEMM+bias reference");
+    m.def("debug_compare_ffn1_fp4_blockscale_only",
+          [](torch::Tensor w_t, torch::Tensor act_t, double norm_constant) {
+              return debug_compare_ffn1_fp4_blockscale_only(w_t, act_t, norm_constant);
+          },
+          "Debug helper: compare blockscale-only FP4 producer vs raw GEMM reference");
+    m.def("debug_compare_ffn1_fp4_blockscale_only_e8m0",
+          [](torch::Tensor w_t, torch::Tensor act_t, double norm_constant) {
+              return debug_compare_ffn1_fp4_blockscale_only_e8m0(w_t, act_t, norm_constant);
+          },
+          "Debug helper: compare blockscale-only FP4 producer with UE8M0 scales vs raw GEMM reference");
+#endif
+    m.def("run_fp4_gemm_packed",
+          [](torch::Tensor w_packed, torch::Tensor w_swizzled,
+             torch::Tensor act_packed, torch::Tensor act_swizzled,
+             int64_t M, int64_t N, int64_t K) {
+              auto out = run_fp4_gemm_rowwise_packed(
+                  w_packed, w_swizzled, act_packed, act_swizzled, M, N, K);
+              CK(cudaStreamSynchronize(at::cuda::getCurrentCUDAStream()));
+              return out;
+          },
+          "Run standalone SM120 rowwise FP4 GEMM on pre-quantized packed operands");
     m.def("run_gdn_recurrent", [](torch::Tensor q_t, torch::Tensor k_t, torch::Tensor v_t,
                                    torch::Tensor g_t, torch::Tensor beta_t, double scale) {
         TORCH_CHECK(g_ready, "engine not initialized");
