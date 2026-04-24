@@ -14,8 +14,11 @@ import time
 import types
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
 
 _ext = None
+_native_train_ops = None
 
 
 def get_ext():
@@ -139,6 +142,40 @@ def get_ext():
             os.environ["TORCH_CUDA_ARCH_LIST"] = prev_arch_list
     print(f"  Compiled in {time.time()-t0:.1f}s")
     return _ext
+
+
+def _get_native_train_ops():
+    global _native_train_ops
+    if _native_train_ops is None:
+        from kairos_ext.engine_autograd import (
+            gate_residual_ssts,
+            ln_adaln_ssts,
+            linear_bf16,
+            rmsnorm,
+            layernorm_affine,
+            attention_core,
+            rope_apply_core,
+            gdn_l2norm_scale,
+            gdn_causal_conv_silu,
+            gdn_compute_gates,
+            gdn_recurrent,
+            gdn_rmsnorm_silu_gate,
+        )
+        _native_train_ops = (
+            gate_residual_ssts,
+            ln_adaln_ssts,
+            linear_bf16,
+            rmsnorm,
+            layernorm_affine,
+            attention_core,
+            rope_apply_core,
+            gdn_l2norm_scale,
+            gdn_causal_conv_silu,
+            gdn_compute_gates,
+            gdn_recurrent,
+            gdn_rmsnorm_silu_gate,
+        )
+    return _native_train_ops
 
 
 # --- Sharding helpers (for TP) ------------------------------------------------
@@ -325,6 +362,435 @@ def _find_blocks(transformer):
     return None, None
 
 
+def _native_linear_rows(linear_bf16, x, linear):
+    orig_shape = x.shape
+    x2 = x.reshape(-1, orig_shape[-1]).contiguous()
+    y2 = linear_bf16(x2, linear.weight, linear.bias)
+    return y2.reshape(*orig_shape[:-1], y2.shape[-1])
+
+
+def _native_text_embedding(self, context, linear_bf16):
+    context = _native_linear_rows(linear_bf16, context, self.text_embedding[0])
+    context = torch.nn.functional.silu(context)
+    context = _native_linear_rows(linear_bf16, context, self.text_embedding[2])
+    return context
+
+
+def _native_time_embedding(self, t, linear_bf16):
+    t = _native_linear_rows(linear_bf16, t, self.time_embedding[0])
+    t = torch.nn.functional.silu(t)
+    t = _native_linear_rows(linear_bf16, t, self.time_embedding[2])
+    return t
+
+
+def _native_time_projection(self, t, linear_bf16):
+    t = torch.nn.functional.silu(t)
+    return _native_linear_rows(linear_bf16, t, self.time_projection[1])
+
+
+def _native_head_forward(self, x, t_mod, linear_bf16):
+    head = self.head
+    x_norm = torch.nn.functional.layer_norm(
+        x.float(),
+        (head.dim,),
+        weight=None,
+        bias=None,
+        eps=head.norm.eps,
+    ).to(x.dtype)
+    if len(t_mod.shape) == 3:
+        shift, scale = (
+            head.modulation.unsqueeze(0).to(dtype=t_mod.dtype, device=t_mod.device) + t_mod.unsqueeze(2)
+        ).chunk(2, dim=2)
+        x_mod = x_norm * (1 + scale.squeeze(2)) + shift.squeeze(2)
+    else:
+        shift, scale = (head.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(2, dim=1)
+        x_mod = x_norm * (1 + scale) + shift
+    out = _native_linear_rows(linear_bf16, x_mod, head.head)
+    return out
+
+
+def _native_cross_attn_forward(block, x, context, context_mask, linear_bf16, rmsnorm, layernorm_affine, attention_core):
+    ca = block.cross_attn
+    x_rows = x.squeeze(0).contiguous()
+    norm = block.cross_attn_norm
+    ca_in = layernorm_affine(x_rows, norm.weight, norm.bias, norm.eps)
+    q = rmsnorm(
+        linear_bf16(ca_in, ca.q.weight, ca.q.bias),
+        ca.norm_q.weight,
+        ca.norm_q.eps,
+    ).unsqueeze(0)
+    ctx_rows = context.squeeze(0).contiguous()
+    k = rmsnorm(
+        linear_bf16(ctx_rows, ca.k.weight, ca.k.bias),
+        ca.norm_k.weight,
+        ca.norm_k.eps,
+    ).unsqueeze(0)
+    v = linear_bf16(ctx_rows, ca.v.weight, ca.v.bias).unsqueeze(0)
+    qh = rearrange(q, "b s (n d) -> b s n d", n=ca.num_heads)
+    kh = rearrange(k, "b s (n d) -> b s n d", n=ca.num_heads)
+    vh = rearrange(v, "b s (n d) -> b s n d", n=ca.num_heads)
+    attn_mask_local = context_mask
+    if attn_mask_local is not None:
+        B, Lq, S = q.shape[0], q.shape[1], k.shape[1]
+        attn_mask_local = attn_mask_local.view(B, 1, 1, S).expand(B, 1, Lq, S)
+    attn_out = attention_core(
+        qh,
+        kh,
+        vh,
+        num_heads=ca.num_heads,
+        attn_mask=attn_mask_local,
+    )
+    attn_out = rearrange(attn_out, "b s n d -> b s (n d)", n=ca.num_heads)
+    return linear_bf16(attn_out.squeeze(0).contiguous(), ca.o.weight, ca.o.bias).unsqueeze(0)
+
+
+def _native_self_attn_forward(sa, input_x_local, freqs, L, linear_bf16, rmsnorm, attention_core, rope_apply_core):
+    q = linear_bf16(input_x_local, sa.q.weight, sa.q.bias).unsqueeze(0)
+    k = linear_bf16(input_x_local, sa.k.weight, sa.k.bias).unsqueeze(0)
+    v = linear_bf16(input_x_local, sa.v.weight, sa.v.bias).unsqueeze(0)
+    q = rmsnorm(q.squeeze(0), sa.norm_q.weight, sa.norm_q.eps).unsqueeze(0)
+    k = rmsnorm(k.squeeze(0), sa.norm_k.weight, sa.norm_k.eps).unsqueeze(0)
+    q = rope_apply_core(q, freqs, sa.num_heads)
+    k = rope_apply_core(k, freqs, sa.num_heads)
+    dilated_length = sa.dilated_length
+    use_dilated = dilated_length > 1 and q.shape[1] // (dilated_length * L) > 1
+    pad_len = 0
+    if use_dilated:
+        assert q.shape[1] % L == 0, "L should equal to the num of tokens per frame"
+        pad_len = dilated_length * L - q.shape[1] % (dilated_length * L)
+        if pad_len != 0:
+            q = F.pad(q, (0, 0, 0, pad_len))
+            k = F.pad(k, (0, 0, 0, pad_len))
+            v = F.pad(v, (0, 0, 0, pad_len))
+        q = rearrange(q, "b (n d l) c -> (b d) (n l) c", l=L, d=dilated_length)
+        k = rearrange(k, "b (n d l) c -> (b d) (n l) c", l=L, d=dilated_length)
+        v = rearrange(v, "b (n d l) c -> (b d) (n l) c", l=L, d=dilated_length)
+    qh = rearrange(q, "b s (n d) -> b s n d", n=sa.num_heads)
+    kh = rearrange(k, "b s (n d) -> b s n d", n=sa.num_heads)
+    vh = rearrange(v, "b s (n d) -> b s n d", n=sa.num_heads)
+    attn_core = attention_core(
+        qh,
+        kh,
+        vh,
+        num_heads=sa.num_heads,
+        window_size=(L * sa.window_size, L * sa.window_size),
+    )
+    attn_core = rearrange(attn_core, "b s n d -> b s (n d)", n=sa.num_heads)
+    if use_dilated:
+        attn_core = rearrange(attn_core, "(b d) (n l) c -> b (n d l) c", l=L, d=dilated_length)
+        if pad_len != 0:
+            attn_core = attn_core[:, :-pad_len]
+    return linear_bf16(attn_core.squeeze(0).contiguous(), sa.o.weight, sa.o.bias).unsqueeze(0)
+
+
+def _can_use_native_quadratic_slices(block, x, t_mod):
+    if block.use_linear_attn:
+        return False
+    if x.dtype != torch.bfloat16:
+        return False
+    if x.dim() != 3 or x.shape[0] != 1:
+        return False
+    if getattr(block, "world", 1) != 1:
+        return False
+    if getattr(block, "use_seq_parallel", False):
+        return False
+    if getattr(block.self_attn, "attend_k0", False):
+        return False
+    if getattr(block.cross_attn, "has_image_input", False):
+        return False
+    if t_mod.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return False
+    return True
+
+
+def _can_use_native_gdn_slices(block, x, t_mod):
+    if not block.use_linear_attn:
+        return False
+    if x.dtype != torch.bfloat16:
+        return False
+    if x.dim() != 3 or x.shape[0] != 1:
+        return False
+    if getattr(block, "world", 1) != 1:
+        return False
+    if getattr(block, "use_seq_parallel", False):
+        return False
+    if t_mod.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return False
+    return True
+
+
+def _run_quadratic_block_native_slices(block, x, context, t_mod, freqs, grid_size, context_mask=None):
+    gate_residual_ssts, ln_adaln_ssts, linear_bf16, rmsnorm, layernorm_affine, attention_core, rope_apply_core, *_ = _get_native_train_ops()
+
+    (f, h, w) = grid_size
+    B, _, D = x.shape
+    if B != 1:
+        raise RuntimeError(f"native quadratic slices currently require batch size 1, got {B}")
+    L = h * w
+    has_seq = len(t_mod.shape) == 4
+    chunk_dim = 2 if has_seq else 1
+
+    mod_dtype = block.modulation.to(dtype=t_mod.dtype, device=t_mod.device)
+    t_mod_chunks = t_mod.chunk(6, dim=chunk_dim)
+    mod_chunks = mod_dtype.chunk(6, dim=1)
+
+    def get_mod_parts(idx, start=None, end=None):
+        t_c = t_mod_chunks[idx]
+        m_c = mod_chunks[idx]
+        if has_seq:
+            t_c = t_c.squeeze(2)
+            m_c = m_c.squeeze(1)
+            if start is not None:
+                t_c = t_c[:, start:end, :]
+        return t_c, m_c
+
+    def as_rows(t_chunk):
+        rows = t_chunk.squeeze(0)
+        if rows.dim() == 1:
+            rows = rows.unsqueeze(0)
+        return rows.float().contiguous()
+
+    def as_ssts(mod_chunk):
+        flat = mod_chunk.reshape(-1, mod_chunk.shape[-1])
+        return flat[0].float().contiguous()
+
+    x_rows = x.squeeze(0).contiguous()
+
+    t_scale_msa, m_scale_msa = get_mod_parts(0)
+    t_shift_msa, m_shift_msa = get_mod_parts(1)
+    gate_t_msa, gate_m_msa = get_mod_parts(2)
+
+    input_x_local = ln_adaln_ssts(
+        x_rows,
+        as_ssts(m_scale_msa),
+        as_ssts(m_shift_msa),
+        as_rows(t_scale_msa),
+        as_rows(t_shift_msa),
+    )
+
+    sa = block.self_attn
+    attn_out = _native_self_attn_forward(sa, input_x_local, freqs, L, linear_bf16, rmsnorm, attention_core, rope_apply_core)
+    x = gate_residual_ssts(
+        x_rows,
+        attn_out.squeeze(0).contiguous(),
+        as_ssts(gate_m_msa),
+        as_rows(gate_t_msa),
+    ).unsqueeze(0)
+
+    attn_out = _native_cross_attn_forward(
+        block,
+        x,
+        context,
+        context_mask,
+        linear_bf16,
+        rmsnorm,
+        layernorm_affine,
+        attention_core,
+    )
+    x = x + attn_out
+
+    chunk_size = 2310
+    out = torch.empty_like(x)
+    for start in range(0, x.shape[1], chunk_size):
+        end = min(start + chunk_size, x.shape[1])
+        x_chunk = x[:, start:end, :]
+        x_chunk_rows = x_chunk.squeeze(0).contiguous()
+
+        t_scale_ffn, m_scale_ffn = get_mod_parts(3, start, end)
+        t_shift_ffn, m_shift_ffn = get_mod_parts(4, start, end)
+        t_gate_ffn, m_gate_ffn = get_mod_parts(5, start, end)
+
+        inp_chunk = ln_adaln_ssts(
+            x_chunk_rows,
+            as_ssts(m_scale_ffn),
+            as_ssts(m_shift_ffn),
+            as_rows(t_scale_ffn),
+            as_rows(t_shift_ffn),
+        )
+        ffn_mid = linear_bf16(inp_chunk, block.ffn[0].weight, block.ffn[0].bias)
+        ffn_mid = torch.nn.functional.silu(ffn_mid)
+        ffn_out = linear_bf16(ffn_mid, block.ffn[2].weight, block.ffn[2].bias).unsqueeze(0)
+        out[:, start:end, :] = gate_residual_ssts(
+            x_chunk_rows,
+            ffn_out.squeeze(0).contiguous(),
+            as_ssts(m_gate_ffn),
+            as_rows(t_gate_ffn),
+        ).unsqueeze(0)
+
+    return out
+
+
+def _run_gdn_block_native_slices(block, x, context, t_mod, freqs, grid_size, context_mask=None):
+    (
+        gate_residual_ssts,
+        ln_adaln_ssts,
+        linear_bf16,
+        rmsnorm,
+        layernorm_affine,
+        attention_core,
+        _rope_apply_core,
+        gdn_l2norm_scale,
+        gdn_causal_conv_silu,
+        gdn_compute_gates,
+        gdn_recurrent,
+        gdn_rmsnorm_silu_gate,
+    ) = _get_native_train_ops()
+
+    del freqs
+    (f, h, w) = grid_size
+    B, _, D = x.shape
+    if B != 1:
+        raise RuntimeError(f"native GDN slices currently require batch size 1, got {B}")
+    L = h * w
+    has_seq = len(t_mod.shape) == 4
+    chunk_dim = 2 if has_seq else 1
+
+    mod_dtype = block.modulation.to(dtype=t_mod.dtype, device=t_mod.device)
+    t_mod_chunks = t_mod.chunk(6, dim=chunk_dim)
+    mod_chunks = mod_dtype.chunk(6, dim=1)
+
+    def get_mod_parts(idx, start=None, end=None):
+        t_c = t_mod_chunks[idx]
+        m_c = mod_chunks[idx]
+        if has_seq:
+            t_c = t_c.squeeze(2)
+            m_c = m_c.squeeze(1)
+            if start is not None:
+                t_c = t_c[:, start:end, :]
+        return t_c, m_c
+
+    def as_rows(t_chunk):
+        rows = t_chunk.squeeze(0)
+        if rows.dim() == 1:
+            rows = rows.unsqueeze(0)
+        return rows.float().contiguous()
+
+    def as_ssts(mod_chunk):
+        flat = mod_chunk.reshape(-1, mod_chunk.shape[-1])
+        return flat[0].float().contiguous()
+
+    x_rows = x.squeeze(0).contiguous()
+
+    t_scale_msa, m_scale_msa = get_mod_parts(0)
+    t_shift_msa, m_shift_msa = get_mod_parts(1)
+    gate_t_msa, gate_m_msa = get_mod_parts(2)
+
+    input_x_local = ln_adaln_ssts(
+        x_rows,
+        as_ssts(m_scale_msa),
+        as_ssts(m_shift_msa),
+        as_rows(t_scale_msa),
+        as_rows(t_shift_msa),
+    )
+    hidden_states = input_x_local.unsqueeze(0)
+    hidden_rows = input_x_local
+
+    gdn = block.gated_delta
+    seq_len = hidden_states.shape[1]
+
+    q_proj = linear_bf16(hidden_rows, gdn.q_proj.weight, gdn.q_proj.bias).contiguous()
+    k_proj = linear_bf16(hidden_rows, gdn.k_proj.weight, gdn.k_proj.bias).contiguous()
+    v_proj = linear_bf16(hidden_rows, gdn.v_proj.weight, gdn.v_proj.bias).contiguous()
+    q_conv = gdn_causal_conv_silu(q_proj, gdn.q_conv1d.weight.float().squeeze(1).contiguous())
+    k_conv = gdn_causal_conv_silu(k_proj, gdn.k_conv1d.weight.float().squeeze(1).contiguous())
+    v_conv = gdn_causal_conv_silu(v_proj, gdn.v_conv1d.weight.float().squeeze(1).contiguous())
+
+    q_heads = q_conv.view(seq_len, gdn.num_heads, gdn.head_k_dim).contiguous()
+    k_heads = k_conv.view(seq_len, gdn.num_heads, gdn.head_k_dim).contiguous()
+    v_heads = v_conv.view(seq_len, gdn.num_v_heads, gdn.head_v_dim).contiguous()
+
+    if gdn.num_v_heads > gdn.num_heads:
+        repeat_factor = gdn.num_v_heads // gdn.num_heads
+        q_heads = q_heads.repeat_interleave(repeat_factor, dim=1)
+        k_heads = k_heads.repeat_interleave(repeat_factor, dim=1)
+
+    beta_in = linear_bf16(hidden_rows, gdn.b_proj.weight, gdn.b_proj.bias).contiguous()
+    a_in = linear_bf16(hidden_rows, gdn.a_proj.weight, gdn.a_proj.bias).contiguous()
+    g_vals, beta_vals = gdn_compute_gates(
+        a_in,
+        beta_in,
+        gdn.A_log.float().contiguous(),
+        gdn.dt_bias.float().contiguous(),
+    )
+    if gdn.allow_neg_eigval:
+        beta_vals = beta_vals * 2.0
+
+    q_norm, k_norm = gdn_l2norm_scale(q_heads, k_heads, gdn.head_k_dim ** -0.5)
+    recurrent_out, _ = gdn_recurrent(
+        q_norm,
+        k_norm,
+        v_heads,
+        g_vals,
+        beta_vals,
+        scale=gdn.head_k_dim ** -0.5,
+    )
+
+    if gdn.use_gate:
+        gate_vals = linear_bf16(hidden_rows, gdn.g_proj.weight, gdn.g_proj.bias).view(seq_len, gdn.num_v_heads, gdn.head_v_dim).contiguous()
+        attn_out = gdn_rmsnorm_silu_gate(
+            recurrent_out.contiguous(),
+            gate_vals,
+            gdn.o_norm.weight,
+            eps=gdn.o_norm.eps,
+        ).unsqueeze(0)
+    else:
+        attn_out = rmsnorm(
+            recurrent_out.reshape(-1, gdn.head_v_dim).contiguous(),
+            gdn.o_norm.weight,
+            gdn.o_norm.eps,
+        ).reshape(seq_len, gdn.num_v_heads, gdn.head_v_dim).unsqueeze(0)
+    attn_out = linear_bf16(attn_out.reshape(seq_len, -1).contiguous(), gdn.o_proj.weight, gdn.o_proj.bias).unsqueeze(0)
+
+    x = gate_residual_ssts(
+        x_rows,
+        attn_out.squeeze(0).contiguous(),
+        as_ssts(gate_m_msa),
+        as_rows(gate_t_msa),
+    ).unsqueeze(0)
+
+    attn_out = _native_cross_attn_forward(
+        block,
+        x,
+        context,
+        context_mask,
+        linear_bf16,
+        rmsnorm,
+        layernorm_affine,
+        attention_core,
+    )
+    x = x + attn_out
+
+    chunk_size = 2310
+    out = torch.empty_like(x)
+    for start in range(0, x.shape[1], chunk_size):
+        end = min(start + chunk_size, x.shape[1])
+        x_chunk = x[:, start:end, :]
+        x_chunk_rows = x_chunk.squeeze(0).contiguous()
+
+        t_scale_ffn, m_scale_ffn = get_mod_parts(3, start, end)
+        t_shift_ffn, m_shift_ffn = get_mod_parts(4, start, end)
+        t_gate_ffn, m_gate_ffn = get_mod_parts(5, start, end)
+
+        inp_chunk = ln_adaln_ssts(
+            x_chunk_rows,
+            as_ssts(m_scale_ffn),
+            as_ssts(m_shift_ffn),
+            as_rows(t_scale_ffn),
+            as_rows(t_shift_ffn),
+        )
+        ffn_mid = linear_bf16(inp_chunk, block.ffn[0].weight, block.ffn[0].bias)
+        ffn_mid = torch.nn.functional.silu(ffn_mid)
+        ffn_out = linear_bf16(ffn_mid, block.ffn[2].weight, block.ffn[2].bias).unsqueeze(0)
+        out[:, start:end, :] = gate_residual_ssts(
+            x_chunk_rows,
+            ffn_out.squeeze(0).contiguous(),
+            as_ssts(m_gate_ffn),
+            as_rows(t_gate_ffn),
+        ).unsqueeze(0)
+
+    return out
+
+
 def _kairos_rope_to_helios(freqs_complex, hd):
     """Convert Kairos 3D complex RoPE to Helios [seq, 2*hd] float layout.
 
@@ -346,7 +812,7 @@ def _kairos_rope_to_helios(freqs_complex, hd):
 
 # --- Main patch entry point ---------------------------------------------------
 def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
-                 tp_rank=0, tp_world=1):
+                 tp_rank=0, tp_world=1, enable_training_bridge=None):
     """
     Install the Kairos engine into `transformer`, replacing its `.blocks`
     ModuleList with Runner stubs.
@@ -361,6 +827,7 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
 
     blocks, block_name = _find_blocks(transformer)
     assert blocks, "No Kairos blocks found on transformer"
+    orig_blocks = tuple(blocks)
 
     # Find a quadratic block to determine dimensions
     first_quad = None
@@ -469,82 +936,88 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
                 cq_b, ck_b, cv_b, co_b, f1_b, f2_b,
                 ca_rms_q, ca_rms_k, n2w, n2b, sst)
 
-    # Load weights for ALL layers
-    for i, b in enumerate(blocks):
-        if _is_gdn_layer(i):
-            # GDN layer: load CA/FFN via ext.load() with dummy SA weights,
-            # then load GDN-specific weights via ext.load_gdn()
-            ga = _get_gdn_block_attrs(b)
-            (cq_w, ck_w, cv_w, co_w, f1_w, f2_w,
-             cq_b, ck_b, cv_b, co_b, f1_b, f2_b,
-             ca_rms_q, ca_rms_k, n2w, n2b, sst) = _load_ca_ffn_weights(i, ga)
-            # Load with dummy SA weights (engine uses GDN path for these layers)
-            z_w = torch.zeros(dim // tp_world, dim, device=dev, dtype=bf16)
-            z_b = zb(dim // tp_world)
-            z_rms = torch.ones(dim // tp_world, device=dev, dtype=f32)
-            z_so_b = zb(dim)
-            ext.load(i,
-                     z_w, z_w, z_w, z_w[:, :dim // tp_world],  # dummy SA
-                     cq_w, ck_w, cv_w, co_w,
-                     f1_w, f2_w,
-                     z_b, z_b, z_b, z_so_b,  # dummy SA biases
-                     cq_b, ck_b, cv_b, co_b,
-                     f1_b, f2_b,
-                     z_rms, z_rms, ca_rms_q, ca_rms_k,
-                     n2w, n2b, sst)
-            # Load GDN-specific weights
-            gdn_q_w = sc(ga["gdn_q_w"].contiguous())
-            gdn_k_w = sc(ga["gdn_k_w"].contiguous())
-            gdn_v_w = sc(ga["gdn_v_w"].contiguous())
-            gdn_g_w = sc(ga["gdn_g_w"].contiguous())
-            gdn_o_w = sr(ga["gdn_o_w"].contiguous())
-            # a/b projections: replicated (small, NH outputs)
-            gdn_a_w = ga["gdn_a_w"].contiguous()
-            gdn_b_w = ga["gdn_b_w"].contiguous()
-            ext.load_gdn(i,
-                         gdn_q_w, gdn_k_w, gdn_v_w,
-                         gdn_a_w, gdn_b_w, gdn_g_w, gdn_o_w,
-                         full_bias(ga["gdn_q_b"], gdn_key_dim // tp_world),
-                         full_bias(ga["gdn_k_b"], gdn_key_dim // tp_world),
-                         full_bias(ga["gdn_v_b"], gdn_value_dim // tp_world),
-                         full_bias(ga["gdn_a_b"], nh),
-                         full_bias(ga["gdn_b_b"], nh),
-                         full_bias(ga["gdn_g_b"], gdn_value_dim // tp_world),
-                         (full_bias(ga["gdn_o_b"], dim).float() * inv_w).to(bf16).contiguous(),
-                         ga["conv_q_w"], ga["conv_k_w"], ga["conv_v_w"],
-                         ga["A_log"], ga["dt_bias"], ga["o_norm_w"])
-        else:
-            # Quadratic layer
-            a = _get_block_attrs(b)
-            sq_w = sc(a["sq_w"].contiguous())
-            sk_w = sc(a["sk_w"].contiguous())
-            sv_w = sc(a["sv_w"].contiguous())
-            so_w = sr(a["so_w"].contiguous())
-            sq_b = sb(full_bias(a["sq_b"], dim))
-            sk_b = sb(full_bias(a["sk_b"], dim))
-            sv_b = sb(full_bias(a["sv_b"], dim))
-            so_b = (full_bias(a["so_b"], dim).float() * inv_w).to(bf16).contiguous()
-            rms_q = sb(a["rms_q"].float().contiguous())
-            rms_k = sb(a["rms_k"].float().contiguous())
-            (cq_w, ck_w, cv_w, co_w, f1_w, f2_w,
-             cq_b, ck_b, cv_b, co_b, f1_b, f2_b,
-             ca_rms_q, ca_rms_k, n2w, n2b, sst) = _load_ca_ffn_weights(i, a)
-            ext.load(i,
-                     sq_w, sk_w, sv_w, so_w,
-                     cq_w, ck_w, cv_w, co_w,
-                     f1_w, f2_w,
-                     sq_b, sk_b, sv_b, so_b,
-                     cq_b, ck_b, cv_b, co_b,
-                     f1_b, f2_b,
-                     rms_q, rms_k, ca_rms_q, ca_rms_k,
-                     n2w, n2b, sst)
+    ssts_stacked = None
 
-    # Stack modulation tables for the engine (all layers)
-    ssts_list = []
-    for i, b in enumerate(blocks):
-        sst_data = b.modulation.data.float().squeeze(0)
-        ssts_list.append(sst_data)
-    ssts_stacked = torch.stack(ssts_list).contiguous()
+    def _sync_engine_weights(force=False):
+        nonlocal ssts_stacked
+        current_versions = tuple(int(p._version) for b in orig_blocks for p in b.parameters())
+        if (not force) and current_versions == getattr(transformer, "_kairos_engine_block_versions", None):
+            return False
+
+        for i, b in enumerate(orig_blocks):
+            if _is_gdn_layer(i):
+                # GDN layer: load CA/FFN via ext.load() with dummy SA weights,
+                # then load GDN-specific weights via ext.load_gdn()
+                ga = _get_gdn_block_attrs(b)
+                (cq_w, ck_w, cv_w, co_w, f1_w, f2_w,
+                 cq_b, ck_b, cv_b, co_b, f1_b, f2_b,
+                 ca_rms_q, ca_rms_k, n2w, n2b, sst) = _load_ca_ffn_weights(i, ga)
+                z_w = torch.zeros(dim // tp_world, dim, device=dev, dtype=bf16)
+                z_b = zb(dim // tp_world)
+                z_rms = torch.ones(dim // tp_world, device=dev, dtype=f32)
+                z_so_b = zb(dim)
+                ext.load(i,
+                         z_w, z_w, z_w, z_w[:, :dim // tp_world],
+                         cq_w, ck_w, cv_w, co_w,
+                         f1_w, f2_w,
+                         z_b, z_b, z_b, z_so_b,
+                         cq_b, ck_b, cv_b, co_b,
+                         f1_b, f2_b,
+                         z_rms, z_rms, ca_rms_q, ca_rms_k,
+                         n2w, n2b, sst)
+                gdn_q_w = sc(ga["gdn_q_w"].contiguous())
+                gdn_k_w = sc(ga["gdn_k_w"].contiguous())
+                gdn_v_w = sc(ga["gdn_v_w"].contiguous())
+                gdn_g_w = sc(ga["gdn_g_w"].contiguous())
+                gdn_o_w = sr(ga["gdn_o_w"].contiguous())
+                gdn_a_w = ga["gdn_a_w"].contiguous()
+                gdn_b_w = ga["gdn_b_w"].contiguous()
+                ext.load_gdn(i,
+                             gdn_q_w, gdn_k_w, gdn_v_w,
+                             gdn_a_w, gdn_b_w, gdn_g_w, gdn_o_w,
+                             full_bias(ga["gdn_q_b"], gdn_key_dim // tp_world),
+                             full_bias(ga["gdn_k_b"], gdn_key_dim // tp_world),
+                             full_bias(ga["gdn_v_b"], gdn_value_dim // tp_world),
+                             full_bias(ga["gdn_a_b"], nh),
+                             full_bias(ga["gdn_b_b"], nh),
+                             full_bias(ga["gdn_g_b"], gdn_value_dim // tp_world),
+                             (full_bias(ga["gdn_o_b"], dim).float() * inv_w).to(bf16).contiguous(),
+                             ga["conv_q_w"], ga["conv_k_w"], ga["conv_v_w"],
+                             ga["A_log"], ga["dt_bias"], ga["o_norm_w"])
+            else:
+                a = _get_block_attrs(b)
+                sq_w = sc(a["sq_w"].contiguous())
+                sk_w = sc(a["sk_w"].contiguous())
+                sv_w = sc(a["sv_w"].contiguous())
+                so_w = sr(a["so_w"].contiguous())
+                sq_b = sb(full_bias(a["sq_b"], dim))
+                sk_b = sb(full_bias(a["sk_b"], dim))
+                sv_b = sb(full_bias(a["sv_b"], dim))
+                so_b = (full_bias(a["so_b"], dim).float() * inv_w).to(bf16).contiguous()
+                rms_q = sb(a["rms_q"].float().contiguous())
+                rms_k = sb(a["rms_k"].float().contiguous())
+                (cq_w, ck_w, cv_w, co_w, f1_w, f2_w,
+                 cq_b, ck_b, cv_b, co_b, f1_b, f2_b,
+                 ca_rms_q, ca_rms_k, n2w, n2b, sst) = _load_ca_ffn_weights(i, a)
+                ext.load(i,
+                         sq_w, sk_w, sv_w, so_w,
+                         cq_w, ck_w, cv_w, co_w,
+                         f1_w, f2_w,
+                         sq_b, sk_b, sv_b, so_b,
+                         cq_b, ck_b, cv_b, co_b,
+                         f1_b, f2_b,
+                         rms_q, rms_k, ca_rms_q, ca_rms_k,
+                         n2w, n2b, sst)
+
+        ssts_list = []
+        for b in orig_blocks:
+            sst_data = b.modulation.data.float().squeeze(0)
+            ssts_list.append(sst_data)
+        ssts_stacked = torch.stack(ssts_list).contiguous()
+        transformer._kairos_engine_block_versions = current_versions
+        return True
+
+    _sync_engine_weights(force=True)
 
     _prepared_ca_lens = set()
     _rope_cache: dict = {}
@@ -573,7 +1046,7 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
             sample_bytes = b""
         else:
             sample_idx = _get_context_sample_idx(flat.numel(), flat.device)
-            sample = flat.index_select(0, sample_idx).to(dtype=torch.float32)
+            sample = flat.index_select(0, sample_idx).detach().to(dtype=torch.float32)
             sample_bytes = sample.cpu().numpy().tobytes()
         return (
             tuple(enci.shape),
@@ -659,6 +1132,236 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
         xi = ext.forward(xi, enci, ei, ssts_stacked, rope, ca_len, 0, nl)
         return xi.unsqueeze(0) if x.dim() == 3 else xi
 
+    def _prepare_forward_inputs(
+            self,
+            x,
+            timestep,
+            context,
+            context_mask=None,
+            clip_feature=None,
+            y=None,
+            first_frame_latents=None,
+        ):
+            native_training_slices = os.environ.get(
+                "KAIROS_ENGINE_NATIVE_TRAINING_SLICES", "1"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            native_ops = _get_native_train_ops() if (native_training_slices and self.training and x.dtype == torch.bfloat16) else None
+            linear_bf16 = native_ops[2] if native_ops is not None else None
+
+            t_in = sinusoidal_embedding_1d(self.freq_dim, timestep)
+            if linear_bf16 is not None:
+                t = _native_time_embedding(self, t_in, linear_bf16)
+                t_mod = _native_time_projection(self, t, linear_bf16).unflatten(1, (6, self.dim))
+                context = _native_text_embedding(self, context, linear_bf16)
+            else:
+                t = self.time_embedding(t_in)
+                t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
+                context = self.text_embedding(context)
+
+            if first_frame_latents is not None and self.use_first_frame_cond:
+                first_frame_latents = first_frame_latents.to(context.device)
+                img_context = self.image_downsample(first_frame_latents.squeeze(2))
+                _, _, fh, fw = img_context.shape
+                img_context = img_context.flatten(2).transpose(-2, -1)
+                img_context = self.image_embedding(img_context)
+                img_context = self.image_pos_embed(img_context, h=fh, w=fw)
+                context = torch.cat([img_context, context], dim=1)
+                if context_mask is not None:
+                    context_mask = torch.cat([
+                        torch.ones(
+                            context.shape[0], img_context.shape[1],
+                            dtype=context_mask.dtype, device=context_mask.device
+                        ),
+                        context_mask
+                    ], dim=1)
+
+            if self.has_image_input:
+                x = torch.cat([x, y], dim=1)
+                clip_embdding = self.img_emb(clip_feature)
+                context = torch.cat([clip_embdding, context], dim=1)
+
+            x, (f, h, w) = self.patchify(x)
+            if x.dim() == 5:
+                x = x.flatten(2).transpose(-2, -1).contiguous()
+            grid_size = (f, h, w)
+            freqs = torch.cat([
+                self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+            return x, context, t, t_mod, freqs, grid_size, context_mask, (f, h, w)
+
+    def _run_orig_blocks(
+        self,
+        x,
+        context,
+        t_mod,
+        freqs,
+        grid_size,
+        context_mask=None,
+        use_gradient_checkpointing=False,
+        use_gradient_checkpointing_offload=False,
+    ):
+        native_training_slices = os.environ.get(
+            "KAIROS_ENGINE_NATIVE_TRAINING_SLICES", "1"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+        def create_custom_forward(module):
+            def custom_forward(*inputs, **kwargs):
+                block_x, block_context, block_t_mod, block_freqs, block_grid_size = inputs
+                block_context_mask = kwargs.get("context_mask")
+                if (
+                    native_training_slices
+                    and self.training
+                    and _can_use_native_quadratic_slices(module, block_x, block_t_mod)
+                ):
+                    return _run_quadratic_block_native_slices(
+                        module,
+                        block_x,
+                        block_context,
+                        block_t_mod,
+                        block_freqs,
+                        block_grid_size,
+                        context_mask=block_context_mask,
+                    )
+                if (
+                    native_training_slices
+                    and self.training
+                    and _can_use_native_gdn_slices(module, block_x, block_t_mod)
+                ):
+                    return _run_gdn_block_native_slices(
+                        module,
+                        block_x,
+                        block_context,
+                        block_t_mod,
+                        block_freqs,
+                        block_grid_size,
+                        context_mask=block_context_mask,
+                    )
+                return module(*inputs, **kwargs)
+            return custom_forward
+
+        for block in orig_blocks:
+            block.train(self.training)
+            if self.training and use_gradient_checkpointing:
+                if use_gradient_checkpointing_offload:
+                    with torch.autograd.graph.save_on_cpu():
+                        x = torch.utils.checkpoint.checkpoint(
+                            create_custom_forward(block),
+                            x, context, t_mod, freqs, grid_size, context_mask=context_mask,
+                            use_reentrant=False,
+                        )
+                else:
+                    x = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        x, context, t_mod, freqs, grid_size, context_mask=context_mask,
+                        use_reentrant=False,
+                    )
+            else:
+                if (
+                    native_training_slices
+                    and self.training
+                    and _can_use_native_quadratic_slices(block, x, t_mod)
+                ):
+                    x = _run_quadratic_block_native_slices(
+                        block,
+                        x,
+                        context,
+                        t_mod,
+                        freqs,
+                        grid_size,
+                        context_mask=context_mask,
+                    )
+                elif (
+                    native_training_slices
+                    and self.training
+                    and _can_use_native_gdn_slices(block, x, t_mod)
+                ):
+                    x = _run_gdn_block_native_slices(
+                        block,
+                        x,
+                        context,
+                        t_mod,
+                        freqs,
+                        grid_size,
+                        context_mask=context_mask,
+                    )
+                else:
+                    x = block(x, context, t_mod, freqs, grid_size, context_mask=context_mask)
+        return x
+
+    def _orig_model_forward(
+            self,
+            x,
+            timestep,
+            context,
+            context_mask=None,
+            clip_feature=None,
+            y=None,
+            use_gradient_checkpointing=False,
+            use_gradient_checkpointing_offload=False,
+            first_frame_latents=None,
+        ):
+            x, context, t, t_mod, freqs, grid_size, context_mask, f_hw = _prepare_forward_inputs(
+                self,
+                x,
+                timestep,
+                context,
+                context_mask=context_mask,
+                clip_feature=clip_feature,
+                y=y,
+                first_frame_latents=first_frame_latents,
+            )
+            x = _run_orig_blocks(
+                self,
+                x,
+                context,
+                t_mod,
+                freqs,
+                grid_size,
+                context_mask=context_mask,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+            )
+            native_training_slices = os.environ.get(
+                "KAIROS_ENGINE_NATIVE_TRAINING_SLICES", "1"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if native_training_slices and self.training and x.dtype == torch.bfloat16:
+                linear_bf16 = _get_native_train_ops()[2]
+                x = _native_head_forward(self, x, t, linear_bf16)
+            else:
+                x = self.head(x, t)
+            x = self.unpatchify(x, f_hw)
+            return x
+
+    def _engine_inference_forward(
+        self,
+        x,
+        timestep,
+        context,
+        context_mask=None,
+        clip_feature=None,
+        y=None,
+        first_frame_latents=None,
+    ):
+        _sync_engine_weights(force=False)
+        x, context, t, t_mod, freqs, grid_size, context_mask, f_hw = _prepare_forward_inputs(
+            self,
+            x,
+            timestep,
+            context,
+            context_mask=context_mask,
+            clip_feature=clip_feature,
+            y=y,
+            first_frame_latents=first_frame_latents,
+        )
+        x = _run_engine_blocks(
+            x, context, t_mod, freqs, grid_size, context_mask=context_mask
+        )
+        x = self.head(x, t)
+        x = self.unpatchify(x, f_hw)
+        return x
+
     class Runner(nn.Module):
         """Block-level stub. Block 0 runs all layers through the engine.
         Blocks 1..N-2 are no-ops. Block N-1 returns the cached result.
@@ -693,9 +1396,227 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
     first._engine_forward_calls = 0
     setattr(transformer, block_name, nn.ModuleList(runners))
     transformer._kairos_engine_run_blocks = _run_engine_blocks
+    transformer._kairos_engine_orig_blocks = nn.ModuleList(orig_blocks)
 
     if not hasattr(transformer, "_kairos_engine_orig_forward"):
         transformer._kairos_engine_orig_forward = transformer.forward
+
+    if enable_training_bridge is None:
+        enable_training_bridge = os.environ.get(
+            "KAIROS_ENGINE_ENABLE_BACKWARD_BRIDGE", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+    backward_checkpoint = os.environ.get(
+        "KAIROS_ENGINE_BACKWARD_CHECKPOINT", "1"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    backward_checkpoint_offload = os.environ.get(
+        "KAIROS_ENGINE_BACKWARD_CHECKPOINT_OFFLOAD", "1"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    backward_release_engine_weights = os.environ.get(
+        "KAIROS_ENGINE_BACKWARD_RELEASE_WEIGHTS", "1"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _empty_like_ref(ref, dtype=None):
+        return torch.empty(0, device=ref.device, dtype=(dtype or ref.dtype))
+
+    def _pack_bridge_inputs(x, context_mask=None, clip_feature=None, y=None, first_frame_latents=None):
+        context_mask_t = context_mask if context_mask is not None else _empty_like_ref(x, dtype=torch.uint8)
+        clip_feature_t = clip_feature if clip_feature is not None else _empty_like_ref(x)
+        y_t = y if y is not None else _empty_like_ref(x)
+        first_frame_t = first_frame_latents if first_frame_latents is not None else _empty_like_ref(x)
+        return context_mask_t, clip_feature_t, y_t, first_frame_t
+
+    def _engine_train_recompute(
+        self,
+        x,
+        timestep,
+        context,
+        context_mask=None,
+        clip_feature=None,
+        y=None,
+        first_frame_latents=None,
+    ):
+        return _orig_model_forward(
+            self,
+            x,
+            timestep,
+            context,
+            context_mask=context_mask,
+            clip_feature=clip_feature,
+            y=y,
+            use_gradient_checkpointing=backward_checkpoint,
+            use_gradient_checkpointing_offload=(
+                backward_checkpoint and backward_checkpoint_offload
+            ),
+            first_frame_latents=first_frame_latents,
+        )
+
+    class _EngineBackwardBridge(torch.autograd.Function):
+
+        @staticmethod
+        def forward(
+            ctx,
+            x,
+            timestep,
+            context,
+            context_mask_t,
+            clip_feature_t,
+            y_t,
+            first_frame_latents_t,
+            *params,
+        ):
+            ctx.params = params
+            ctx.cuda_autocast_enabled = torch.is_autocast_enabled("cuda")
+            ctx.cuda_autocast_dtype = torch.get_autocast_dtype("cuda")
+            ctx.has_context_mask = context_mask_t.numel() != 0
+            ctx.has_clip_feature = clip_feature_t.numel() != 0
+            ctx.has_y = y_t.numel() != 0
+            ctx.has_first_frame = first_frame_latents_t.numel() != 0
+            ctx.x_requires_grad = x.requires_grad
+            ctx.context_requires_grad = context.requires_grad
+            ctx.clip_feature_requires_grad = clip_feature_t.requires_grad
+            ctx.y_requires_grad = y_t.requires_grad
+            ctx.first_frame_requires_grad = first_frame_latents_t.requires_grad
+            ctx.save_for_backward(
+                x.detach(),
+                timestep.detach(),
+                context.detach(),
+                context_mask_t.detach(),
+                clip_feature_t.detach(),
+                y_t.detach(),
+                first_frame_latents_t.detach(),
+            )
+            with torch.no_grad():
+                return _engine_inference_forward(
+                    transformer,
+                    x,
+                    timestep,
+                    context,
+                    context_mask=context_mask_t if ctx.has_context_mask else None,
+                    clip_feature=clip_feature_t if ctx.has_clip_feature else None,
+                    y=y_t if ctx.has_y else None,
+                    first_frame_latents=first_frame_latents_t if ctx.has_first_frame else None,
+                )
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            (x, timestep, context, context_mask_t,
+             clip_feature_t, y_t, first_frame_latents_t) = ctx.saved_tensors
+
+            x_r = x.detach().requires_grad_(ctx.x_requires_grad)
+            context_r = context.detach().requires_grad_(ctx.context_requires_grad)
+            clip_feature_r = None
+            y_r = None
+            first_frame_r = None
+            if ctx.has_clip_feature:
+                clip_feature_r = clip_feature_t.detach().requires_grad_(ctx.clip_feature_requires_grad)
+            if ctx.has_y:
+                y_r = y_t.detach().requires_grad_(ctx.y_requires_grad)
+            if ctx.has_first_frame:
+                first_frame_r = first_frame_latents_t.detach().requires_grad_(ctx.first_frame_requires_grad)
+
+            grad_targets = []
+            grad_slots = []
+            for name, tensor in (
+                ("x", x_r),
+                ("context", context_r),
+                ("clip_feature", clip_feature_r),
+                ("y", y_r),
+                ("first_frame_latents", first_frame_r),
+            ):
+                if tensor is not None and tensor.requires_grad:
+                    grad_targets.append(tensor)
+                    grad_slots.append(name)
+
+            with torch.enable_grad(), torch.amp.autocast(
+                "cuda",
+                dtype=ctx.cuda_autocast_dtype,
+                enabled=ctx.cuda_autocast_enabled,
+            ):
+                if backward_release_engine_weights:
+                    ext.release_loaded_weights()
+                    transformer._kairos_engine_block_versions = None
+                if backward_checkpoint_offload:
+                    torch.cuda.empty_cache()
+                out = transformer._kairos_engine_train_recompute(
+                    x_r,
+                    timestep,
+                    context_r,
+                    context_mask=context_mask_t if ctx.has_context_mask else None,
+                    clip_feature=clip_feature_r,
+                    y=y_r,
+                    first_frame_latents=first_frame_r,
+                )
+                torch.autograd.backward(out, grad_output)
+
+            grad_x = None
+            grad_context = None
+            grad_clip_feature = None
+            grad_y = None
+            grad_first_frame = None
+            param_grads = [None] * len(ctx.params)
+            grad_by_slot = {
+                "x": x_r.grad if x_r.requires_grad else None,
+                "context": context_r.grad if context_r.requires_grad else None,
+                "clip_feature": clip_feature_r.grad if clip_feature_r is not None and clip_feature_r.requires_grad else None,
+                "y": y_r.grad if y_r is not None and y_r.requires_grad else None,
+                "first_frame_latents": (
+                    first_frame_r.grad
+                    if first_frame_r is not None and first_frame_r.requires_grad
+                    else None
+                ),
+            }
+            for slot in grad_slots:
+                grad = grad_by_slot[slot]
+                if slot == "x":
+                    grad_x = grad
+                elif slot == "context":
+                    grad_context = grad
+                elif slot == "clip_feature":
+                    grad_clip_feature = grad
+                elif slot == "y":
+                    grad_y = grad
+                elif slot == "first_frame_latents":
+                    grad_first_frame = grad
+
+            return (
+                grad_x,
+                None,
+                grad_context,
+                None,
+                grad_clip_feature,
+                grad_y,
+                grad_first_frame,
+                *param_grads,
+            )
+
+    def _engine_train_forward(
+        self,
+        x,
+        timestep,
+        context,
+        context_mask=None,
+        clip_feature=None,
+        y=None,
+        first_frame_latents=None,
+    ):
+        params = tuple(p for p in self.parameters() if p.requires_grad)
+        context_mask_t, clip_feature_t, y_t, first_frame_t = _pack_bridge_inputs(
+            x,
+            context_mask=context_mask,
+            clip_feature=clip_feature,
+            y=y,
+            first_frame_latents=first_frame_latents,
+        )
+        return _EngineBackwardBridge.apply(
+            x,
+            timestep,
+            context,
+            context_mask_t,
+            clip_feature_t,
+            y_t,
+            first_frame_t,
+            *params,
+        )
 
     def _engine_forward(
         self,
@@ -710,8 +1631,9 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
         first_frame_latents=None,
         **kwargs,
     ):
-        if self.training or use_gradient_checkpointing or use_gradient_checkpointing_offload:
-            return self._kairos_engine_orig_forward(
+        if kwargs:
+            return _orig_model_forward(
+                self,
                 x,
                 timestep,
                 context,
@@ -721,55 +1643,65 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                 first_frame_latents=first_frame_latents,
-                **kwargs,
             )
 
-        t = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, timestep)
+        if use_gradient_checkpointing or use_gradient_checkpointing_offload:
+            return _orig_model_forward(
+                self,
+                x,
+                timestep,
+                context,
+                context_mask=context_mask,
+                clip_feature=clip_feature,
+                y=y,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+                first_frame_latents=first_frame_latents,
+                )
+
+        if self.training:
+            if not enable_training_bridge:
+                return _orig_model_forward(
+                    self,
+                    x,
+                    timestep,
+                    context,
+                    context_mask=context_mask,
+                    clip_feature=clip_feature,
+                    y=y,
+                    use_gradient_checkpointing=False,
+                    use_gradient_checkpointing_offload=False,
+                    first_frame_latents=first_frame_latents,
+                )
+
+            return self._kairos_engine_train_forward(
+                x,
+                timestep,
+                context,
+                context_mask=context_mask,
+                clip_feature=clip_feature,
+                y=y,
+                first_frame_latents=first_frame_latents,
+            )
+
+        return _engine_inference_forward(
+            self,
+            x,
+            timestep,
+            context,
+            context_mask=context_mask,
+            clip_feature=clip_feature,
+            y=y,
+            first_frame_latents=first_frame_latents,
         )
-        t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
-        context = self.text_embedding(context)
 
-        if first_frame_latents is not None and self.use_first_frame_cond:
-            first_frame_latents = first_frame_latents.to(context.device)
-            img_context = self.image_downsample(first_frame_latents.squeeze(2))
-            _, _, fh, fw = img_context.shape
-            img_context = img_context.flatten(2).transpose(-2, -1)
-            img_context = self.image_embedding(img_context)
-            img_context = self.image_pos_embed(img_context, h=fh, w=fw)
-            context = torch.cat([img_context, context], dim=1)
-            if context_mask is not None:
-                context_mask = torch.cat([
-                    torch.ones(
-                        context.shape[0], img_context.shape[1],
-                        dtype=context_mask.dtype, device=context_mask.device
-                    ),
-                    context_mask
-                ], dim=1)
-
-        if self.has_image_input:
-            x = torch.cat([x, y], dim=1)
-            clip_embdding = self.img_emb(clip_feature)
-            context = torch.cat([clip_embdding, context], dim=1)
-
-        x, (f, h, w) = self.patchify(x)
-        grid_size = (f, h, w)
-
-        freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-
-        x = _run_engine_blocks(
-            x, context, t_mod, freqs, grid_size, context_mask=context_mask
-        )
-        x = self.head(x, t)
-        x = self.unpatchify(x, (f, h, w))
-        return x
-
+    transformer._kairos_engine_inference_forward = types.MethodType(_engine_inference_forward, transformer)
+    transformer._kairos_engine_train_recompute = types.MethodType(_engine_train_recompute, transformer)
+    transformer._kairos_engine_train_forward = types.MethodType(_engine_train_forward, transformer)
     transformer.forward = types.MethodType(_engine_forward, transformer)
 
     if verbose:
+        if enable_training_bridge:
+            print("  Training bridge: enabled (engine forward + recompute backward)")
         print(f"  Kairos engine ready in {time.time()-t0:.1f}s")
     return nl

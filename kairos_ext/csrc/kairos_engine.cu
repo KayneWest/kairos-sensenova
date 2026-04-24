@@ -431,6 +431,151 @@ __global__ void k_ln_adaln_ssts(
     }
 }
 
+// Training-friendly out-of-place AdaLN without FP8 side output.
+__global__ void k_ln_adaln_ssts_out(
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ out,
+    const float* __restrict__ ssts_scale,
+    const float* __restrict__ ssts_shift,
+    const float* __restrict__ temb_scale,
+    const float* __restrict__ temb_shift,
+    int D,
+    int temb_row_stride) {
+    extern __shared__ __nv_bfloat16 srow_ln_bf[];
+    __shared__ float sm[16];
+    int r = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
+    const __nv_bfloat16* xi = x + (size_t)r * D;
+    const float* tsc = temb_scale + (size_t)r * temb_row_stride;
+    const float* tsh = temb_shift + (size_t)r * temb_row_stride;
+    float s1 = 0.0f, s2 = 0.0f;
+    for (int i = t; i < D; i += 256) {
+        __nv_bfloat16 bv = xi[i];
+        srow_ln_bf[i] = bv;
+        float v = __bfloat162float(bv);
+        s1 += v;
+        s2 += v * v;
+    }
+    s1 = warp_reduce(s1);
+    s2 = warp_reduce(s2);
+    if (l == 0) {
+        sm[w] = s1;
+        sm[w + 8] = s2;
+    }
+    __syncthreads();
+    if (t == 0) {
+        float a = 0.0f, b = 0.0f;
+        for (int i = 0; i < 8; i++) {
+            a += sm[i];
+            b += sm[i + 8];
+        }
+        sm[0] = a;
+        sm[1] = b;
+    }
+    __syncthreads();
+    float mean = sm[0] / D;
+    float rstd = rsqrtf(sm[1] / D - mean * mean + 1e-6f);
+    __nv_bfloat16* oi = out + (size_t)r * D;
+    for (int i = t; i < D; i += 256) {
+        float sc = ssts_scale[i] + tsc[i];
+        float sh = ssts_shift[i] + tsh[i];
+        float xhat = (__bfloat162float(srow_ln_bf[i]) - mean) * rstd;
+        oi[i] = __float2bfloat16(xhat * (1.0f + sc) + sh);
+    }
+}
+
+__global__ void k_ln_adaln_ssts_bwd(
+    const __nv_bfloat16* __restrict__ grad_out,
+    const __nv_bfloat16* __restrict__ x,
+    const float* __restrict__ ssts_scale,
+    const float* __restrict__ temb_scale,
+    __nv_bfloat16* __restrict__ dx,
+    float* __restrict__ dssts_scale,
+    float* __restrict__ dssts_shift,
+    float* __restrict__ dtemb_scale,
+    float* __restrict__ dtemb_shift,
+    int D,
+    int temb_row_stride) {
+    extern __shared__ __nv_bfloat16 srow_ln_bf[];
+    __shared__ float sm[16];
+    int r = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
+    const __nv_bfloat16* xi = x + (size_t)r * D;
+    const __nv_bfloat16* goi = grad_out + (size_t)r * D;
+    const float* tsc = temb_scale + (size_t)r * temb_row_stride;
+
+    float sx = 0.0f, sx2 = 0.0f;
+    for (int i = t; i < D; i += 256) {
+        __nv_bfloat16 bv = xi[i];
+        srow_ln_bf[i] = bv;
+        float v = __bfloat162float(bv);
+        sx += v;
+        sx2 += v * v;
+    }
+    sx = warp_reduce(sx);
+    sx2 = warp_reduce(sx2);
+    if (l == 0) {
+        sm[w] = sx;
+        sm[w + 8] = sx2;
+    }
+    __syncthreads();
+    if (t == 0) {
+        float a = 0.0f, b = 0.0f;
+        for (int i = 0; i < 8; i++) {
+            a += sm[i];
+            b += sm[i + 8];
+        }
+        sm[0] = a;
+        sm[1] = b;
+    }
+    __syncthreads();
+
+    float mean = sm[0] / D;
+    float rstd = rsqrtf(sm[1] / D - mean * mean + 1e-6f);
+
+    float sdy = 0.0f, sdy_xhat = 0.0f;
+    for (int i = t; i < D; i += 256) {
+        float xhat = (__bfloat162float(srow_ln_bf[i]) - mean) * rstd;
+        float go = __bfloat162float(goi[i]);
+        float gamma = 1.0f + ssts_scale[i] + tsc[i];
+        float dscale = go * xhat;
+        sdy += go * gamma;
+        sdy_xhat += go * gamma * xhat;
+        atomicAdd(dssts_scale + i, dscale);
+        atomicAdd(dssts_shift + i, go);
+        atomicAdd(dtemb_scale + (size_t)r * temb_row_stride + i, dscale);
+        atomicAdd(dtemb_shift + (size_t)r * temb_row_stride + i, go);
+    }
+    sdy = warp_reduce(sdy);
+    sdy_xhat = warp_reduce(sdy_xhat);
+    if (l == 0) {
+        sm[w] = sdy;
+        sm[w + 8] = sdy_xhat;
+    }
+    __syncthreads();
+    if (t == 0) {
+        float a = 0.0f, b = 0.0f;
+        for (int i = 0; i < 8; i++) {
+            a += sm[i];
+            b += sm[i + 8];
+        }
+        sm[0] = a;
+        sm[1] = b;
+    }
+    __syncthreads();
+
+    float sum_dy = sm[0];
+    float sum_dy_xhat = sm[1];
+    __nv_bfloat16* dxi = dx + (size_t)r * D;
+    float invD = 1.0f / D;
+    for (int i = t; i < D; i += 256) {
+        float xhat = (__bfloat162float(srow_ln_bf[i]) - mean) * rstd;
+        float go = __bfloat162float(goi[i]);
+        float gamma = 1.0f + ssts_scale[i] + tsc[i];
+        float dy = go * gamma;
+        float dxv = (D * dy - sum_dy - xhat * sum_dy_xhat) * (rstd * invD);
+        dxi[i] = __float2bfloat16(dxv);
+    }
+}
+
 // Gated residual: x += y * (ssts_gate + temb_gate)
 __global__ void k_gate_res_ssts(
     __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ y,
@@ -455,6 +600,58 @@ __global__ void k_gate_res_ssts(
             xp[k] = __float2bfloat16(v);
         }
         *reinterpret_cast<uint4*>(x + base) = xv;
+    }
+}
+
+// Out-of-place variant for training/autograd building blocks.
+__global__ void k_gate_res_ssts_out(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ y,
+    const float* __restrict__ ssts_gate, const float* __restrict__ temb_gate,
+    __nv_bfloat16* __restrict__ out,
+    int N, int D, int temb_row_stride) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    int total = N * D;
+    for (int idx = tid; idx < total; idx += stride) {
+        int r = idx / D;
+        int c = idx - r * D;
+        const float g = ssts_gate[c] + temb_gate[(size_t)r * temb_row_stride + c];
+        const float xv = __bfloat162float(x[idx]);
+        const float yv = __bfloat162float(y[idx]);
+        out[idx] = __float2bfloat16(xv + yv * g);
+    }
+}
+
+// Backward for out = x + y * (ssts_gate + temb_gate[row])
+// Produces:
+//   dx    = grad_out
+//   dy    = grad_out * gate
+//   dssts = sum_rows grad_out * y
+//   dtemb = grad_out * y   (or rowwise-summed into row 0 if temb_row_stride == 0)
+__global__ void k_gate_res_ssts_bwd(
+    const __nv_bfloat16* __restrict__ grad_out,
+    const __nv_bfloat16* __restrict__ y,
+    const float* __restrict__ ssts_gate,
+    const float* __restrict__ temb_gate,
+    __nv_bfloat16* __restrict__ dx,
+    __nv_bfloat16* __restrict__ dy,
+    float* __restrict__ dssts_gate,
+    float* __restrict__ dtemb_gate,
+    int N, int D, int temb_row_stride) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    int total = N * D;
+    for (int idx = tid; idx < total; idx += stride) {
+        int r = idx / D;
+        int c = idx - r * D;
+        float go = __bfloat162float(grad_out[idx]);
+        float yv = __bfloat162float(y[idx]);
+        float gate = ssts_gate[c] + temb_gate[(size_t)r * temb_row_stride + c];
+        float dgate = go * yv;
+        dx[idx] = grad_out[idx];
+        dy[idx] = __float2bfloat16(go * gate);
+        atomicAdd(dssts_gate + c, dgate);
+        atomicAdd(dtemb_gate + (size_t)r * temb_row_stride + c, dgate);
     }
 }
 
@@ -1009,6 +1206,38 @@ __global__ void k_causal_dw_conv_silu(
     out[t * C + c] = __float2bfloat16(s);
 }
 
+__global__ void k_causal_dw_conv_silu_bwd(
+    const __nv_bfloat16* __restrict__ grad_out,
+    const __nv_bfloat16* __restrict__ in,
+    const float* __restrict__ w,
+    float* __restrict__ d_in,
+    float* __restrict__ d_w,
+    int T, int C, int K) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= C * T) return;
+    int c = idx % C;
+    int t = idx / C;
+
+    float z = 0.0f;
+    for (int k = 0; k < K; k++) {
+        int src_t = t - (K - 1) + k;
+        if (src_t >= 0) {
+            z += __bfloat162float(in[src_t * C + c]) * w[c * K + k];
+        }
+    }
+    float sig = 1.0f / (1.0f + expf(-z));
+    float dsilu = sig + z * sig * (1.0f - sig);
+    float dz = __bfloat162float(grad_out[t * C + c]) * dsilu;
+    for (int k = 0; k < K; k++) {
+        int src_t = t - (K - 1) + k;
+        if (src_t >= 0) {
+            float inv = __bfloat162float(in[src_t * C + c]);
+            atomicAdd(d_w + c * K + k, dz * inv);
+            atomicAdd(d_in + src_t * C + c, dz * w[c * K + k]);
+        }
+    }
+}
+
 __global__ void k_gdn_compute_gates(
     const __nv_bfloat16* __restrict__ a_proj,  // [T, NH]
     const __nv_bfloat16* __restrict__ b_proj,  // [T, NH]
@@ -1027,6 +1256,41 @@ __global__ void k_gdn_compute_gates(
     // g = -exp(A_log) * softplus(a + dt_bias)
     float sp = (a_val > 20.f) ? a_val : logf(1.f + expf(a_val));  // softplus
     g_out[idx] = -expf(A_log[h]) * sp;
+}
+
+__global__ void k_gdn_compute_gates_bwd(
+    const float* __restrict__ grad_g,
+    const float* __restrict__ grad_beta,
+    const __nv_bfloat16* __restrict__ a_proj,
+    const __nv_bfloat16* __restrict__ b_proj,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    __nv_bfloat16* __restrict__ d_a_proj,
+    __nv_bfloat16* __restrict__ d_b_proj,
+    float* __restrict__ d_A_log,
+    float* __restrict__ d_dt_bias,
+    int T, int NH) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= T * NH) return;
+    int h = idx % NH;
+    float a_raw = __bfloat162float(a_proj[idx]);
+    float b_raw = __bfloat162float(b_proj[idx]);
+    float x = a_raw + dt_bias[h];
+    float Aexp = expf(A_log[h]);
+    float sp = (x > 20.f) ? x : logf(1.f + expf(x));
+    float sig_sp = 1.0f / (1.0f + expf(-x));
+    float beta = 1.0f / (1.0f + expf(-b_raw));
+    float g = -Aexp * sp;
+
+    float gg = grad_g[idx];
+    float gb = grad_beta[idx];
+
+    float da = gg * (-Aexp) * sig_sp;
+    float db = gb * beta * (1.0f - beta);
+    d_a_proj[idx] = __float2bfloat16(da);
+    d_b_proj[idx] = __float2bfloat16(db);
+    atomicAdd(d_A_log + h, gg * g);
+    atomicAdd(d_dt_bias + h, da);
 }
 
 // Pre-normalize Q and K with L2 norm + scale, in-place.
@@ -1075,6 +1339,132 @@ __global__ void k_gdn_l2norm_scale(
     }
 }
 
+__global__ void k_gdn_l2norm_scale_out(
+    const __nv_bfloat16* __restrict__ q_in,
+    const __nv_bfloat16* __restrict__ k_in,
+    __nv_bfloat16* __restrict__ q_out,
+    __nv_bfloat16* __restrict__ k_out,
+    int K,
+    float scale) {
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    int tid = threadIdx.x;
+    size_t base = ((size_t)t * gridDim.y + h) * K;
+
+    float q_sq = 0.0f, k_sq = 0.0f;
+    for (int i = tid; i < K; i += blockDim.x) {
+        float qv = __bfloat162float(q_in[base + i]);
+        float kv = __bfloat162float(k_in[base + i]);
+        q_sq += qv * qv;
+        k_sq += kv * kv;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        q_sq += __shfl_down_sync(0xffffffff, q_sq, off);
+        k_sq += __shfl_down_sync(0xffffffff, k_sq, off);
+    }
+    __shared__ float sm[16];
+    int wid = tid >> 5, lane = tid & 31;
+    if (lane == 0) {
+        sm[wid] = q_sq;
+        sm[8 + wid] = k_sq;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float sq = 0.0f, sk = 0.0f;
+        for (int i = 0; i < (blockDim.x + 31) / 32; i++) {
+            sq += sm[i];
+            sk += sm[8 + i];
+        }
+        sm[0] = sq;
+        sm[1] = sk;
+    }
+    __syncthreads();
+    float q_inv = rsqrtf(sm[0] + 1e-6f);
+    float k_inv = rsqrtf(sm[1] + 1e-6f);
+    float q_sc = q_inv * scale;
+    float k_sc = k_inv;
+
+    for (int i = tid; i < K; i += blockDim.x) {
+        q_out[base + i] = __float2bfloat16(__bfloat162float(q_in[base + i]) * q_sc);
+        k_out[base + i] = __float2bfloat16(__bfloat162float(k_in[base + i]) * k_sc);
+    }
+}
+
+__global__ void k_gdn_l2norm_scale_bwd(
+    const __nv_bfloat16* __restrict__ grad_q,
+    const __nv_bfloat16* __restrict__ grad_k,
+    const __nv_bfloat16* __restrict__ q_in,
+    const __nv_bfloat16* __restrict__ k_in,
+    __nv_bfloat16* __restrict__ dq_out,
+    __nv_bfloat16* __restrict__ dk_out,
+    int K,
+    float scale) {
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    int tid = threadIdx.x;
+    size_t base = ((size_t)t * gridDim.y + h) * K;
+
+    float q_sq = 0.0f, k_sq = 0.0f;
+    float q_dot = 0.0f, k_dot = 0.0f;
+    for (int i = tid; i < K; i += blockDim.x) {
+        float qv = __bfloat162float(q_in[base + i]);
+        float kv = __bfloat162float(k_in[base + i]);
+        float gq = __bfloat162float(grad_q[base + i]);
+        float gk = __bfloat162float(grad_k[base + i]);
+        q_sq += qv * qv;
+        k_sq += kv * kv;
+        q_dot += qv * gq;
+        k_dot += kv * gk;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        q_sq += __shfl_down_sync(0xffffffff, q_sq, off);
+        k_sq += __shfl_down_sync(0xffffffff, k_sq, off);
+        q_dot += __shfl_down_sync(0xffffffff, q_dot, off);
+        k_dot += __shfl_down_sync(0xffffffff, k_dot, off);
+    }
+    __shared__ float sm[32];
+    int wid = tid >> 5, lane = tid & 31;
+    if (lane == 0) {
+        sm[wid] = q_sq;
+        sm[8 + wid] = k_sq;
+        sm[16 + wid] = q_dot;
+        sm[24 + wid] = k_dot;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float sq = 0.0f, sk = 0.0f, dq = 0.0f, dk = 0.0f;
+        for (int i = 0; i < (blockDim.x + 31) / 32; i++) {
+            sq += sm[i];
+            sk += sm[8 + i];
+            dq += sm[16 + i];
+            dk += sm[24 + i];
+        }
+        sm[0] = sq;
+        sm[1] = sk;
+        sm[2] = dq;
+        sm[3] = dk;
+    }
+    __syncthreads();
+
+    float q_inv = rsqrtf(sm[0] + 1e-6f);
+    float k_inv = rsqrtf(sm[1] + 1e-6f);
+    float q_inv3 = q_inv * q_inv * q_inv;
+    float k_inv3 = k_inv * k_inv * k_inv;
+    float q_dot_total = sm[2];
+    float k_dot_total = sm[3];
+
+    for (int i = tid; i < K; i += blockDim.x) {
+        float qv = __bfloat162float(q_in[base + i]);
+        float kv = __bfloat162float(k_in[base + i]);
+        float gq = __bfloat162float(grad_q[base + i]);
+        float gk = __bfloat162float(grad_k[base + i]);
+        float dq = scale * (gq * q_inv - qv * q_dot_total * q_inv3);
+        float dk = gk * k_inv - kv * k_dot_total * k_inv3;
+        dq_out[base + i] = __float2bfloat16(dq);
+        dk_out[base + i] = __float2bfloat16(dk);
+    }
+}
+
 // Persistent GDN recurrent kernel — Triton-style tile scheduling.
 //
 // Instead of 1 block per (V_tile, head), launches NUM_SMS * warps_per_sm
@@ -1100,6 +1490,21 @@ __device__ __forceinline__ void load_bf16x8_to_f32(const __nv_bfloat16* src, flo
         float2 pair = __bfloat1622float2(vals[i]);
         dst[2 * i] = pair.x;
         dst[2 * i + 1] = pair.y;
+    }
+}
+
+__device__ __forceinline__ void load_bf16x8_to_f32_broadcast(const __nv_bfloat16* src, int lane, float* dst) {
+    float pair_vals[2] = {0.0f, 0.0f};
+    if (lane < 4) {
+        __nv_bfloat162 pair = reinterpret_cast<const __nv_bfloat162*>(src)[lane];
+        float2 fp = __bfloat1622float2(pair);
+        pair_vals[0] = fp.x;
+        pair_vals[1] = fp.y;
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        dst[2 * i] = __shfl_sync(0xffffffff, pair_vals[0], i);
+        dst[2 * i + 1] = __shfl_sync(0xffffffff, pair_vals[1], i);
     }
 }
 
@@ -1261,6 +1666,305 @@ __global__ void __launch_bounds__(32) k_gdn_recurrent(
     }
 }
 
+__global__ void __launch_bounds__(32) k_gdn_recurrent_train(
+    const __nv_bfloat16* __restrict__ q,   // [T, NH, K]
+    const __nv_bfloat16* __restrict__ k,   // [T, NH, K]
+    const __nv_bfloat16* __restrict__ v,   // [T, NH, V]
+    const float* __restrict__ g,           // [T, NH]
+    const float* __restrict__ beta,        // [T, NH]
+    const float* __restrict__ state0,      // [NH, K, V]
+    __nv_bfloat16* __restrict__ o,         // [T, NH, V]
+    float* __restrict__ stateT,            // [NH, K, V]
+    int T, int NH, int K, int V) {
+    int tile_id = blockIdx.x;
+    int lane = threadIdx.x;
+    int k_off = lane * GDN_BK;
+    int nv_tiles = V / GDN_BV;
+    if (tile_id >= NH * nv_tiles) return;
+
+    int h = tile_id / nv_tiles;
+    int bv = tile_id % nv_tiles;
+    int v_off = bv * GDN_BV;
+
+    float hr[GDN_BK][GDN_BV];
+    const float* st0 = state0 + (size_t)h * K * V;
+    #pragma unroll
+    for (int ki = 0; ki < GDN_BK; ++ki) {
+        #pragma unroll
+        for (int vi = 0; vi < GDN_BV; ++vi) {
+            hr[ki][vi] = st0[(size_t)(k_off + ki) * V + v_off + vi];
+        }
+    }
+
+    for (int t = 0; t < T; ++t) {
+        size_t qk_base = ((size_t)t * NH + h) * K;
+        size_t v_base = ((size_t)t * NH + h) * V;
+        float my_k[GDN_BK];
+        float my_q[GDN_BK];
+        load_bf16x8_to_f32(k + qk_base + k_off, my_k);
+        load_bf16x8_to_f32(q + qk_base + k_off, my_q);
+
+        float qk_dot = 0.0f;
+        #pragma unroll
+        for (int ki = 0; ki < GDN_BK; ++ki) qk_dot += my_q[ki] * my_k[ki];
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) qk_dot += __shfl_xor_sync(0xffffffff, qk_dot, mask);
+
+        float curr_gt = (lane == 0) ? g[(size_t)t * NH + h] : 0.0f;
+        float curr_bt = (lane == 0) ? beta[(size_t)t * NH + h] : 0.0f;
+        curr_gt = __shfl_sync(0xffffffff, curr_gt, 0);
+        curr_bt = __shfl_sync(0xffffffff, curr_bt, 0);
+        float decay = __expf(curr_gt);
+
+        #pragma unroll
+        for (int ki = 0; ki < GDN_BK; ++ki)
+            #pragma unroll
+            for (int vi = 0; vi < GDN_BV; ++vi)
+                hr[ki][vi] *= decay;
+
+        float hk[GDN_BV];
+        float hq[GDN_BV];
+        #pragma unroll
+        for (int vi = 0; vi < GDN_BV; ++vi) {
+            float acc_k = 0.0f;
+            float acc_q = 0.0f;
+            #pragma unroll
+            for (int ki = 0; ki < GDN_BK; ++ki) {
+                float hval = hr[ki][vi];
+                acc_k += hval * my_k[ki];
+                acc_q += hval * my_q[ki];
+            }
+            hk[vi] = acc_k;
+            hq[vi] = acc_q;
+        }
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            #pragma unroll
+            for (int vi = 0; vi < GDN_BV; ++vi) {
+                hk[vi] += __shfl_xor_sync(0xffffffff, hk[vi], mask);
+                hq[vi] += __shfl_xor_sync(0xffffffff, hq[vi], mask);
+            }
+        }
+
+        float v_vals[GDN_BV];
+        load_bf16x8_to_f32_broadcast(v + v_base + v_off, lane, v_vals);
+        float out_vals[GDN_BV];
+        #pragma unroll
+        for (int vi = 0; vi < GDN_BV; ++vi) {
+            float vn = curr_bt * (v_vals[vi] - hk[vi]);
+            out_vals[vi] = hq[vi] + qk_dot * vn;
+            #pragma unroll
+            for (int ki = 0; ki < GDN_BK; ++ki) hr[ki][vi] += my_k[ki] * vn;
+        }
+        if (lane == 0) {
+            size_t o_base = ((size_t)t * NH + h) * V;
+            #pragma unroll
+            for (int vi = 0; vi < GDN_BV; ++vi) o[o_base + v_off + vi] = __float2bfloat16(out_vals[vi]);
+        }
+    }
+
+    float* stT = stateT + (size_t)h * K * V;
+    #pragma unroll
+    for (int ki = 0; ki < GDN_BK; ++ki)
+        #pragma unroll
+        for (int vi = 0; vi < GDN_BV; ++vi)
+            stT[(size_t)(k_off + ki) * V + v_off + vi] = hr[ki][vi];
+}
+
+__global__ void __launch_bounds__(32) k_gdn_recurrent_bwd(
+    const __nv_bfloat16* __restrict__ grad_o,     // [T, NH, V]
+    const float* __restrict__ grad_stateT,        // [NH, K, V]
+    const __nv_bfloat16* __restrict__ q,          // [T, NH, K]
+    const __nv_bfloat16* __restrict__ k,          // [T, NH, K]
+    const __nv_bfloat16* __restrict__ v,          // [T, NH, V]
+    const float* __restrict__ g,                  // [T, NH]
+    const float* __restrict__ beta,               // [T, NH]
+    const float* __restrict__ stateT,             // [NH, K, V]
+    float* __restrict__ dq_accum,                 // [T, NH, K]
+    float* __restrict__ dk_accum,                 // [T, NH, K]
+    float* __restrict__ dv_accum,                 // [T, NH, V]
+    float* __restrict__ dg_out,                   // [T, NH]
+    float* __restrict__ dbeta_out,                // [T, NH]
+    float* __restrict__ dstate0,                  // [NH, K, V]
+    int T, int NH, int K, int V) {
+    int tile_id = blockIdx.x;
+    int lane = threadIdx.x;
+    int k_off = lane * GDN_BK;
+    int nv_tiles = V / GDN_BV;
+    if (tile_id >= NH * nv_tiles) return;
+
+    int h = tile_id / nv_tiles;
+    int bv = tile_id % nv_tiles;
+    int v_off = bv * GDN_BV;
+
+    float state_cur[GDN_BK][GDN_BV];
+    float dstate_cur[GDN_BK][GDN_BV];
+    const float* stT = stateT + (size_t)h * K * V;
+    const float* gstT = grad_stateT + (size_t)h * K * V;
+    #pragma unroll
+    for (int ki = 0; ki < GDN_BK; ++ki) {
+        #pragma unroll
+        for (int vi = 0; vi < GDN_BV; ++vi) {
+            state_cur[ki][vi] = stT[(size_t)(k_off + ki) * V + v_off + vi];
+            dstate_cur[ki][vi] = gstT[(size_t)(k_off + ki) * V + v_off + vi];
+        }
+    }
+
+    for (int t = T - 1; t >= 0; --t) {
+        size_t qk_base = ((size_t)t * NH + h) * K;
+        size_t v_base = ((size_t)t * NH + h) * V;
+        size_t qk_idx_base = ((size_t)t * NH + h) * K;
+        float my_q[GDN_BK];
+        float my_k[GDN_BK];
+        float v_vals[GDN_BV];
+        float grad_o_vals[GDN_BV];
+        load_bf16x8_to_f32(q + qk_base + k_off, my_q);
+        load_bf16x8_to_f32(k + qk_base + k_off, my_k);
+        load_bf16x8_to_f32_broadcast(v + v_base + v_off, lane, v_vals);
+        load_bf16x8_to_f32_broadcast(grad_o + v_base + v_off, lane, grad_o_vals);
+
+        float curr_g = (lane == 0) ? g[(size_t)t * NH + h] : 0.0f;
+        float curr_beta = (lane == 0) ? beta[(size_t)t * NH + h] : 0.0f;
+        curr_g = __shfl_sync(0xffffffff, curr_g, 0);
+        curr_beta = __shfl_sync(0xffffffff, curr_beta, 0);
+        float decay = __expf(curr_g);
+        float inv_decay = 1.0f / decay;
+
+        float qk_dot = 0.0f;
+        float kk = 0.0f;
+        #pragma unroll
+        for (int ki = 0; ki < GDN_BK; ++ki) {
+            qk_dot += my_q[ki] * my_k[ki];
+            kk += my_k[ki] * my_k[ki];
+        }
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            qk_dot += __shfl_xor_sync(0xffffffff, qk_dot, mask);
+            kk += __shfl_xor_sync(0xffffffff, kk, mask);
+        }
+
+        float k_state_cur[GDN_BV];
+        #pragma unroll
+        for (int vi = 0; vi < GDN_BV; ++vi) {
+            float acc = 0.0f;
+            #pragma unroll
+            for (int ki = 0; ki < GDN_BK; ++ki) acc += state_cur[ki][vi] * my_k[ki];
+            k_state_cur[vi] = acc;
+        }
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            #pragma unroll
+            for (int vi = 0; vi < GDN_BV; ++vi)
+                k_state_cur[vi] += __shfl_xor_sync(0xffffffff, k_state_cur[vi], mask);
+
+        float denom = 1.0f - kk * curr_beta;
+        float hk[GDN_BV];
+        float vn[GDN_BV];
+        float state_dec[GDN_BK][GDN_BV];
+        #pragma unroll
+        for (int vi = 0; vi < GDN_BV; ++vi) {
+            hk[vi] = (k_state_cur[vi] - kk * curr_beta * v_vals[vi]) / denom;
+            vn[vi] = curr_beta * (v_vals[vi] - hk[vi]);
+            #pragma unroll
+            for (int ki = 0; ki < GDN_BK; ++ki) {
+                state_dec[ki][vi] = state_cur[ki][vi] - my_k[ki] * vn[vi];
+            }
+        }
+
+        float dq_local[GDN_BK];
+        float dk_local[GDN_BK];
+        float dstate_dec[GDN_BK][GDN_BV];
+        #pragma unroll
+        for (int ki = 0; ki < GDN_BK; ++ki) {
+            dq_local[ki] = 0.0f;
+            dk_local[ki] = 0.0f;
+            #pragma unroll
+            for (int vi = 0; vi < GDN_BV; ++vi) dstate_dec[ki][vi] = dstate_cur[ki][vi];
+        }
+
+        float d_vn[GDN_BV];
+        float d_hk[GDN_BV];
+        float d_beta = 0.0f;
+        float d_qk = 0.0f;
+        #pragma unroll
+        for (int vi = 0; vi < GDN_BV; ++vi) d_qk += grad_o_vals[vi] * vn[vi];
+
+        #pragma unroll
+        for (int vi = 0; vi < GDN_BV; ++vi) {
+            float acc = 0.0f;
+            #pragma unroll
+            for (int ki = 0; ki < GDN_BK; ++ki) {
+                acc += dstate_cur[ki][vi] * my_k[ki];
+                dk_local[ki] += dstate_cur[ki][vi] * vn[vi];
+                dstate_dec[ki][vi] += my_q[ki] * grad_o_vals[vi];
+            }
+            d_vn[vi] = acc;
+        }
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            #pragma unroll
+            for (int vi = 0; vi < GDN_BV; ++vi)
+                d_vn[vi] += __shfl_xor_sync(0xffffffff, d_vn[vi], mask);
+
+        #pragma unroll
+        for (int ki = 0; ki < GDN_BK; ++ki) {
+            dq_local[ki] += d_qk * my_k[ki];
+            dk_local[ki] += d_qk * my_q[ki];
+        }
+
+        #pragma unroll
+        for (int vi = 0; vi < GDN_BV; ++vi) {
+            d_vn[vi] += qk_dot * grad_o_vals[vi];
+            d_beta += d_vn[vi] * (v_vals[vi] - hk[vi]);
+            d_hk[vi] = -curr_beta * d_vn[vi];
+            if (lane == 0) {
+                dv_accum[v_base + v_off + vi] = curr_beta * d_vn[vi];
+            }
+        }
+
+        #pragma unroll
+        for (int ki = 0; ki < GDN_BK; ++ki) {
+            float sdec_dout = 0.0f;
+            float sdec_dhk = 0.0f;
+            #pragma unroll
+            for (int vi = 0; vi < GDN_BV; ++vi) {
+                sdec_dout += state_dec[ki][vi] * grad_o_vals[vi];
+                sdec_dhk += state_dec[ki][vi] * d_hk[vi];
+                dstate_dec[ki][vi] += my_k[ki] * d_hk[vi];
+            }
+            dq_local[ki] += sdec_dout;
+            dk_local[ki] += sdec_dhk;
+        }
+
+        float dg_local = 0.0f;
+        #pragma unroll
+        for (int ki = 0; ki < GDN_BK; ++ki) {
+            size_t grad_idx = qk_idx_base + k_off + ki;
+            atomicAdd(dq_accum + grad_idx, dq_local[ki]);
+            atomicAdd(dk_accum + grad_idx, dk_local[ki]);
+            #pragma unroll
+            for (int vi = 0; vi < GDN_BV; ++vi) {
+                dg_local += dstate_dec[ki][vi] * state_dec[ki][vi];
+                dstate_cur[ki][vi] = decay * dstate_dec[ki][vi];
+                state_cur[ki][vi] = state_dec[ki][vi] * inv_decay;
+            }
+        }
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) dg_local += __shfl_xor_sync(0xffffffff, dg_local, mask);
+        if (lane == 0) {
+            atomicAdd(dg_out + (size_t)t * NH + h, dg_local);
+            atomicAdd(dbeta_out + (size_t)t * NH + h, d_beta);
+        }
+    }
+
+    float* dst0 = dstate0 + (size_t)h * K * V;
+    #pragma unroll
+    for (int ki = 0; ki < GDN_BK; ++ki)
+        #pragma unroll
+        for (int vi = 0; vi < GDN_BV; ++vi)
+            dst0[(size_t)(k_off + ki) * V + v_off + vi] = dstate_cur[ki][vi];
+}
+
 
 // GDN output norm + gate: out[t,v] = rmsnorm(recurrent_out, weight) * silu(gate[t,v])
 // recurrent_out is [T, NH, Vhd], gate is [T, NH*Vhd], weight is [Vhd]
@@ -1304,6 +2008,96 @@ __global__ void k_gdn_rmsnorm_silu_gate(
         float gv = __bfloat162float(gi[i]);
         float sg = gv / (1.f + expf(-gv));  // silu(gate)
         oi[i] = __float2bfloat16(rv * sg);
+    }
+}
+
+// Backward for GDN output norm + gate.
+// Inputs:
+//   grad_out  [T, NH, Vhd] bf16
+//   rec_out   [T, NH, Vhd] bf16
+//   gate      [T, NH, Vhd] bf16
+//   weight    [Vhd] float32
+// Outputs:
+//   drec      [T, NH, Vhd] bf16
+//   dgate     [T, NH, Vhd] bf16
+//   dweight   [Vhd] float32
+__global__ void k_gdn_rmsnorm_silu_gate_bwd(
+    const __nv_bfloat16* __restrict__ grad_out,
+    const __nv_bfloat16* __restrict__ rec_out,
+    const __nv_bfloat16* __restrict__ gate,
+    const float* __restrict__ weight,
+    __nv_bfloat16* __restrict__ drec,
+    __nv_bfloat16* __restrict__ dgate,
+    float* __restrict__ dweight,
+    int T, int NH, int Vhd, float eps) {
+    int th = blockIdx.x;
+    if (th >= T * NH) return;
+    int t = th / NH, h = th % NH;
+    int tid = threadIdx.x;
+    int total_v = NH * Vhd;
+
+    const __nv_bfloat16* goi = grad_out + (size_t)th * Vhd;
+    const __nv_bfloat16* ri = rec_out + (size_t)th * Vhd;
+    const __nv_bfloat16* gi = gate + (size_t)t * total_v + (size_t)h * Vhd;
+    __nv_bfloat16* dri = drec + (size_t)th * Vhd;
+    __nv_bfloat16* dgi = dgate + (size_t)t * total_v + (size_t)h * Vhd;
+
+    __shared__ float sm_ss[8];
+    __shared__ float sm_dot[8];
+    float ss = 0.f;
+    for (int i = tid; i < Vhd; i += 256) {
+        float rv = __bfloat162float(ri[i]);
+        ss += rv * rv;
+    }
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xffffffff, ss, off);
+    int wid = tid >> 5, lane = tid & 31;
+    if (lane == 0) sm_ss[wid] = ss;
+    __syncthreads();
+    if (tid == 0) {
+        float a = 0.f;
+        for (int i = 0; i < 8; ++i) a += sm_ss[i];
+        sm_ss[0] = a;
+    }
+    __syncthreads();
+    float rstd = rsqrtf(sm_ss[0] / Vhd + eps);
+
+    float dot = 0.f;
+    for (int i = tid; i < Vhd; i += 256) {
+        float go = __bfloat162float(goi[i]);
+        float rv = __bfloat162float(ri[i]);
+        float gv = __bfloat162float(gi[i]);
+        float sig = 1.f / (1.f + expf(-gv));
+        float silu = gv * sig;
+        float c = go * weight[i] * silu;
+        dot += c * rv;
+    }
+    for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffff, dot, off);
+    if (lane == 0) sm_dot[wid] = dot;
+    __syncthreads();
+    if (tid == 0) {
+        float a = 0.f;
+        for (int i = 0; i < 8; ++i) a += sm_dot[i];
+        sm_dot[0] = a;
+    }
+    __syncthreads();
+    float dot_all = sm_dot[0];
+    float coeff = (rstd * rstd * rstd) / Vhd;
+
+    for (int i = tid; i < Vhd; i += 256) {
+        float go = __bfloat162float(goi[i]);
+        float rv = __bfloat162float(ri[i]);
+        float gv = __bfloat162float(gi[i]);
+        float sig = 1.f / (1.f + expf(-gv));
+        float silu = gv * sig;
+        float silu_grad = sig * (1.f + gv * (1.f - sig));
+        float z = rv * rstd;
+        float c = go * weight[i] * silu;
+        float dx = c * rstd - rv * coeff * dot_all;
+        float dg = go * (z * weight[i]) * silu_grad;
+        float dw = go * z * silu;
+        dri[i] = __float2bfloat16(dx);
+        dgi[i] = __float2bfloat16(dg);
+        atomicAdd(dweight + i, dw);
     }
 }
 
@@ -3349,6 +4143,44 @@ struct Layer {
     int gdn_head_k = 0, gdn_head_v = 0;
 };
 
+template <typename T>
+static inline void free_dev_ptr(T*& p) {
+    if (p != nullptr) {
+        cudaFree((void*)p);
+        p = nullptr;
+    }
+}
+
+static inline void free_layer_weights(Layer& L) {
+    free_dev_ptr(L.sq_w8); free_dev_ptr(L.sk_w8); free_dev_ptr(L.sv_w8); free_dev_ptr(L.so_w8);
+    free_dev_ptr(L.cq_w8); free_dev_ptr(L.ck_w8); free_dev_ptr(L.cv_w8); free_dev_ptr(L.co_w8);
+    free_dev_ptr(L.f1_w8); free_dev_ptr(L.f2_w8);
+    free_dev_ptr(L.f2_w4); free_dev_ptr(L.f2_s4);
+
+    free_dev_ptr(L.sqb); free_dev_ptr(L.skb); free_dev_ptr(L.svb); free_dev_ptr(L.sob);
+    free_dev_ptr(L.cqb); free_dev_ptr(L.ckb); free_dev_ptr(L.cvb); free_dev_ptr(L.cob);
+    free_dev_ptr(L.f1b); free_dev_ptr(L.f2b);
+
+    free_dev_ptr(L.rms_q); free_dev_ptr(L.rms_k);
+    free_dev_ptr(L.ca_rms_q); free_dev_ptr(L.ca_rms_k);
+    free_dev_ptr(L.n2w); free_dev_ptr(L.n2b); free_dev_ptr(L.sst);
+
+    free_dev_ptr(L.sq_w16); free_dev_ptr(L.sk_w16); free_dev_ptr(L.sv_w16); free_dev_ptr(L.so_w16);
+    free_dev_ptr(L.cq_w16); free_dev_ptr(L.ck_w16); free_dev_ptr(L.cv_w16); free_dev_ptr(L.co_w16);
+    free_dev_ptr(L.f1_w16); free_dev_ptr(L.f2_w16);
+
+    free_dev_ptr(L.gdn_q_w16); free_dev_ptr(L.gdn_k_w16); free_dev_ptr(L.gdn_v_w16);
+    free_dev_ptr(L.gdn_g_w16); free_dev_ptr(L.gdn_o_w16);
+
+    free_dev_ptr(L.gdn_q_w8); free_dev_ptr(L.gdn_k_w8); free_dev_ptr(L.gdn_v_w8);
+    free_dev_ptr(L.gdn_a_w8); free_dev_ptr(L.gdn_b_w8); free_dev_ptr(L.gdn_g_w8); free_dev_ptr(L.gdn_o_w8);
+    free_dev_ptr(L.gdn_a_w_bf16); free_dev_ptr(L.gdn_b_w_bf16);
+    free_dev_ptr(L.gdn_qb); free_dev_ptr(L.gdn_kb); free_dev_ptr(L.gdn_vb);
+    free_dev_ptr(L.gdn_ab); free_dev_ptr(L.gdn_bb); free_dev_ptr(L.gdn_gb); free_dev_ptr(L.gdn_ob);
+    free_dev_ptr(L.gdn_conv_q_w); free_dev_ptr(L.gdn_conv_k_w); free_dev_ptr(L.gdn_conv_v_w);
+    free_dev_ptr(L.gdn_A_log); free_dev_ptr(L.gdn_dt_bias); free_dev_ptr(L.gdn_o_norm_w);
+}
+
 // ============================================================
 // Global engine state
 // ============================================================
@@ -3361,6 +4193,23 @@ static int g_D, g_NH, g_HD, g_NL, g_FFN, g_CA_K_DIM, g_nsm;
 static int g_max_seq = 0, g_ctx = 0;
 static int g_actual_ctx = 0;  // actual encoder token count (may be < g_ctx)
 static bool g_ready = false;
+
+static int current_sm_count() {
+    if (g_nsm > 0) return g_nsm;
+    int dev = 0;
+    cudaDeviceProp prop{};
+    cudaError_t err = cudaGetDevice(&dev);
+    if (err != cudaSuccess) return 1;
+    err = cudaGetDeviceProperties(&prop, dev);
+    if (err != cudaSuccess) return 1;
+    return std::max(1, prop.multiProcessorCount);
+}
+
+static int launch_blocks_1d(int total, int threads = 256, int blocks_per_sm = 8) {
+    int max_blocks = std::max(1, blocks_per_sm * current_sm_count());
+    int needed = std::max(1, (total + threads - 1) / threads);
+    return std::min(needed, max_blocks);
+}
 
 static void ensure_gemm_runtime() {
     if (!g_blasH) CKBL(cublasCreate(&g_blasH));
@@ -4212,6 +5061,10 @@ void engine_init(int64_t D, int64_t NH, int64_t HD, int64_t NL,
     if (fused_ffn1_fp4_env) {
         g_cutlass_fused_ffn1_fp4 = atoi(fused_ffn1_fp4_env) != 0;
     }
+    if (g_fp4_ffn2 && g_cutlass_fused_ffn1 && !g_cutlass_fused_ffn1_fp4) {
+        printf("  [CUTLASS FFN1] disabled: incompatible with KAIROS_FP4_FFN2=1 unless KAIROS_FUSED_FFN1_FP4=1 is also enabled\n");
+        g_cutlass_fused_ffn1 = false;
+    }
     ensure_gemm_runtime();
     if (!g_cudnnH) {
         cudnnCreate(&g_cudnnH);
@@ -4687,6 +5540,18 @@ void engine_invalidate_ca_kv_cache() {
     g_ca_kv_cache_valid = false;
 }
 
+void engine_release_loaded_weights() {
+    for (auto& L : g_layers) {
+        free_layer_weights(L);
+    }
+    for (auto& W : g_bf16_attn_weights) {
+        free_dev_ptr(W.sq_w); free_dev_ptr(W.sk_w); free_dev_ptr(W.sv_w); free_dev_ptr(W.so_w);
+        free_dev_ptr(W.cq_w); free_dev_ptr(W.ck_w); free_dev_ptr(W.cv_w); free_dev_ptr(W.co_w);
+    }
+    g_bf16_attn_weights.clear();
+    g_ca_kv_cache_valid = false;
+}
+
 // Toggle cuBLASLt chunk GDN (true) vs fused recurrent (false)
 void engine_set_gdn_cublas_chunk(bool enable) {
     g_gdn_use_cublas_chunk = enable;
@@ -4997,7 +5862,7 @@ static void forward_core(
             } else {
                 bool use_fp4_ffn2 = g_fp4_ffn2 && DO_GEMM && DO_EWISE;
                 bool use_fused_ffn1_fp4 = use_fp4_ffn2 && g_cutlass_fused_ffn1_fp4;
-                bool use_fused_ffn1 = g_cutlass_fused_ffn1 && DO_GEMM && DO_EWISE && !use_fused_ffn1_fp4;
+                bool use_fused_ffn1 = g_cutlass_fused_ffn1 && DO_GEMM && DO_EWISE && !use_fused_ffn1_fp4 && !g_fp4_ffn2;
                 if (use_fused_ffn1_fp4) {
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
                     gm->f1_fused_fp4.run(
@@ -5343,7 +6208,7 @@ static void forward_core(
             } else {
                 bool use_fp4_ffn2 = g_fp4_ffn2 && DO_GEMM && DO_EWISE;
                 bool use_fused_ffn1_fp4 = use_fp4_ffn2 && g_cutlass_fused_ffn1_fp4;
-                bool use_fused_ffn1 = g_cutlass_fused_ffn1 && DO_GEMM && DO_EWISE && !use_fused_ffn1_fp4;
+                bool use_fused_ffn1 = g_cutlass_fused_ffn1 && DO_GEMM && DO_EWISE && !use_fused_ffn1_fp4 && !g_fp4_ffn2;
                 if (use_fused_ffn1_fp4) {
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
                     gm->f1_fused_fp4.run(
@@ -5617,6 +6482,759 @@ torch::Tensor get_buf(std::string name, int64_t seq) {
     else TORCH_CHECK(false, "unknown buffer: ", name);
     auto& opts = is_fp8 ? opts_fp8 : opts_bf16;
     return torch::from_blob(p, {n_rows, n_cols}, opts).clone();
+}
+
+std::vector<torch::Tensor> gate_residual_ssts_train(
+    torch::Tensor x_t,
+    torch::Tensor y_t,
+    torch::Tensor ssts_gate_t,
+    torch::Tensor temb_gate_t) {
+    TORCH_CHECK(x_t.is_cuda() && y_t.is_cuda() && ssts_gate_t.is_cuda() && temb_gate_t.is_cuda(),
+                "all inputs must be CUDA");
+    TORCH_CHECK(x_t.scalar_type() == torch::kBFloat16 && y_t.scalar_type() == torch::kBFloat16,
+                "x and y must be bf16");
+    TORCH_CHECK(ssts_gate_t.scalar_type() == torch::kFloat32 && temb_gate_t.scalar_type() == torch::kFloat32,
+                "gate tensors must be float32");
+    TORCH_CHECK(x_t.dim() == 2 && y_t.dim() == 2, "x and y must be [N, D]");
+    TORCH_CHECK(x_t.sizes() == y_t.sizes(), "x and y shape mismatch");
+    TORCH_CHECK(ssts_gate_t.dim() == 1, "ssts_gate must be [D]");
+    TORCH_CHECK(temb_gate_t.dim() == 2, "temb_gate must be [R, D]");
+
+    int N = (int)x_t.size(0);
+    int D = (int)x_t.size(1);
+    TORCH_CHECK((int)ssts_gate_t.size(0) == D, "ssts_gate dim mismatch");
+    TORCH_CHECK((int)temb_gate_t.size(1) == D, "temb_gate dim mismatch");
+    TORCH_CHECK((int)temb_gate_t.size(0) == 1 || (int)temb_gate_t.size(0) == N,
+                "temb_gate rows must be 1 or N");
+    int temb_row_stride = ((int)temb_gate_t.size(0) == 1) ? 0 : D;
+
+    auto out = torch::empty_like(x_t);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    int blocks = launch_blocks_1d(N * D);
+    k_gate_res_ssts_out<<<blocks, 256, 0, stream>>>(
+        (__nv_bfloat16*)x_t.data_ptr(),
+        (__nv_bfloat16*)y_t.data_ptr(),
+        ssts_gate_t.data_ptr<float>(),
+        temb_gate_t.data_ptr<float>(),
+        (__nv_bfloat16*)out.data_ptr(),
+        N, D, temb_row_stride);
+    return {out};
+}
+
+std::vector<torch::Tensor> gate_residual_ssts_backward(
+    torch::Tensor grad_out_t,
+    torch::Tensor y_t,
+    torch::Tensor ssts_gate_t,
+    torch::Tensor temb_gate_t) {
+    TORCH_CHECK(grad_out_t.is_cuda() && y_t.is_cuda() && ssts_gate_t.is_cuda() && temb_gate_t.is_cuda(),
+                "all inputs must be CUDA");
+    TORCH_CHECK(grad_out_t.scalar_type() == torch::kBFloat16 && y_t.scalar_type() == torch::kBFloat16,
+                "grad_out and y must be bf16");
+    TORCH_CHECK(ssts_gate_t.scalar_type() == torch::kFloat32 && temb_gate_t.scalar_type() == torch::kFloat32,
+                "gate tensors must be float32");
+    TORCH_CHECK(grad_out_t.dim() == 2 && y_t.dim() == 2, "grad_out and y must be [N, D]");
+    TORCH_CHECK(grad_out_t.sizes() == y_t.sizes(), "grad_out and y shape mismatch");
+
+    int N = (int)grad_out_t.size(0);
+    int D = (int)grad_out_t.size(1);
+    TORCH_CHECK((int)ssts_gate_t.size(0) == D, "ssts_gate dim mismatch");
+    TORCH_CHECK(temb_gate_t.dim() == 2 && (int)temb_gate_t.size(1) == D, "temb_gate dim mismatch");
+    TORCH_CHECK((int)temb_gate_t.size(0) == 1 || (int)temb_gate_t.size(0) == N,
+                "temb_gate rows must be 1 or N");
+    int temb_row_stride = ((int)temb_gate_t.size(0) == 1) ? 0 : D;
+
+    auto dx = torch::empty_like(grad_out_t);
+    auto dy = torch::empty_like(y_t);
+    auto dssts = torch::zeros_like(ssts_gate_t);
+    auto dtemb = torch::zeros_like(temb_gate_t);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    int blocks = launch_blocks_1d(N * D);
+    k_gate_res_ssts_bwd<<<blocks, 256, 0, stream>>>(
+        (__nv_bfloat16*)grad_out_t.data_ptr(),
+        (__nv_bfloat16*)y_t.data_ptr(),
+        ssts_gate_t.data_ptr<float>(),
+        temb_gate_t.data_ptr<float>(),
+        (__nv_bfloat16*)dx.data_ptr(),
+        (__nv_bfloat16*)dy.data_ptr(),
+        dssts.data_ptr<float>(),
+        dtemb.data_ptr<float>(),
+        N, D, temb_row_stride);
+    return {dx, dy, dssts, dtemb};
+}
+
+std::vector<torch::Tensor> ln_adaln_ssts_train(
+    torch::Tensor x_t,
+    torch::Tensor ssts_scale_t,
+    torch::Tensor ssts_shift_t,
+    torch::Tensor temb_scale_t,
+    torch::Tensor temb_shift_t) {
+    TORCH_CHECK(x_t.is_cuda() && ssts_scale_t.is_cuda() && ssts_shift_t.is_cuda() &&
+                    temb_scale_t.is_cuda() && temb_shift_t.is_cuda(),
+                "all inputs must be CUDA");
+    TORCH_CHECK(x_t.scalar_type() == torch::kBFloat16, "x must be bf16");
+    TORCH_CHECK(ssts_scale_t.scalar_type() == torch::kFloat32 &&
+                    ssts_shift_t.scalar_type() == torch::kFloat32 &&
+                    temb_scale_t.scalar_type() == torch::kFloat32 &&
+                    temb_shift_t.scalar_type() == torch::kFloat32,
+                "adaln params must be float32");
+    TORCH_CHECK(x_t.dim() == 2, "x must be [N, D]");
+    TORCH_CHECK(ssts_scale_t.dim() == 1 && ssts_shift_t.dim() == 1,
+                "ssts tensors must be [D]");
+    TORCH_CHECK(temb_scale_t.dim() == 2 && temb_shift_t.dim() == 2,
+                "temb tensors must be [R, D]");
+
+    int N = (int)x_t.size(0);
+    int D = (int)x_t.size(1);
+    TORCH_CHECK((int)ssts_scale_t.size(0) == D && (int)ssts_shift_t.size(0) == D,
+                "ssts dim mismatch");
+    TORCH_CHECK((int)temb_scale_t.size(1) == D && (int)temb_shift_t.size(1) == D,
+                "temb dim mismatch");
+    TORCH_CHECK(temb_scale_t.sizes() == temb_shift_t.sizes(),
+                "temb scale/shift shape mismatch");
+    TORCH_CHECK((int)temb_scale_t.size(0) == 1 || (int)temb_scale_t.size(0) == N,
+                "temb rows must be 1 or N");
+    int temb_row_stride = ((int)temb_scale_t.size(0) == 1) ? 0 : D;
+
+    auto out = torch::empty_like(x_t);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    k_ln_adaln_ssts_out<<<N, 256, (size_t)D * sizeof(__nv_bfloat16), stream>>>(
+        (__nv_bfloat16*)x_t.data_ptr(),
+        (__nv_bfloat16*)out.data_ptr(),
+        ssts_scale_t.data_ptr<float>(),
+        ssts_shift_t.data_ptr<float>(),
+        temb_scale_t.data_ptr<float>(),
+        temb_shift_t.data_ptr<float>(),
+        D, temb_row_stride);
+    return {out};
+}
+
+std::vector<torch::Tensor> ln_adaln_ssts_backward(
+    torch::Tensor grad_out_t,
+    torch::Tensor x_t,
+    torch::Tensor ssts_scale_t,
+    torch::Tensor ssts_shift_t,
+    torch::Tensor temb_scale_t,
+    torch::Tensor temb_shift_t) {
+    TORCH_CHECK(grad_out_t.is_cuda() && x_t.is_cuda() && ssts_scale_t.is_cuda() &&
+                    ssts_shift_t.is_cuda() && temb_scale_t.is_cuda() && temb_shift_t.is_cuda(),
+                "all inputs must be CUDA");
+    TORCH_CHECK(grad_out_t.scalar_type() == torch::kBFloat16 && x_t.scalar_type() == torch::kBFloat16,
+                "grad_out and x must be bf16");
+    TORCH_CHECK(ssts_scale_t.scalar_type() == torch::kFloat32 &&
+                    ssts_shift_t.scalar_type() == torch::kFloat32 &&
+                    temb_scale_t.scalar_type() == torch::kFloat32 &&
+                    temb_shift_t.scalar_type() == torch::kFloat32,
+                "adaln params must be float32");
+    TORCH_CHECK(grad_out_t.dim() == 2 && x_t.dim() == 2, "grad_out and x must be [N, D]");
+    TORCH_CHECK(grad_out_t.sizes() == x_t.sizes(), "grad_out and x shape mismatch");
+
+    int N = (int)x_t.size(0);
+    int D = (int)x_t.size(1);
+    TORCH_CHECK((int)ssts_scale_t.size(0) == D && (int)ssts_shift_t.size(0) == D,
+                "ssts dim mismatch");
+    TORCH_CHECK((int)temb_scale_t.size(1) == D && (int)temb_shift_t.size(1) == D,
+                "temb dim mismatch");
+    TORCH_CHECK(temb_scale_t.sizes() == temb_shift_t.sizes(),
+                "temb scale/shift shape mismatch");
+    TORCH_CHECK((int)temb_scale_t.size(0) == 1 || (int)temb_scale_t.size(0) == N,
+                "temb rows must be 1 or N");
+    int temb_row_stride = ((int)temb_scale_t.size(0) == 1) ? 0 : D;
+
+    auto dx = torch::empty_like(x_t);
+    auto dssts_scale = torch::zeros_like(ssts_scale_t);
+    auto dssts_shift = torch::zeros_like(ssts_shift_t);
+    auto dtemb_scale = torch::zeros_like(temb_scale_t);
+    auto dtemb_shift = torch::zeros_like(temb_shift_t);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    k_ln_adaln_ssts_bwd<<<N, 256, (size_t)D * sizeof(__nv_bfloat16), stream>>>(
+        (__nv_bfloat16*)grad_out_t.data_ptr(),
+        (__nv_bfloat16*)x_t.data_ptr(),
+        ssts_scale_t.data_ptr<float>(),
+        temb_scale_t.data_ptr<float>(),
+        (__nv_bfloat16*)dx.data_ptr(),
+        dssts_scale.data_ptr<float>(),
+        dssts_shift.data_ptr<float>(),
+        dtemb_scale.data_ptr<float>(),
+        dtemb_shift.data_ptr<float>(),
+        D, temb_row_stride);
+    return {dx, dssts_scale, dssts_shift, dtemb_scale, dtemb_shift};
+}
+
+std::vector<torch::Tensor> linear_bf16_train(
+    torch::Tensor x_t,
+    torch::Tensor w_t,
+    torch::Tensor b_t) {
+    TORCH_CHECK(x_t.is_cuda() && w_t.is_cuda() && b_t.is_cuda(), "all inputs must be CUDA");
+    TORCH_CHECK(x_t.scalar_type() == torch::kBFloat16 || x_t.scalar_type() == torch::kFloat32,
+                "x must be bf16 or float32");
+    TORCH_CHECK(w_t.scalar_type() == torch::kBFloat16 || w_t.scalar_type() == torch::kFloat32,
+                "w must be bf16 or float32");
+    TORCH_CHECK(b_t.numel() == 0 || b_t.scalar_type() == torch::kBFloat16 || b_t.scalar_type() == torch::kFloat32,
+                "bias must be bf16, float32, or empty");
+    TORCH_CHECK(x_t.dim() == 2 && w_t.dim() == 2, "x must be [N,K], w must be [M,K]");
+    TORCH_CHECK((int)x_t.size(1) == (int)w_t.size(1), "K mismatch");
+    TORCH_CHECK(b_t.numel() == 0 || (b_t.dim() == 1 && (int)b_t.size(0) == (int)w_t.size(0)),
+                "bias must be [M] or empty");
+    auto x = x_t.contiguous().to(torch::kFloat32);
+    auto w = w_t.contiguous().to(torch::kFloat32);
+    auto out = torch::matmul(x, w.transpose(0, 1));
+    if (b_t.numel() > 0) {
+        out = out + b_t.contiguous().to(torch::kFloat32).view({1, -1});
+    }
+    return {out.to(x_t.scalar_type())};
+}
+
+std::vector<torch::Tensor> linear_bf16_backward(
+    torch::Tensor grad_out_t,
+    torch::Tensor x_t,
+    torch::Tensor w_t,
+    torch::Tensor b_t) {
+    TORCH_CHECK(grad_out_t.is_cuda() && x_t.is_cuda() && w_t.is_cuda() && b_t.is_cuda(),
+                "all inputs must be CUDA");
+    TORCH_CHECK(grad_out_t.scalar_type() == torch::kBFloat16 || grad_out_t.scalar_type() == torch::kFloat32,
+                "grad_out must be bf16 or float32");
+    TORCH_CHECK(x_t.scalar_type() == torch::kBFloat16 || x_t.scalar_type() == torch::kFloat32,
+                "x must be bf16 or float32");
+    TORCH_CHECK(w_t.scalar_type() == torch::kBFloat16 || w_t.scalar_type() == torch::kFloat32,
+                "w must be bf16 or float32");
+    TORCH_CHECK(b_t.numel() == 0 || b_t.scalar_type() == torch::kBFloat16 || b_t.scalar_type() == torch::kFloat32,
+                "bias must be bf16, float32, or empty");
+    TORCH_CHECK(grad_out_t.dim() == 2 && x_t.dim() == 2 && w_t.dim() == 2,
+                "grad_out, x and w must be rank-2");
+    TORCH_CHECK((int)x_t.size(1) == (int)w_t.size(1), "K mismatch");
+    TORCH_CHECK((int)grad_out_t.size(0) == (int)x_t.size(0) &&
+                    (int)grad_out_t.size(1) == (int)w_t.size(0),
+                "grad_out shape mismatch");
+    TORCH_CHECK(b_t.numel() == 0 || (b_t.dim() == 1 && (int)b_t.size(0) == (int)w_t.size(0)),
+                "bias must be [M] or empty");
+    auto go_f = grad_out_t.contiguous().to(torch::kFloat32);
+    auto x_f = x_t.contiguous().to(torch::kFloat32);
+    auto w_f = w_t.contiguous().to(torch::kFloat32);
+    auto dx = torch::matmul(go_f, w_f).to(x_t.scalar_type());
+    auto dw = torch::matmul(go_f.transpose(0, 1), x_f).to(w_t.scalar_type());
+    torch::Tensor db = b_t.numel() > 0 ? go_f.sum(0).to(b_t.scalar_type()) : torch::empty_like(b_t);
+    return {dx, dw, db};
+}
+
+std::vector<torch::Tensor> rmsnorm_train(
+    torch::Tensor x_t,
+    torch::Tensor w_t,
+    double eps) {
+    TORCH_CHECK(x_t.is_cuda() && w_t.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(x_t.scalar_type() == torch::kBFloat16 || x_t.scalar_type() == torch::kFloat32,
+                "x must be bf16 or float32");
+    TORCH_CHECK(w_t.scalar_type() == torch::kBFloat16 || w_t.scalar_type() == torch::kFloat32,
+                "w must be bf16 or float32");
+    TORCH_CHECK(x_t.dim() == 2 && w_t.dim() == 1, "x must be [N,D], w must be [D]");
+    TORCH_CHECK((int)x_t.size(1) == (int)w_t.size(0), "D mismatch");
+    auto x = x_t.contiguous().to(torch::kFloat32);
+    auto w = w_t.contiguous().to(torch::kFloat32);
+    auto mean_sq = x.pow(2).mean(1, true);
+    auto rstd = torch::rsqrt(mean_sq + (float)eps);
+    auto out = x * rstd * w.view({1, -1});
+    return {out.to(x_t.scalar_type())};
+}
+
+std::vector<torch::Tensor> rmsnorm_backward(
+    torch::Tensor grad_out_t,
+    torch::Tensor x_t,
+    torch::Tensor w_t,
+    double eps) {
+    TORCH_CHECK(grad_out_t.is_cuda() && x_t.is_cuda() && w_t.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(grad_out_t.scalar_type() == torch::kBFloat16 || grad_out_t.scalar_type() == torch::kFloat32,
+                "grad_out must be bf16 or float32");
+    TORCH_CHECK(x_t.scalar_type() == torch::kBFloat16 || x_t.scalar_type() == torch::kFloat32,
+                "x must be bf16 or float32");
+    TORCH_CHECK(w_t.scalar_type() == torch::kBFloat16 || w_t.scalar_type() == torch::kFloat32,
+                "w must be bf16 or float32");
+    TORCH_CHECK(grad_out_t.dim() == 2 && x_t.dim() == 2 && w_t.dim() == 1,
+                "grad_out and x must be [N,D], w must be [D]");
+    TORCH_CHECK(grad_out_t.sizes() == x_t.sizes(), "grad_out/x shape mismatch");
+    TORCH_CHECK((int)x_t.size(1) == (int)w_t.size(0), "D mismatch");
+    auto go = grad_out_t.contiguous().to(torch::kFloat32);
+    auto x = x_t.contiguous().to(torch::kFloat32);
+    auto w = w_t.contiguous().to(torch::kFloat32);
+    int64_t D = x.size(1);
+    auto mean_sq = x.pow(2).mean(1, true);
+    auto rstd = torch::rsqrt(mean_sq + (float)eps);
+    auto xhat = x * rstd;
+    auto grad_norm = go * w.view({1, -1});
+    auto inner = (grad_norm * x).sum(1, true) / (float)D;
+    auto dx = grad_norm * rstd - x * (rstd.pow(3) * inner);
+    auto dw = (go * xhat).sum(0);
+    return {dx.to(x_t.scalar_type()), dw.to(w_t.scalar_type())};
+}
+
+std::vector<torch::Tensor> layernorm_affine_train(
+    torch::Tensor x_t,
+    torch::Tensor w_t,
+    torch::Tensor b_t,
+    double eps) {
+    TORCH_CHECK(x_t.is_cuda() && w_t.is_cuda() && b_t.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(x_t.scalar_type() == torch::kBFloat16 || x_t.scalar_type() == torch::kFloat32,
+                "x must be bf16 or float32");
+    TORCH_CHECK(w_t.numel() == 0 || w_t.scalar_type() == torch::kBFloat16 || w_t.scalar_type() == torch::kFloat32,
+                "w must be bf16, float32, or empty");
+    TORCH_CHECK(b_t.numel() == 0 || b_t.scalar_type() == torch::kBFloat16 || b_t.scalar_type() == torch::kFloat32,
+                "b must be bf16, float32, or empty");
+    TORCH_CHECK(x_t.dim() == 2, "x must be [N,D]");
+    TORCH_CHECK(w_t.numel() == 0 || (w_t.dim() == 1 && (int)w_t.size(0) == (int)x_t.size(1)),
+                "w must be [D] or empty");
+    TORCH_CHECK(b_t.numel() == 0 || (b_t.dim() == 1 && (int)b_t.size(0) == (int)x_t.size(1)),
+                "b must be [D] or empty");
+    auto x = x_t.contiguous().to(torch::kFloat32);
+    auto mean = x.mean(1, true);
+    auto x_centered = x - mean;
+    auto var = x_centered.pow(2).mean(1, true);
+    auto rstd = torch::rsqrt(var + (float)eps);
+    auto xhat = x_centered * rstd;
+    auto out = xhat;
+    if (w_t.numel() > 0) {
+        out = out * w_t.contiguous().to(torch::kFloat32).view({1, -1});
+    }
+    if (b_t.numel() > 0) {
+        out = out + b_t.contiguous().to(torch::kFloat32).view({1, -1});
+    }
+    return {out.to(x_t.scalar_type())};
+}
+
+std::vector<torch::Tensor> layernorm_affine_backward(
+    torch::Tensor grad_out_t,
+    torch::Tensor x_t,
+    torch::Tensor w_t,
+    torch::Tensor b_t,
+    double eps) {
+    TORCH_CHECK(grad_out_t.is_cuda() && x_t.is_cuda() && w_t.is_cuda() && b_t.is_cuda(),
+                "inputs must be CUDA");
+    TORCH_CHECK(grad_out_t.scalar_type() == torch::kBFloat16 || grad_out_t.scalar_type() == torch::kFloat32,
+                "grad_out must be bf16 or float32");
+    TORCH_CHECK(x_t.scalar_type() == torch::kBFloat16 || x_t.scalar_type() == torch::kFloat32,
+                "x must be bf16 or float32");
+    TORCH_CHECK(w_t.numel() == 0 || w_t.scalar_type() == torch::kBFloat16 || w_t.scalar_type() == torch::kFloat32,
+                "w must be bf16, float32, or empty");
+    TORCH_CHECK(b_t.numel() == 0 || b_t.scalar_type() == torch::kBFloat16 || b_t.scalar_type() == torch::kFloat32,
+                "b must be bf16, float32, or empty");
+    TORCH_CHECK(grad_out_t.dim() == 2 && x_t.dim() == 2, "grad_out and x must be [N,D]");
+    TORCH_CHECK(grad_out_t.sizes() == x_t.sizes(), "grad_out/x shape mismatch");
+    TORCH_CHECK(w_t.numel() == 0 || (w_t.dim() == 1 && (int)w_t.size(0) == (int)x_t.size(1)),
+                "w must be [D] or empty");
+    TORCH_CHECK(b_t.numel() == 0 || (b_t.dim() == 1 && (int)b_t.size(0) == (int)x_t.size(1)),
+                "b must be [D] or empty");
+    auto go = grad_out_t.contiguous().to(torch::kFloat32);
+    auto x = x_t.contiguous().to(torch::kFloat32);
+    int64_t D = x.size(1);
+    auto mean = x.mean(1, true);
+    auto x_centered = x - mean;
+    auto var = x_centered.pow(2).mean(1, true);
+    auto rstd = torch::rsqrt(var + (float)eps);
+    auto xhat = x_centered * rstd;
+    auto grad_norm = go;
+    if (w_t.numel() > 0) {
+        grad_norm = grad_norm * w_t.contiguous().to(torch::kFloat32).view({1, -1});
+    }
+    auto sum1 = grad_norm.sum(1, true);
+    auto sum2 = (grad_norm * xhat).sum(1, true);
+    auto dx = (grad_norm * (float)D - sum1 - xhat * sum2) * (rstd / (float)D);
+    torch::Tensor dw = w_t.numel() > 0 ? (go * xhat).sum(0).to(w_t.scalar_type()) : torch::empty_like(w_t);
+    torch::Tensor db = b_t.numel() > 0 ? go.sum(0).to(b_t.scalar_type()) : torch::empty_like(b_t);
+    return {dx.to(x_t.scalar_type()), dw, db};
+}
+
+std::vector<torch::Tensor> gdn_l2norm_scale_train(
+    torch::Tensor q_t,
+    torch::Tensor k_t,
+    double scale) {
+    TORCH_CHECK(q_t.is_cuda() && k_t.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(q_t.scalar_type() == torch::kBFloat16 && k_t.scalar_type() == torch::kBFloat16,
+                "q and k must be bf16");
+    TORCH_CHECK(q_t.dim() == 3 && k_t.dim() == 3, "q and k must be [T, NH, K]");
+    TORCH_CHECK(q_t.sizes() == k_t.sizes(), "q and k shape mismatch");
+    int T = (int)q_t.size(0);
+    int NH = (int)q_t.size(1);
+    int K = (int)q_t.size(2);
+    auto q_out = torch::empty_like(q_t);
+    auto k_out = torch::empty_like(k_t);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    k_gdn_l2norm_scale_out<<<dim3(T, NH), 256, 0, stream>>>(
+        (__nv_bfloat16*)q_t.data_ptr(),
+        (__nv_bfloat16*)k_t.data_ptr(),
+        (__nv_bfloat16*)q_out.data_ptr(),
+        (__nv_bfloat16*)k_out.data_ptr(),
+        K, (float)scale);
+    return {q_out, k_out};
+}
+
+std::vector<torch::Tensor> gdn_l2norm_scale_backward(
+    torch::Tensor grad_q_t,
+    torch::Tensor grad_k_t,
+    torch::Tensor q_t,
+    torch::Tensor k_t,
+    double scale) {
+    TORCH_CHECK(grad_q_t.is_cuda() && grad_k_t.is_cuda() && q_t.is_cuda() && k_t.is_cuda(),
+                "all inputs must be CUDA");
+    TORCH_CHECK(grad_q_t.scalar_type() == torch::kBFloat16 &&
+                    grad_k_t.scalar_type() == torch::kBFloat16 &&
+                    q_t.scalar_type() == torch::kBFloat16 &&
+                    k_t.scalar_type() == torch::kBFloat16,
+                "all tensors must be bf16");
+    TORCH_CHECK(grad_q_t.dim() == 3 && grad_k_t.dim() == 3 && q_t.dim() == 3 && k_t.dim() == 3,
+                "all tensors must be [T, NH, K]");
+    TORCH_CHECK(grad_q_t.sizes() == q_t.sizes() && grad_k_t.sizes() == k_t.sizes() &&
+                    q_t.sizes() == k_t.sizes(),
+                "shape mismatch");
+    int T = (int)q_t.size(0);
+    int NH = (int)q_t.size(1);
+    int K = (int)q_t.size(2);
+    auto dq = torch::empty_like(q_t);
+    auto dk = torch::empty_like(k_t);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    k_gdn_l2norm_scale_bwd<<<dim3(T, NH), 256, 0, stream>>>(
+        (__nv_bfloat16*)grad_q_t.data_ptr(),
+        (__nv_bfloat16*)grad_k_t.data_ptr(),
+        (__nv_bfloat16*)q_t.data_ptr(),
+        (__nv_bfloat16*)k_t.data_ptr(),
+        (__nv_bfloat16*)dq.data_ptr(),
+        (__nv_bfloat16*)dk.data_ptr(),
+        K, (float)scale);
+    return {dq, dk};
+}
+
+std::vector<torch::Tensor> gdn_causal_conv_silu_train(
+    torch::Tensor in_t,
+    torch::Tensor w_t) {
+    TORCH_CHECK(in_t.is_cuda() && w_t.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(in_t.scalar_type() == torch::kBFloat16, "input must be bf16");
+    TORCH_CHECK(w_t.scalar_type() == torch::kFloat32, "weights must be float32");
+    TORCH_CHECK(in_t.dim() == 2 && w_t.dim() == 2, "expected in[T,C], w[C,K]");
+    int T = (int)in_t.size(0);
+    int C = (int)in_t.size(1);
+    int K = (int)w_t.size(1);
+    TORCH_CHECK((int)w_t.size(0) == C, "weight channel mismatch");
+    auto out = torch::empty_like(in_t);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    int total = T * C;
+    int blocks = launch_blocks_1d(total);
+    k_causal_dw_conv_silu<<<blocks, 256, 0, stream>>>(
+        (__nv_bfloat16*)in_t.data_ptr(),
+        (__nv_bfloat16*)out.data_ptr(),
+        w_t.data_ptr<float>(),
+        T, C, K);
+    return {out};
+}
+
+std::vector<torch::Tensor> gdn_causal_conv_silu_backward(
+    torch::Tensor grad_out_t,
+    torch::Tensor in_t,
+    torch::Tensor w_t) {
+    TORCH_CHECK(grad_out_t.is_cuda() && in_t.is_cuda() && w_t.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(grad_out_t.scalar_type() == torch::kBFloat16 && in_t.scalar_type() == torch::kBFloat16,
+                "grad_out and input must be bf16");
+    TORCH_CHECK(w_t.scalar_type() == torch::kFloat32, "weights must be float32");
+    TORCH_CHECK(grad_out_t.dim() == 2 && in_t.dim() == 2 && w_t.dim() == 2,
+                "expected grad[T,C], in[T,C], w[C,K]");
+    TORCH_CHECK(grad_out_t.sizes() == in_t.sizes(), "grad/input shape mismatch");
+    int T = (int)in_t.size(0);
+    int C = (int)in_t.size(1);
+    int K = (int)w_t.size(1);
+    TORCH_CHECK((int)w_t.size(0) == C, "weight channel mismatch");
+    auto d_in_accum = torch::zeros({T, C}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    auto d_w = torch::zeros_like(w_t);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    int total = T * C;
+    int blocks = launch_blocks_1d(total);
+    k_causal_dw_conv_silu_bwd<<<blocks, 256, 0, stream>>>(
+        (__nv_bfloat16*)grad_out_t.data_ptr(),
+        (__nv_bfloat16*)in_t.data_ptr(),
+        w_t.data_ptr<float>(),
+        d_in_accum.data_ptr<float>(),
+        d_w.data_ptr<float>(),
+        T, C, K);
+    auto d_in = d_in_accum.to(torch::kBFloat16);
+    return {d_in, d_w};
+}
+
+std::vector<torch::Tensor> gdn_compute_gates_train(
+    torch::Tensor a_proj_t,
+    torch::Tensor b_proj_t,
+    torch::Tensor A_log_t,
+    torch::Tensor dt_bias_t) {
+    TORCH_CHECK(a_proj_t.is_cuda() && b_proj_t.is_cuda() && A_log_t.is_cuda() && dt_bias_t.is_cuda(),
+                "all inputs must be CUDA");
+    TORCH_CHECK(a_proj_t.scalar_type() == torch::kBFloat16 && b_proj_t.scalar_type() == torch::kBFloat16,
+                "a_proj and b_proj must be bf16");
+    TORCH_CHECK(A_log_t.scalar_type() == torch::kFloat32 && dt_bias_t.scalar_type() == torch::kFloat32,
+                "A_log and dt_bias must be float32");
+    TORCH_CHECK(a_proj_t.dim() == 2 && b_proj_t.dim() == 2, "a_proj and b_proj must be [T,NH]");
+    TORCH_CHECK(a_proj_t.sizes() == b_proj_t.sizes(), "a_proj and b_proj shape mismatch");
+    int T = (int)a_proj_t.size(0);
+    int NH = (int)a_proj_t.size(1);
+    TORCH_CHECK((int)A_log_t.numel() == NH && (int)dt_bias_t.numel() == NH,
+                "A_log/dt_bias shape mismatch");
+    auto g_out = torch::empty({T, NH}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    auto beta_out = torch::empty({T, NH}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    int total = T * NH;
+    int blocks = launch_blocks_1d(total);
+    k_gdn_compute_gates<<<blocks, 256, 0, stream>>>(
+        (__nv_bfloat16*)a_proj_t.data_ptr(),
+        (__nv_bfloat16*)b_proj_t.data_ptr(),
+        A_log_t.data_ptr<float>(),
+        dt_bias_t.data_ptr<float>(),
+        g_out.data_ptr<float>(),
+        beta_out.data_ptr<float>(),
+        T, NH);
+    return {g_out, beta_out};
+}
+
+std::vector<torch::Tensor> gdn_compute_gates_backward(
+    torch::Tensor grad_g_t,
+    torch::Tensor grad_beta_t,
+    torch::Tensor a_proj_t,
+    torch::Tensor b_proj_t,
+    torch::Tensor A_log_t,
+    torch::Tensor dt_bias_t) {
+    TORCH_CHECK(grad_g_t.is_cuda() && grad_beta_t.is_cuda() && a_proj_t.is_cuda() &&
+                    b_proj_t.is_cuda() && A_log_t.is_cuda() && dt_bias_t.is_cuda(),
+                "all inputs must be CUDA");
+    TORCH_CHECK(grad_g_t.scalar_type() == torch::kFloat32 && grad_beta_t.scalar_type() == torch::kFloat32,
+                "grad_g and grad_beta must be float32");
+    TORCH_CHECK(a_proj_t.scalar_type() == torch::kBFloat16 && b_proj_t.scalar_type() == torch::kBFloat16,
+                "a_proj and b_proj must be bf16");
+    TORCH_CHECK(A_log_t.scalar_type() == torch::kFloat32 && dt_bias_t.scalar_type() == torch::kFloat32,
+                "A_log and dt_bias must be float32");
+    TORCH_CHECK(grad_g_t.sizes() == grad_beta_t.sizes() && grad_g_t.sizes() == a_proj_t.sizes() &&
+                    a_proj_t.sizes() == b_proj_t.sizes(),
+                "shape mismatch");
+    int T = (int)a_proj_t.size(0);
+    int NH = (int)a_proj_t.size(1);
+    auto d_a = torch::empty_like(a_proj_t);
+    auto d_b = torch::empty_like(b_proj_t);
+    auto d_A = torch::zeros_like(A_log_t);
+    auto d_dt = torch::zeros_like(dt_bias_t);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    int total = T * NH;
+    int blocks = launch_blocks_1d(total);
+    k_gdn_compute_gates_bwd<<<blocks, 256, 0, stream>>>(
+        grad_g_t.data_ptr<float>(),
+        grad_beta_t.data_ptr<float>(),
+        (__nv_bfloat16*)a_proj_t.data_ptr(),
+        (__nv_bfloat16*)b_proj_t.data_ptr(),
+        A_log_t.data_ptr<float>(),
+        dt_bias_t.data_ptr<float>(),
+        (__nv_bfloat16*)d_a.data_ptr(),
+        (__nv_bfloat16*)d_b.data_ptr(),
+        d_A.data_ptr<float>(),
+        d_dt.data_ptr<float>(),
+        T, NH);
+    return {d_a, d_b, d_A, d_dt};
+}
+
+std::vector<torch::Tensor> gdn_recurrent_train(
+    torch::Tensor q_t,
+    torch::Tensor k_t,
+    torch::Tensor v_t,
+    torch::Tensor g_t,
+    torch::Tensor beta_t,
+    torch::Tensor state0_t,
+    double scale) {
+    TORCH_CHECK(q_t.is_cuda() && k_t.is_cuda() && v_t.is_cuda() &&
+                    g_t.is_cuda() && beta_t.is_cuda() && state0_t.is_cuda(),
+                "all inputs must be CUDA");
+    TORCH_CHECK(q_t.scalar_type() == torch::kBFloat16 &&
+                    k_t.scalar_type() == torch::kBFloat16 &&
+                    v_t.scalar_type() == torch::kBFloat16,
+                "q, k, v must be bf16");
+    TORCH_CHECK(g_t.scalar_type() == torch::kFloat32 &&
+                    beta_t.scalar_type() == torch::kFloat32 &&
+                    state0_t.scalar_type() == torch::kFloat32,
+                "g, beta, state0 must be float32");
+    TORCH_CHECK(q_t.dim() == 3 && k_t.dim() == 3 && v_t.dim() == 3, "q/k/v must be [T,NH,K/V]");
+    TORCH_CHECK(g_t.dim() == 2 && beta_t.dim() == 2, "g and beta must be [T,NH]");
+    TORCH_CHECK(state0_t.dim() == 3, "state0 must be [NH,K,V]");
+    TORCH_CHECK(q_t.sizes() == k_t.sizes(), "q/k shape mismatch");
+    int T = (int)q_t.size(0);
+    int NH = (int)q_t.size(1);
+    int K = (int)q_t.size(2);
+    int V = (int)v_t.size(2);
+    TORCH_CHECK((int)v_t.size(0) == T && (int)v_t.size(1) == NH, "v shape mismatch");
+    TORCH_CHECK((int)g_t.size(0) == T && (int)g_t.size(1) == NH, "g shape mismatch");
+    TORCH_CHECK((int)beta_t.size(0) == T && (int)beta_t.size(1) == NH, "beta shape mismatch");
+    TORCH_CHECK((int)state0_t.size(0) == NH && (int)state0_t.size(1) == K && (int)state0_t.size(2) == V,
+                "state0 shape mismatch");
+    TORCH_CHECK(K == 32 * GDN_BK, "recurrent train kernel currently requires K == ", 32 * GDN_BK);
+    TORCH_CHECK(V % GDN_BV == 0, "V must align with GDN_BV");
+    (void)scale;
+
+    auto o_out = torch::empty({T, NH, V}, torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+    auto stateT = torch::empty_like(state0_t);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    int total_tiles = NH * (V / GDN_BV);
+    k_gdn_recurrent_train<<<total_tiles, 32, 0, stream>>>(
+        (__nv_bfloat16*)q_t.data_ptr(),
+        (__nv_bfloat16*)k_t.data_ptr(),
+        (__nv_bfloat16*)v_t.data_ptr(),
+        g_t.data_ptr<float>(),
+        beta_t.data_ptr<float>(),
+        state0_t.data_ptr<float>(),
+        (__nv_bfloat16*)o_out.data_ptr(),
+        stateT.data_ptr<float>(),
+        T, NH, K, V);
+    return {o_out, stateT};
+}
+
+std::vector<torch::Tensor> gdn_recurrent_backward(
+    torch::Tensor grad_o_t,
+    torch::Tensor grad_stateT_t,
+    torch::Tensor q_t,
+    torch::Tensor k_t,
+    torch::Tensor v_t,
+    torch::Tensor g_t,
+    torch::Tensor beta_t,
+    torch::Tensor stateT_t,
+    double scale) {
+    TORCH_CHECK(grad_o_t.is_cuda() && grad_stateT_t.is_cuda() &&
+                    q_t.is_cuda() && k_t.is_cuda() && v_t.is_cuda() &&
+                    g_t.is_cuda() && beta_t.is_cuda() && stateT_t.is_cuda(),
+                "all inputs must be CUDA");
+    TORCH_CHECK(grad_o_t.scalar_type() == torch::kBFloat16 &&
+                    q_t.scalar_type() == torch::kBFloat16 &&
+                    k_t.scalar_type() == torch::kBFloat16 &&
+                    v_t.scalar_type() == torch::kBFloat16,
+                "grad_o, q, k, v must be bf16");
+    TORCH_CHECK(grad_stateT_t.scalar_type() == torch::kFloat32 &&
+                    g_t.scalar_type() == torch::kFloat32 &&
+                    beta_t.scalar_type() == torch::kFloat32 &&
+                    stateT_t.scalar_type() == torch::kFloat32,
+                "grad_stateT, g, beta, stateT must be float32");
+    TORCH_CHECK(q_t.dim() == 3 && k_t.dim() == 3 && v_t.dim() == 3, "q/k/v must be [T,NH,K/V]");
+    TORCH_CHECK(grad_o_t.dim() == 3 && grad_stateT_t.dim() == 3, "grad_o/state must be rank 3");
+    TORCH_CHECK(q_t.sizes() == k_t.sizes(), "q/k shape mismatch");
+    int T = (int)q_t.size(0);
+    int NH = (int)q_t.size(1);
+    int K = (int)q_t.size(2);
+    int V = (int)v_t.size(2);
+    TORCH_CHECK((int)v_t.size(0) == T && (int)v_t.size(1) == NH, "v shape mismatch");
+    TORCH_CHECK((int)grad_o_t.size(0) == T && (int)grad_o_t.size(1) == NH && (int)grad_o_t.size(2) == V,
+                "grad_o shape mismatch");
+    TORCH_CHECK((int)g_t.size(0) == T && (int)g_t.size(1) == NH, "g shape mismatch");
+    TORCH_CHECK((int)beta_t.size(0) == T && (int)beta_t.size(1) == NH, "beta shape mismatch");
+    TORCH_CHECK((int)stateT_t.size(0) == NH && (int)stateT_t.size(1) == K && (int)stateT_t.size(2) == V,
+                "stateT shape mismatch");
+    TORCH_CHECK(grad_stateT_t.sizes() == stateT_t.sizes(), "grad_stateT/stateT mismatch");
+    TORCH_CHECK(K == 32 * GDN_BK, "recurrent backward kernel currently requires K == ", 32 * GDN_BK);
+    TORCH_CHECK(V % GDN_BV == 0, "V must align with GDN_BV");
+    (void)scale;
+
+    auto dq_accum = torch::zeros({T, NH, K}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    auto dk_accum = torch::zeros({T, NH, K}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    auto dv_accum = torch::zeros({T, NH, V}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    auto dg_out = torch::zeros_like(g_t);
+    auto dbeta_out = torch::zeros_like(beta_t);
+    auto dstate0 = torch::zeros_like(stateT_t);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    int total_tiles = NH * (V / GDN_BV);
+    k_gdn_recurrent_bwd<<<total_tiles, 32, 0, stream>>>(
+        (__nv_bfloat16*)grad_o_t.data_ptr(),
+        grad_stateT_t.data_ptr<float>(),
+        (__nv_bfloat16*)q_t.data_ptr(),
+        (__nv_bfloat16*)k_t.data_ptr(),
+        (__nv_bfloat16*)v_t.data_ptr(),
+        g_t.data_ptr<float>(),
+        beta_t.data_ptr<float>(),
+        stateT_t.data_ptr<float>(),
+        dq_accum.data_ptr<float>(),
+        dk_accum.data_ptr<float>(),
+        dv_accum.data_ptr<float>(),
+        dg_out.data_ptr<float>(),
+        dbeta_out.data_ptr<float>(),
+        dstate0.data_ptr<float>(),
+        T, NH, K, V);
+    auto dq = dq_accum.to(torch::kBFloat16);
+    auto dk = dk_accum.to(torch::kBFloat16);
+    auto dv = dv_accum.to(torch::kBFloat16);
+    return {dq, dk, dv, dg_out, dbeta_out, dstate0};
+}
+
+std::vector<torch::Tensor> gdn_rmsnorm_silu_gate_train(
+    torch::Tensor rec_out_t,
+    torch::Tensor gate_t,
+    torch::Tensor weight_t,
+    double eps) {
+    TORCH_CHECK(rec_out_t.is_cuda() && gate_t.is_cuda() && weight_t.is_cuda(),
+                "all inputs must be CUDA");
+    TORCH_CHECK(rec_out_t.scalar_type() == torch::kBFloat16 &&
+                    gate_t.scalar_type() == torch::kBFloat16,
+                "rec_out and gate must be bf16");
+    TORCH_CHECK(weight_t.scalar_type() == torch::kFloat32 ||
+                    weight_t.scalar_type() == torch::kBFloat16,
+                "weight must be float32 or bf16");
+    TORCH_CHECK(rec_out_t.dim() == 3 && gate_t.dim() == 3, "rec_out and gate must be [T,NH,Vhd]");
+    TORCH_CHECK(weight_t.dim() == 1, "weight must be [Vhd]");
+    TORCH_CHECK(rec_out_t.sizes() == gate_t.sizes(), "rec_out/gate shape mismatch");
+    int T = (int)rec_out_t.size(0);
+    int NH = (int)rec_out_t.size(1);
+    int Vhd = (int)rec_out_t.size(2);
+    TORCH_CHECK((int)weight_t.numel() == Vhd, "weight size mismatch");
+    auto rec_c = rec_out_t.contiguous();
+    auto gate_c = gate_t.contiguous();
+    auto weight_f = weight_t.scalar_type() == torch::kFloat32
+        ? weight_t.contiguous()
+        : weight_t.to(torch::kFloat32).contiguous();
+    auto out = torch::empty_like(rec_out_t);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    k_gdn_rmsnorm_silu_gate<<<T * NH, 256, 0, stream>>>(
+        (__nv_bfloat16*)rec_c.data_ptr(),
+        (__nv_bfloat16*)gate_c.data_ptr(),
+        weight_f.data_ptr<float>(),
+        (__nv_bfloat16*)out.data_ptr(),
+        T, NH, Vhd);
+    return {out};
+}
+
+std::vector<torch::Tensor> gdn_rmsnorm_silu_gate_backward(
+    torch::Tensor grad_out_t,
+    torch::Tensor rec_out_t,
+    torch::Tensor gate_t,
+    torch::Tensor weight_t,
+    double eps) {
+    TORCH_CHECK(grad_out_t.is_cuda() && rec_out_t.is_cuda() && gate_t.is_cuda() && weight_t.is_cuda(),
+                "all inputs must be CUDA");
+    TORCH_CHECK(grad_out_t.scalar_type() == torch::kBFloat16 &&
+                    rec_out_t.scalar_type() == torch::kBFloat16 &&
+                    gate_t.scalar_type() == torch::kBFloat16,
+                "grad_out, rec_out and gate must be bf16");
+    TORCH_CHECK(weight_t.scalar_type() == torch::kFloat32 ||
+                    weight_t.scalar_type() == torch::kBFloat16,
+                "weight must be float32 or bf16");
+    TORCH_CHECK(grad_out_t.dim() == 3 && rec_out_t.dim() == 3 && gate_t.dim() == 3,
+                "grad_out, rec_out and gate must be [T,NH,Vhd]");
+    TORCH_CHECK(grad_out_t.sizes() == rec_out_t.sizes() && rec_out_t.sizes() == gate_t.sizes(),
+                "shape mismatch");
+    int T = (int)rec_out_t.size(0);
+    int NH = (int)rec_out_t.size(1);
+    int Vhd = (int)rec_out_t.size(2);
+    TORCH_CHECK((int)weight_t.numel() == Vhd, "weight size mismatch");
+    auto grad_c = grad_out_t.contiguous();
+    auto rec_c = rec_out_t.contiguous();
+    auto gate_c = gate_t.contiguous();
+    auto weight_f = weight_t.scalar_type() == torch::kFloat32
+        ? weight_t.contiguous()
+        : weight_t.to(torch::kFloat32).contiguous();
+    auto drec = torch::empty_like(rec_out_t);
+    auto dgate = torch::empty_like(gate_t);
+    auto dweight_f = torch::zeros({Vhd}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    k_gdn_rmsnorm_silu_gate_bwd<<<T * NH, 256, 0, stream>>>(
+        (__nv_bfloat16*)grad_c.data_ptr(),
+        (__nv_bfloat16*)rec_c.data_ptr(),
+        (__nv_bfloat16*)gate_c.data_ptr(),
+        weight_f.data_ptr<float>(),
+        (__nv_bfloat16*)drec.data_ptr(),
+        (__nv_bfloat16*)dgate.data_ptr(),
+        dweight_f.data_ptr<float>(),
+        T, NH, Vhd, (float)eps);
+    auto dweight = weight_t.scalar_type() == torch::kFloat32 ? dweight_f : dweight_f.to(weight_t.scalar_type());
+    return {drec, dgate, dweight};
 }
 
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
@@ -5901,7 +7519,8 @@ debug_compare_ffn1_fp4_producers_impl(
                  ref_mid.data_ptr(),
                  g_gemm_ws, g_gemm_ws_bytes,
                  1.f, 0.f, stream,
-                 bias_bf16.data_ptr());
+                 nullptr);
+    ref_mid = ref_mid + bias_bf16.unsqueeze(0);
 
     int rows_padded = fp4_scale_rows(M);
     int scale_cols = fp4_scale_cols(N);
@@ -6139,6 +7758,61 @@ debug_compare_ffn1_fp4_blockscale_only_e8m0(
     CK(cudaStreamSynchronize(stream));
     return {ref_mid, fused_packed, fused_scales};
 }
+
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+debug_compare_ffn1_fp8_producer(
+    torch::Tensor w_t,
+    torch::Tensor act_t,
+    torch::Tensor bias_t) {
+    TORCH_CHECK(w_t.is_cuda() && act_t.is_cuda() && bias_t.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(w_t.scalar_type() == torch::kBFloat16 &&
+                act_t.scalar_type() == torch::kBFloat16 &&
+                bias_t.scalar_type() == torch::kBFloat16,
+                "inputs must be bf16");
+    TORCH_CHECK(w_t.dim() == 2 && act_t.dim() == 2 && bias_t.dim() == 1,
+                "expected w[N,K], act[M,K], bias[N]");
+    auto w_bf16 = w_t.contiguous();
+    auto act_bf16 = act_t.contiguous();
+    auto bias_bf16 = bias_t.contiguous();
+    int N = (int)w_bf16.size(0);
+    int K = (int)w_bf16.size(1);
+    int M = (int)act_bf16.size(0);
+    TORCH_CHECK((int)act_bf16.size(1) == K, "K mismatch");
+    TORCH_CHECK((int)bias_bf16.numel() == N, "bias size mismatch");
+
+    ensure_gemm_runtime();
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    auto opts_fp8 = torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA);
+
+    auto w_fp8 = w_bf16.to(torch::kFloat8_e4m3fn).contiguous();
+    auto act_fp8 = act_bf16.to(torch::kFloat8_e4m3fn).contiguous();
+
+    auto ref_mid = torch::zeros({M, N}, opts_bf16);
+    auto ref_fp8 = torch::zeros({M, N}, opts_fp8);
+    auto fused_fp8 = torch::zeros({M, N}, opts_fp8);
+
+    FP8Gemm ref_gemm;
+    ref_gemm.setup(g_ltH, M, N, K, g_scaleA, g_scaleB, g_gemm_ws, g_gemm_ws_bytes, 0);
+    ref_gemm.run(g_ltH,
+                 w_fp8.data_ptr(),
+                 act_fp8.data_ptr(),
+                 ref_mid.data_ptr(),
+                 g_gemm_ws, g_gemm_ws_bytes,
+                 1.f, 0.f, stream,
+                 bias_bf16.data_ptr());
+    k_silu_to_fp8<<<8 * g_nsm, 256, 0, stream>>>(
+        (__nv_bfloat16*)ref_mid.data_ptr(),
+        (__nv_fp8_e4m3*)ref_fp8.data_ptr(),
+        (size_t)M * (size_t)N);
+
+    CutlassFusedFfn1 fused;
+    fused.setup(M, N, K);
+    fused.run(w_fp8.data_ptr(), act_fp8.data_ptr(), fused_fp8.data_ptr(), (__nv_bfloat16*)bias_bf16.data_ptr(), stream);
+
+    CK(cudaStreamSynchronize(stream));
+    return {ref_mid, ref_fp8, fused_fp8};
+}
 #endif
 
 // ============================================================
@@ -6161,6 +7835,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("set_ca_kv_cache_valid", &engine_set_ca_kv_cache_valid,
           "Mark CA K/V cache as valid with actual context length",
           py::arg("valid"), py::arg("actual_ctx"));
+    m.def("release_loaded_weights", &engine_release_loaded_weights,
+          "Release engine-resident weight copies");
     m.def("forward", &engine_forward,
           "Forward pass through a range of quadratic layers (skips GatedDeltaNet layers).",
           py::arg("x_t"), py::arg("enc_t"), py::arg("temb_t"), py::arg("ssts_t"),
@@ -6184,6 +7860,46 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Skip all CA operations in engine (let Python handle cross-attention)");
     m.def("set_use_graph", &set_use_graph, "Enable/disable CUDA graph capture");
     m.def("get_buf", &get_buf, "Get a clone of an internal buffer by name");
+    m.def("gate_residual_ssts_train", &gate_residual_ssts_train,
+          "Out-of-place training forward for out = x + y * (ssts_gate + temb_gate)");
+    m.def("gate_residual_ssts_backward", &gate_residual_ssts_backward,
+          "Backward for out = x + y * (ssts_gate + temb_gate)");
+    m.def("ln_adaln_ssts_train", &ln_adaln_ssts_train,
+          "Out-of-place training forward for AdaLN+SSTS");
+    m.def("ln_adaln_ssts_backward", &ln_adaln_ssts_backward,
+          "Backward for AdaLN+SSTS");
+    m.def("linear_bf16_train", &linear_bf16_train,
+          "Out-of-place training forward for bf16 linear");
+    m.def("linear_bf16_backward", &linear_bf16_backward,
+          "Backward for bf16 linear");
+    m.def("rmsnorm_train", &rmsnorm_train,
+          "Out-of-place training forward for RMSNorm");
+    m.def("rmsnorm_backward", &rmsnorm_backward,
+          "Backward for RMSNorm");
+    m.def("layernorm_affine_train", &layernorm_affine_train,
+          "Out-of-place training forward for LayerNorm + affine");
+    m.def("layernorm_affine_backward", &layernorm_affine_backward,
+          "Backward for LayerNorm + affine");
+    m.def("gdn_l2norm_scale_train", &gdn_l2norm_scale_train,
+          "Out-of-place training forward for GDN q/k L2 normalization");
+    m.def("gdn_l2norm_scale_backward", &gdn_l2norm_scale_backward,
+          "Backward for GDN q/k L2 normalization");
+    m.def("gdn_causal_conv_silu_train", &gdn_causal_conv_silu_train,
+          "Out-of-place training forward for GDN causal depthwise conv + SiLU");
+    m.def("gdn_causal_conv_silu_backward", &gdn_causal_conv_silu_backward,
+          "Backward for GDN causal depthwise conv + SiLU");
+    m.def("gdn_compute_gates_train", &gdn_compute_gates_train,
+          "Out-of-place training forward for GDN gate/beta computation");
+    m.def("gdn_compute_gates_backward", &gdn_compute_gates_backward,
+          "Backward for GDN gate/beta computation");
+    m.def("gdn_recurrent_train", &gdn_recurrent_train,
+          "Out-of-place training forward for GDN recurrent core");
+    m.def("gdn_recurrent_backward", &gdn_recurrent_backward,
+          "Backward for GDN recurrent core");
+    m.def("gdn_rmsnorm_silu_gate_train", &gdn_rmsnorm_silu_gate_train,
+          "Out-of-place training forward for GDN output RMSNorm + SiLU gate");
+    m.def("gdn_rmsnorm_silu_gate_backward", &gdn_rmsnorm_silu_gate_backward,
+          "Backward for GDN output RMSNorm + SiLU gate");
     m.def("set_gdn_cublas_chunk", &engine_set_gdn_cublas_chunk,
           "Toggle cuBLASLt chunk GDN (true) vs fused recurrent (false)",
           py::arg("enable") = true);
@@ -6337,6 +8053,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               return debug_compare_ffn1_fp4_blockscale_only_e8m0(w_t, act_t, norm_constant);
           },
           "Debug helper: compare blockscale-only FP4 producer with UE8M0 scales vs raw GEMM reference");
+    m.def("debug_compare_ffn1_fp8_producer",
+          [](torch::Tensor w_t, torch::Tensor act_t, torch::Tensor bias_t) {
+              return debug_compare_ffn1_fp8_producer(w_t, act_t, bias_t);
+          },
+          "Debug helper: compare fused FFN1 FP8 producer vs engine-style FP8 GEMM + SiLU->FP8 reference");
 #endif
     m.def("run_fp4_gemm_packed",
           [](torch::Tensor w_packed, torch::Tensor w_swizzled,
