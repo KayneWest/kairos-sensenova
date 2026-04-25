@@ -46,14 +46,28 @@ __device__ __forceinline__ void load_bf16x8_to_f32(const __nv_bfloat16* src, flo
     }
 }
 
+__device__ __forceinline__ void load_bf16x8_to_f32_broadcast(const __nv_bfloat16* src, int lane, float* dst) {
+    float pair_vals[2] = {0.0f, 0.0f};
+    if (lane < 4) {
+        __nv_bfloat162 pair = reinterpret_cast<const __nv_bfloat162*>(src)[lane];
+        float2 fp = __bfloat1622float2(pair);
+        pair_vals[0] = fp.x;
+        pair_vals[1] = fp.y;
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        dst[2 * i] = __shfl_sync(0xffffffff, pair_vals[0], i);
+        dst[2 * i + 1] = __shfl_sync(0xffffffff, pair_vals[1], i);
+    }
+}
+
 static __device__ int g_gdn_work_counter;
 
 __global__ void __launch_bounds__(32 * GDN_WARPS_PER_CTA) k_gdn_recurrent_only(
     const __nv_bfloat16* __restrict__ q,   // [T, NH, K]
     const __nv_bfloat16* __restrict__ k,   // [T, NH, K]
     const __nv_bfloat16* __restrict__ v,   // [T, NH, V]
-    const float* __restrict__ g,           // [T, NH]
-    const float* __restrict__ beta,        // [T, NH]
+    const float2* __restrict__ gbeta,      // [T, NH]
     __nv_bfloat16* __restrict__ o,         // [T, NH, V]
     float* __restrict__ state,             // [NH, K, V]
     int T, int NH, int K, int V, int total_work) {
@@ -125,8 +139,9 @@ __global__ void __launch_bounds__(32 * GDN_WARPS_PER_CTA) k_gdn_recurrent_only(
             load_bf16x8_to_f32(k + qk_base + k_off, my_k);
             load_bf16x8_to_f32(q + qk_base + k_off, my_q);
 #endif
-            float curr_gt = (lane == 0) ? g[(size_t)t * NH + h] : 0.0f;
-            float curr_bt = (lane == 0) ? beta[(size_t)t * NH + h] : 0.0f;
+            float2 curr_gb = (lane == 0) ? gbeta[(size_t)t * NH + h] : make_float2(0.0f, 0.0f);
+            float curr_gt = curr_gb.x;
+            float curr_bt = curr_gb.y;
             curr_gt = __shfl_sync(0xffffffff, curr_gt, 0);
             curr_bt = __shfl_sync(0xffffffff, curr_bt, 0);
             float qk_dot = 0.0f;
@@ -173,7 +188,7 @@ __global__ void __launch_bounds__(32 * GDN_WARPS_PER_CTA) k_gdn_recurrent_only(
             }
 
             float v_vals[GDN_BV];
-            load_bf16x8_to_f32(v + v_base + v_off, v_vals);
+            load_bf16x8_to_f32_broadcast(v + v_base + v_off, lane, v_vals);
             float ov[GDN_BV];
             #pragma unroll
             for (int vi = 0; vi < GDN_BV; vi++) {
@@ -355,25 +370,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run_gdn_recurrent", [](torch::Tensor q_t,
                                   torch::Tensor k_t,
                                   torch::Tensor v_t,
-                                  torch::Tensor g_t,
-                                  torch::Tensor beta_t) {
+                                  torch::Tensor gbeta_t) {
         TORCH_CHECK(q_t.is_cuda() && k_t.is_cuda() && v_t.is_cuda() &&
-                    g_t.is_cuda() && beta_t.is_cuda(), "inputs must be CUDA");
+                    gbeta_t.is_cuda(), "inputs must be CUDA");
         TORCH_CHECK(q_t.scalar_type() == torch::kBFloat16 &&
                     k_t.scalar_type() == torch::kBFloat16 &&
                     v_t.scalar_type() == torch::kBFloat16, "q/k/v must be bf16");
-        TORCH_CHECK(g_t.scalar_type() == torch::kFloat32 &&
-                    beta_t.scalar_type() == torch::kFloat32, "g/beta must be f32");
+        TORCH_CHECK(gbeta_t.scalar_type() == torch::kFloat32, "gbeta must be f32");
         TORCH_CHECK(q_t.dim() == 3 && k_t.dim() == 3 && v_t.dim() == 3, "q/k/v must be [T,NH,K/V]");
-        TORCH_CHECK(g_t.dim() == 2 && beta_t.dim() == 2, "g/beta must be [T,NH]");
+        TORCH_CHECK(gbeta_t.dim() == 3 && gbeta_t.size(2) == 2, "gbeta must be [T,NH,2]");
         int T = (int)q_t.size(0);
         int NH = (int)q_t.size(1);
         int K = (int)q_t.size(2);
         int V = (int)v_t.size(2);
         TORCH_CHECK((int)k_t.size(0) == T && (int)k_t.size(1) == NH && (int)k_t.size(2) == K, "k shape mismatch");
         TORCH_CHECK((int)v_t.size(0) == T && (int)v_t.size(1) == NH, "v shape mismatch");
-        TORCH_CHECK((int)g_t.size(0) == T && (int)g_t.size(1) == NH, "g shape mismatch");
-        TORCH_CHECK((int)beta_t.size(0) == T && (int)beta_t.size(1) == NH, "beta shape mismatch");
+        TORCH_CHECK((int)gbeta_t.size(0) == T && (int)gbeta_t.size(1) == NH, "gbeta shape mismatch");
         TORCH_CHECK(K == 256, "standalone kernel currently assumes K == 256");
         TORCH_CHECK(V % GDN_BV == 0, "V must be aligned to GDN_BV");
 
@@ -391,7 +403,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         int n_persistent = std::min(total_work, prop.multiProcessorCount * GDN_PERSISTENT_BLOCKS_PER_SM);
         k_gdn_recurrent_only<<<n_persistent, 32 * warps_per_cta, 0, stream>>>(
             (__nv_bfloat16*)q_t.data_ptr(), (__nv_bfloat16*)k_t.data_ptr(), (__nv_bfloat16*)v_t.data_ptr(),
-            (float*)g_t.data_ptr(), (float*)beta_t.data_ptr(),
+            (float2*)gbeta_t.data_ptr(),
             (__nv_bfloat16*)o_out.data_ptr(), (float*)state.data_ptr(),
             T, NH, K, V, total_work);
         CK(cudaGetLastError());

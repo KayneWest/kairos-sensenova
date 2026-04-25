@@ -98,14 +98,15 @@ def run_reference(q, k, v, g, beta):
 
 
 def benchmark(ext, q, k, v, g, beta, iters: int, warmup: int):
+    gbeta = torch.stack((g, beta), dim=-1).contiguous()
     for _ in range(warmup):
-        ext.run_gdn_recurrent(q, k, v, g, beta)
+        ext.run_gdn_recurrent(q, k, v, gbeta)
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
-        out, state = ext.run_gdn_recurrent(q, k, v, g, beta)
+        out, state = ext.run_gdn_recurrent(q, k, v, gbeta)
     end.record()
     end.synchronize()
     return out, state, start.elapsed_time(end) / iters
@@ -113,7 +114,8 @@ def benchmark(ext, q, k, v, g, beta, iters: int, warmup: int):
 
 def correctness(ext, q, k, v, g, beta):
     out_ref, state_ref = run_reference(q, k, v, g, beta)
-    out, state = ext.run_gdn_recurrent(q, k, v, g, beta)
+    gbeta = torch.stack((g, beta), dim=-1).contiguous()
+    out, state = ext.run_gdn_recurrent(q, k, v, gbeta)
     out_cos = torch.nn.functional.cosine_similarity(
         out_ref.flatten().float().unsqueeze(0), out.flatten().float().unsqueeze(0)
     ).item()
