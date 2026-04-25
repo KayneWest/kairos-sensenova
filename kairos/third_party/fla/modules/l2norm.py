@@ -8,13 +8,18 @@ import triton.language as tl
 
 from kairos.third_party.fla.utils import autotune_cache_kwargs, input_guard, is_amd
 
-from kairos.modules.utils import FLAGS_KAIROS_IS_METAX
+from kairos.modules.utils import FLAGS_KAIROS_CUDA_SM, FLAGS_KAIROS_IS_METAX
 
 if FLAGS_KAIROS_IS_METAX:
     BT_LIST = [8, 16, 32, 64] 
+elif FLAGS_KAIROS_CUDA_SM in [120, 121]:
+    BT_LIST = [8]
 else:
     BT_LIST = [8, 16, 32, 64, 128]
-NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if is_amd else [1, 2, 4, 8, 16, 32]
+if FLAGS_KAIROS_CUDA_SM in [120, 121]:
+    NUM_WARPS_AUTOTUNE = [1, 2]
+else:
+    NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if is_amd else [1, 2, 4, 8, 16, 32]
 
 
 @triton.autotune(
@@ -83,7 +88,7 @@ def l2norm_bwd_kernel1(
 @triton.autotune(
     configs=[
         triton.Config({'BT': BT}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8, 16]
+        for num_warps in NUM_WARPS_AUTOTUNE
         for BT in BT_LIST
     ],
     key=['D', 'NB'],
@@ -117,7 +122,7 @@ def l2norm_fwd_kernel(
 @triton.autotune(
     configs=[
         triton.Config({'BT': BT}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8, 16]
+        for num_warps in NUM_WARPS_AUTOTUNE
         for BT in BT_LIST
     ],
     key=['D', 'NB'],

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers.activations import ACT2CLS
 from apex.normalization.fused_layer_norm import FusedRMSNorm
+from .common import sinusoidal_embedding_1d
 
 FLASH_ATTN_2_AVAILABLE = False
 FLASH_ATTN_3_AVAILABLE = False
@@ -306,13 +307,6 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
     x.mul_(1 + scale)
     x.add_(shift)
     return x
-
-
-def sinusoidal_embedding_1d(dim, position):
-    sinusoid = torch.outer(position.type(torch.float64), torch.pow(
-        10000, -torch.arange(dim//2, dtype=torch.float64, device=position.device).div(dim//2)))
-    x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
-    return x.to(position.dtype)
 
 
 def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):

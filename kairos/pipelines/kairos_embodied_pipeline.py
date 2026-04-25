@@ -12,7 +12,7 @@ from typing_extensions import Literal
 
 from .base_pipeline import BasePipeline, PipelineUnit, PipelineUnitRunner
 from kairos.modules.utils import load_state_dict, init_weights_on_device
-from kairos.modules.dits import sinusoidal_embedding_1d
+from kairos.modules.dits.common import sinusoidal_embedding_1d
 from kairos.modules.vaes import WanVideoVAE
 from kairos.modules.text_encoders import QwenVLTextEncoder
 from kairos.modules.schedulers.flow_match import FlowMatchScheduler

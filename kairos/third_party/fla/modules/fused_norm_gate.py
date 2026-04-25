@@ -10,7 +10,18 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from kairos.modules.utils import FLAGS_KAIROS_CUDA_SM
 from kairos.third_party.fla.utils import autotune_cache_kwargs, get_multiprocessor_count, input_guard
+
+
+if FLAGS_KAIROS_CUDA_SM in [120, 121]:
+    _FUSED_NORM_GATE_BLOCK_BT = [16]
+    _FUSED_NORM_GATE_BLOCK_WARPS = [4]
+    _FUSED_NORM_GATE_ROW_WARPS = [2]
+else:
+    _FUSED_NORM_GATE_BLOCK_BT = [16, 32, 64]
+    _FUSED_NORM_GATE_BLOCK_WARPS = [4, 8, 16]
+    _FUSED_NORM_GATE_ROW_WARPS = [2, 4, 8, 16]
 
 
 @triton.heuristics({
@@ -22,8 +33,8 @@ from kairos.third_party.fla.utils import autotune_cache_kwargs, get_multiprocess
 @triton.autotune(
     configs=[
         triton.Config({'BT': BT}, num_warps=num_warps)
-        for BT in [16, 32, 64]
-        for num_warps in [4, 8, 16]
+        for BT in _FUSED_NORM_GATE_BLOCK_BT
+        for num_warps in _FUSED_NORM_GATE_BLOCK_WARPS
     ],
     key=['D', 'NB', 'IS_RMS_NORM', 'STORE_RESIDUAL_OUT', 'HAS_RESIDUAL', 'HAS_WEIGHT'],
     **autotune_cache_kwargs,
@@ -110,7 +121,7 @@ def layer_norm_gated_fwd_kernel(
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps)
-        for num_warps in [2, 4, 8, 16]
+        for num_warps in _FUSED_NORM_GATE_ROW_WARPS
     ],
     key=['D', 'IS_RMS_NORM', 'STORE_RESIDUAL_OUT', 'HAS_RESIDUAL', 'HAS_WEIGHT'],
     **autotune_cache_kwargs,
@@ -192,8 +203,8 @@ def layer_norm_gated_fwd_kernel1(
 @triton.autotune(
     configs=[
         triton.Config({'BT': BT}, num_warps=num_warps)
-        for BT in [16, 32, 64]
-        for num_warps in [4, 8, 16]
+        for BT in _FUSED_NORM_GATE_BLOCK_BT
+        for num_warps in _FUSED_NORM_GATE_BLOCK_WARPS
     ],
     key=['D', 'NB', 'IS_RMS_NORM', 'HAS_DRESIDUAL', 'HAS_WEIGHT'],
     **autotune_cache_kwargs,
@@ -316,7 +327,7 @@ def layer_norm_gated_bwd_kernel(
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps)
-        for num_warps in [2, 4, 8, 16]
+        for num_warps in _FUSED_NORM_GATE_ROW_WARPS
     ],
     key=['D', 'IS_RMS_NORM', 'STORE_DRESIDUAL', 'HAS_DRESIDUAL', 'HAS_WEIGHT'],
     **autotune_cache_kwargs,

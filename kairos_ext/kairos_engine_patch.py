@@ -12,13 +12,76 @@ Usage:
 import os
 import time
 import types
+import glob
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from einops import rearrange
 
 _ext = None
 _native_train_ops = None
+
+
+def _prefer_current_py_paths(paths):
+    py_tag = f"python{sys.version_info.major}.{sys.version_info.minor}"
+
+    def _key(path):
+        return (py_tag not in path, path)
+
+    return sorted(paths, key=_key)
+
+
+def _detect_nvidia_pkg_paths(pkg_name, header_name, lib_glob):
+    prefix = os.environ.get("CONDA_PREFIX", "")
+    inc_dir = ""
+    lib_dir = ""
+    if not prefix:
+        return inc_dir, lib_dir
+
+    include_matches = []
+    lib_matches = []
+    for patt in (
+        os.path.join(prefix, "lib", "python*", "site-packages", "nvidia", pkg_name, "include"),
+        os.path.join(prefix, "**", "nvidia", pkg_name, "include"),
+    ):
+        include_matches.extend(glob.glob(patt, recursive=True))
+    for patt in (
+        os.path.join(prefix, "lib", "python*", "site-packages", "nvidia", pkg_name, "lib"),
+        os.path.join(prefix, "**", "nvidia", pkg_name, "lib"),
+    ):
+        lib_matches.extend(glob.glob(patt, recursive=True))
+
+    for match in _prefer_current_py_paths(set(include_matches)):
+        if os.path.isfile(os.path.join(match, header_name)):
+            inc_dir = match
+            break
+    for match in _prefer_current_py_paths(set(lib_matches)):
+        if glob.glob(os.path.join(match, lib_glob)):
+            lib_dir = match
+            break
+    return inc_dir, lib_dir
+
+
+def _detect_cudnn_paths():
+    cudnn_inc = os.environ.get("CUDNN_INC", "")
+    cudnn_lib = os.environ.get("CUDNN_LIB", "")
+    if not cudnn_inc or not cudnn_lib:
+        auto_inc, auto_lib = _detect_nvidia_pkg_paths("cudnn", "cudnn.h", "libcudnn.so*")
+        cudnn_inc = cudnn_inc or auto_inc
+        cudnn_lib = cudnn_lib or auto_lib
+    return cudnn_inc, cudnn_lib
+
+
+def _detect_nccl_root():
+    nccl_home = os.environ.get("NCCL_HOME", "/usr")
+    if nccl_home != "/usr":
+        return nccl_home
+    nccl_inc, nccl_lib = _detect_nvidia_pkg_paths("nccl", "nccl.h", "libnccl.so*")
+    if nccl_inc and nccl_lib:
+        return os.path.dirname(nccl_inc.rstrip("/"))
+    return nccl_home
 
 
 def get_ext():
@@ -41,14 +104,13 @@ def get_ext():
         os.path.join(sage_root, "sageattn3", "quantization", "fp4_quantization_4d.cu"),
     ]
     cudnn_fe = os.environ.get("CUDNN_FRONTEND", "/tmp/cudnn-frontend/include")
-    cudnn_inc = os.environ.get("CUDNN_INC", "")
-    cudnn_lib = os.environ.get("CUDNN_LIB", "")
+    cudnn_inc, cudnn_lib = _detect_cudnn_paths()
     if not cudnn_lib and cudnn_inc:
         cudnn_root = os.path.dirname(cudnn_inc.rstrip("/"))
         guessed_cudnn_lib = os.path.join(cudnn_root, "lib")
         if os.path.isdir(guessed_cudnn_lib):
             cudnn_lib = guessed_cudnn_lib
-    nccl_inc = os.environ.get("NCCL_HOME", "/usr")
+    nccl_inc = _detect_nccl_root()
     # CUTLASS headers for CuTe MMA atoms (tensor core chunk GDN kernel)
     cutlass_inc = os.environ.get("CUTLASS_INC",
         os.path.join(os.path.dirname(os.path.dirname(__file__)), "cutlass", "include"))
@@ -369,6 +431,91 @@ def _native_linear_rows(linear_bf16, x, linear):
     return y2.reshape(*orig_shape[:-1], y2.shape[-1])
 
 
+def _native_mlp_rows(layernorm_affine, linear_bf16, x, mlp):
+    if mlp.has_pos_emb:
+        x = x + mlp.emb_pos.to(dtype=x.dtype, device=x.device)
+    orig_shape = x.shape
+    x = x.reshape(-1, orig_shape[-1]).contiguous()
+    x = layernorm_affine(x, mlp.proj[0].weight, mlp.proj[0].bias, mlp.proj[0].eps)
+    x = _native_linear_rows(linear_bf16, x, mlp.proj[1])
+    x = torch.nn.functional.silu(x)
+    x = _native_linear_rows(linear_bf16, x, mlp.proj[3])
+    x = layernorm_affine(x, mlp.proj[4].weight, mlp.proj[4].bias, mlp.proj[4].eps)
+    return x.reshape(*orig_shape[:-1], x.shape[-1])
+
+
+def _build_2d_sincos_pos_embed(embed_dim: int, h: int, w: int, device=None, dtype=None):
+    assert embed_dim % 4 == 0, "embed_dim must be divisible by 4."
+    device = device or "cpu"
+    dtype = dtype or torch.float32
+    y = torch.arange(h, device=device, dtype=dtype)
+    x = torch.arange(w, device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    yy = yy.reshape(-1)
+    xx = xx.reshape(-1)
+    dim_each = embed_dim // 2
+    omega = torch.arange(dim_each // 2, device=device, dtype=dtype)
+    omega = 1.0 / (10000 ** (omega / (dim_each // 2)))
+    out_y = yy[:, None] * omega[None, :]
+    out_x = xx[:, None] * omega[None, :]
+    pos_y = torch.cat([torch.sin(out_y), torch.cos(out_y)], dim=1)
+    pos_x = torch.cat([torch.sin(out_x), torch.cos(out_x)], dim=1)
+    return torch.cat([pos_y, pos_x], dim=1).unsqueeze(0)
+
+
+def _native_pos_embed_2d(x, h, w):
+    pos = _build_2d_sincos_pos_embed(x.shape[-1], h, w, device=x.device, dtype=torch.float32)
+    return x + pos.to(x.dtype)
+
+
+def _native_attention_lse(qh, kh, attn_mask=None):
+    qf = rearrange(qh.float(), "b s n d -> b n s d")
+    kf = rearrange(kh.float(), "b s n d -> b n s d")
+    scale = qf.shape[-1] ** -0.5
+    scores = torch.einsum("bnsd,bntd->bnst", qf, kf) * scale
+    if attn_mask is not None:
+        scores = scores.masked_fill(~attn_mask.to(torch.bool), -float("inf"))
+    return torch.logsumexp(scores, dim=-1).transpose(1, 2).contiguous()
+
+
+def _native_quadratic_slice_reason(block, x, t_mod):
+    world = getattr(block, "world", 1)
+    if block.use_linear_attn:
+        return "linear_attn_block"
+    if x.dtype != torch.bfloat16:
+        return f"x_dtype={x.dtype}"
+    if x.dim() != 3:
+        return f"x_dim={x.dim()}"
+    if world > 1 and getattr(block, "use_tp_in_self_attn", False):
+        return "use_tp_in_self_attn"
+    if t_mod.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return f"t_mod_dtype={t_mod.dtype}"
+    return None
+
+
+def _native_gdn_slice_reason(block, x, t_mod):
+    world = getattr(block, "world", 1)
+    if not block.use_linear_attn:
+        return "quadratic_block"
+    if x.dtype != torch.bfloat16:
+        return f"x_dtype={x.dtype}"
+    if x.dim() != 3:
+        return f"x_dim={x.dim()}"
+    if world > 1:
+        if getattr(block, "use_tp_in_getaeddeltanet", False):
+            return "use_tp_in_getaeddeltanet"
+        if getattr(block, "use_seq_parallel", False):
+            if not (dist.is_available() and dist.is_initialized()):
+                return "dist_uninitialized"
+            if getattr(block, "context_group", None) is None:
+                return "context_group_none"
+        else:
+            return f"world={world}"
+    if t_mod.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return f"t_mod_dtype={t_mod.dtype}"
+    return None
+
+
 def _native_text_embedding(self, context, linear_bf16):
     context = _native_linear_rows(linear_bf16, context, self.text_embedding[0])
     context = torch.nn.functional.silu(context)
@@ -409,6 +556,86 @@ def _native_head_forward(self, x, t_mod, linear_bf16):
     return out
 
 
+def _native_conv_module(x, conv):
+    if isinstance(conv, nn.Conv2d):
+        return F.conv2d(
+            x,
+            conv.weight,
+            conv.bias,
+            stride=conv.stride,
+            padding=conv.padding,
+            dilation=conv.dilation,
+            groups=conv.groups,
+        )
+    if isinstance(conv, nn.Conv3d):
+        return F.conv3d(
+            x,
+            conv.weight,
+            conv.bias,
+            stride=conv.stride,
+            padding=conv.padding,
+            dilation=conv.dilation,
+            groups=conv.groups,
+        )
+    raise TypeError(f"Unsupported conv module type: {type(conv)!r}")
+
+
+def _native_patchify(self, x, control_camera_latents_input=None):
+    x = _native_conv_module(x, self.patch_embedding)
+    if self.control_adapter is not None and control_camera_latents_input is not None:
+        y_camera = self.control_adapter(control_camera_latents_input)
+        x = [u + v for u, v in zip(x, y_camera)]
+        x = x[0].unsqueeze(0)
+    grid_size = x.shape[2:]
+    return x, grid_size
+
+
+def _native_image_downsample(self, first_frame_latents):
+    x = first_frame_latents.squeeze(2)
+    for layer in self.image_downsample:
+        x = _native_conv_module(x, layer)
+    return x
+
+
+def _native_get_owner_chunk_info(chunk_id, chunk_size, local_seq_len):
+    global_start = chunk_id * chunk_size
+    owner_rank = global_start // local_seq_len
+    owner_local_start = global_start % local_seq_len
+    owner_local_end = owner_local_start + chunk_size
+    return owner_rank, owner_local_start, owner_local_end
+
+
+class _OwnerBroadcastFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x_chunk, owner_rank, group):
+        ctx.owner_rank = owner_rank
+        ctx.group = group
+        ctx.rank = dist.get_rank(group)
+        ctx.input_requires_grad = x_chunk.requires_grad
+
+        if ctx.rank == owner_rank:
+            out = x_chunk.clone()
+        else:
+            out = torch.empty_like(x_chunk)
+        dist.broadcast(out, src=owner_rank, group=group)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_owner = grad_output.contiguous()
+        dist.all_reduce(grad_owner, op=dist.ReduceOp.SUM, group=ctx.group)
+        if ctx.input_requires_grad:
+            return grad_owner, None, None
+        return None, None, None
+
+
+def _native_broadcast_from_owner(x_chunk, owner_rank, chunk_shape, dtype, device, group):
+    rank = dist.get_rank(group)
+    if rank != owner_rank:
+        x_chunk = torch.empty(chunk_shape, device=device, dtype=dtype, requires_grad=True)
+    return _OwnerBroadcastFn.apply(x_chunk, owner_rank, group)
+
+
 def _native_cross_attn_forward(block, x, context, context_mask, linear_bf16, rmsnorm, layernorm_affine, attention_core):
     ca = block.cross_attn
     x_rows = x.squeeze(0).contiguous()
@@ -418,20 +645,29 @@ def _native_cross_attn_forward(block, x, context, context_mask, linear_bf16, rms
         linear_bf16(ca_in, ca.q.weight, ca.q.bias),
         ca.norm_q.weight,
         ca.norm_q.eps,
-    ).unsqueeze(0)
-    ctx_rows = context.squeeze(0).contiguous()
+    )
+    qh = rearrange(q.unsqueeze(0), "b s (n d) -> b s n d", n=ca.num_heads)
+
+    ctx_full = context
+    img = None
+    ctx = ctx_full
+    if ca.has_image_input:
+        img = ctx_full[:, :257, :]
+        ctx = ctx_full[:, 257:, :]
+
+    ctx_rows = ctx.squeeze(0).contiguous()
     k = rmsnorm(
         linear_bf16(ctx_rows, ca.k.weight, ca.k.bias),
         ca.norm_k.weight,
         ca.norm_k.eps,
-    ).unsqueeze(0)
-    v = linear_bf16(ctx_rows, ca.v.weight, ca.v.bias).unsqueeze(0)
-    qh = rearrange(q, "b s (n d) -> b s n d", n=ca.num_heads)
-    kh = rearrange(k, "b s (n d) -> b s n d", n=ca.num_heads)
-    vh = rearrange(v, "b s (n d) -> b s n d", n=ca.num_heads)
+    )
+    v = linear_bf16(ctx_rows, ca.v.weight, ca.v.bias)
+    kh = rearrange(k.unsqueeze(0), "b s (n d) -> b s n d", n=ca.num_heads)
+    vh = rearrange(v.unsqueeze(0), "b s (n d) -> b s n d", n=ca.num_heads)
+
     attn_mask_local = context_mask
     if attn_mask_local is not None:
-        B, Lq, S = q.shape[0], q.shape[1], k.shape[1]
+        B, Lq, S = x.shape[0], x.shape[1], ctx.shape[1]
         attn_mask_local = attn_mask_local.view(B, 1, 1, S).expand(B, 1, Lq, S)
     attn_out = attention_core(
         qh,
@@ -440,6 +676,23 @@ def _native_cross_attn_forward(block, x, context, context_mask, linear_bf16, rms
         num_heads=ca.num_heads,
         attn_mask=attn_mask_local,
     )
+    if img is not None:
+        img_rows = img.squeeze(0).contiguous()
+        k_img = rmsnorm(
+            linear_bf16(img_rows, ca.k_img.weight, ca.k_img.bias),
+            ca.norm_k_img.weight,
+            ca.norm_k_img.eps,
+        )
+        v_img = linear_bf16(img_rows, ca.v_img.weight, ca.v_img.bias)
+        kh_img = rearrange(k_img.unsqueeze(0), "b s (n d) -> b s n d", n=ca.num_heads)
+        vh_img = rearrange(v_img.unsqueeze(0), "b s (n d) -> b s n d", n=ca.num_heads)
+        img_attn_out = attention_core(
+            qh,
+            kh_img,
+            vh_img,
+            num_heads=ca.num_heads,
+        )
+        attn_out = attn_out + img_attn_out
     attn_out = rearrange(attn_out, "b s n d -> b s (n d)", n=ca.num_heads)
     return linear_bf16(attn_out.squeeze(0).contiguous(), ca.o.weight, ca.o.bias).unsqueeze(0)
 
@@ -452,6 +705,9 @@ def _native_self_attn_forward(sa, input_x_local, freqs, L, linear_bf16, rmsnorm,
     k = rmsnorm(k.squeeze(0), sa.norm_k.weight, sa.norm_k.eps).unsqueeze(0)
     q = rope_apply_core(q, freqs, sa.num_heads)
     k = rope_apply_core(k, freqs, sa.num_heads)
+    if sa.attend_k0:
+        fk = k[:, :1]
+        fv = v[:, :1]
     dilated_length = sa.dilated_length
     use_dilated = dilated_length > 1 and q.shape[1] // (dilated_length * L) > 1
     pad_len = 0
@@ -465,6 +721,9 @@ def _native_self_attn_forward(sa, input_x_local, freqs, L, linear_bf16, rmsnorm,
         q = rearrange(q, "b (n d l) c -> (b d) (n l) c", l=L, d=dilated_length)
         k = rearrange(k, "b (n d l) c -> (b d) (n l) c", l=L, d=dilated_length)
         v = rearrange(v, "b (n d l) c -> (b d) (n l) c", l=L, d=dilated_length)
+        if sa.attend_k0:
+            fk = fk.unsqueeze(1).expand(-1, dilated_length, -1, -1).flatten(0, 1)
+            fv = fv.unsqueeze(1).expand(-1, dilated_length, -1, -1).flatten(0, 1)
     qh = rearrange(q, "b s (n d) -> b s n d", n=sa.num_heads)
     kh = rearrange(k, "b s (n d) -> b s n d", n=sa.num_heads)
     vh = rearrange(v, "b s (n d) -> b s n d", n=sa.num_heads)
@@ -475,6 +734,16 @@ def _native_self_attn_forward(sa, input_x_local, freqs, L, linear_bf16, rmsnorm,
         num_heads=sa.num_heads,
         window_size=(L * sa.window_size, L * sa.window_size),
     )
+    if sa.attend_k0:
+        fk_h = rearrange(fk, "b s (n d) -> b s n d", n=sa.num_heads)
+        fv_h = rearrange(fv, "b s (n d) -> b s n d", n=sa.num_heads)
+        softmax_scale = qh.shape[-1] ** -0.5
+        logits0 = (qh * fk_h).sum(dim=-1) * softmax_scale
+        lse = _native_attention_lse(qh, kh)
+        lse_total = torch.logaddexp(lse, logits0.float())
+        w_swa = torch.exp(lse - lse_total).to(attn_core.dtype).unsqueeze(-1)
+        w0 = torch.exp(logits0.float() - lse_total).to(attn_core.dtype).unsqueeze(-1)
+        attn_core = attn_core * w_swa + fv_h.expand_as(qh) * w0
     attn_core = rearrange(attn_core, "b s n d -> b s (n d)", n=sa.num_heads)
     if use_dilated:
         attn_core = rearrange(attn_core, "(b d) (n l) c -> b (n d l) c", l=L, d=dilated_length)
@@ -484,39 +753,11 @@ def _native_self_attn_forward(sa, input_x_local, freqs, L, linear_bf16, rmsnorm,
 
 
 def _can_use_native_quadratic_slices(block, x, t_mod):
-    if block.use_linear_attn:
-        return False
-    if x.dtype != torch.bfloat16:
-        return False
-    if x.dim() != 3 or x.shape[0] != 1:
-        return False
-    if getattr(block, "world", 1) != 1:
-        return False
-    if getattr(block, "use_seq_parallel", False):
-        return False
-    if getattr(block.self_attn, "attend_k0", False):
-        return False
-    if getattr(block.cross_attn, "has_image_input", False):
-        return False
-    if t_mod.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        return False
-    return True
+    return _native_quadratic_slice_reason(block, x, t_mod) is None
 
 
 def _can_use_native_gdn_slices(block, x, t_mod):
-    if not block.use_linear_attn:
-        return False
-    if x.dtype != torch.bfloat16:
-        return False
-    if x.dim() != 3 or x.shape[0] != 1:
-        return False
-    if getattr(block, "world", 1) != 1:
-        return False
-    if getattr(block, "use_seq_parallel", False):
-        return False
-    if t_mod.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        return False
-    return True
+    return _native_gdn_slice_reason(block, x, t_mod) is None
 
 
 def _run_quadratic_block_native_slices(block, x, context, t_mod, freqs, grid_size, context_mask=None):
@@ -525,7 +766,23 @@ def _run_quadratic_block_native_slices(block, x, context, t_mod, freqs, grid_siz
     (f, h, w) = grid_size
     B, _, D = x.shape
     if B != 1:
-        raise RuntimeError(f"native quadratic slices currently require batch size 1, got {B}")
+        outs = []
+        for b in range(B):
+            t_mod_b = t_mod[b:b + 1] if t_mod.shape[0] == B else t_mod
+            context_b = context[b:b + 1] if context.shape[0] == B else context
+            context_mask_b = context_mask[b:b + 1] if (context_mask is not None and context_mask.shape[0] == B) else context_mask
+            outs.append(
+                _run_quadratic_block_native_slices(
+                    block,
+                    x[b:b + 1],
+                    context_b,
+                    t_mod_b,
+                    freqs,
+                    grid_size,
+                    context_mask=context_mask_b,
+                )
+            )
+        return torch.cat(outs, dim=0)
     L = h * w
     has_seq = len(t_mod.shape) == 4
     chunk_dim = 2 if has_seq else 1
@@ -636,11 +893,26 @@ def _run_gdn_block_native_slices(block, x, context, t_mod, freqs, grid_size, con
         gdn_rmsnorm_silu_gate,
     ) = _get_native_train_ops()
 
-    del freqs
     (f, h, w) = grid_size
     B, _, D = x.shape
     if B != 1:
-        raise RuntimeError(f"native GDN slices currently require batch size 1, got {B}")
+        outs = []
+        for b in range(B):
+            t_mod_b = t_mod[b:b + 1] if t_mod.shape[0] == B else t_mod
+            context_b = context[b:b + 1] if context.shape[0] == B else context
+            context_mask_b = context_mask[b:b + 1] if (context_mask is not None and context_mask.shape[0] == B) else context_mask
+            outs.append(
+                _run_gdn_block_native_slices(
+                    block,
+                    x[b:b + 1],
+                    context_b,
+                    t_mod_b,
+                    freqs,
+                    grid_size,
+                    context_mask=context_mask_b,
+                )
+            )
+        return torch.cat(outs, dim=0)
     L = h * w
     has_seq = len(t_mod.shape) == 4
     chunk_dim = 2 if has_seq else 1
@@ -716,14 +988,72 @@ def _run_gdn_block_native_slices(block, x, context, t_mod, freqs, grid_size, con
         beta_vals = beta_vals * 2.0
 
     q_norm, k_norm = gdn_l2norm_scale(q_heads, k_heads, gdn.head_k_dim ** -0.5)
-    recurrent_out, _ = gdn_recurrent(
-        q_norm,
-        k_norm,
-        v_heads,
-        g_vals,
-        beta_vals,
-        scale=gdn.head_k_dim ** -0.5,
-    )
+    world = getattr(block, "world", 1)
+    if world > 1 and getattr(block, "use_seq_parallel", False):
+        group = getattr(block, "context_group", None)
+        rank = getattr(block, "context_group_rank", 0)
+        if not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError("Distributed must be initialized for multi-rank native GDN path.")
+        if group is None:
+            raise RuntimeError("context_group must be set for multi-rank native GDN path.")
+        local_seq_len = q_norm.shape[0]
+        chunk_size = local_seq_len
+        total_seq_len = local_seq_len * world
+        assert local_seq_len % chunk_size == 0
+        assert total_seq_len % chunk_size == 0
+        num_chunks = total_seq_len // chunk_size
+        recurrent_out = None
+        state = None
+        dummy_dep = None
+        for chunk_id in range(num_chunks):
+            owner_rank, owner_local_start, owner_local_end = _native_get_owner_chunk_info(
+                chunk_id=chunk_id,
+                chunk_size=chunk_size,
+                local_seq_len=local_seq_len,
+            )
+
+            def _owner_chunk(tensor):
+                local = tensor[owner_local_start:owner_local_end].contiguous() if rank == owner_rank else None
+                return _native_broadcast_from_owner(
+                    local,
+                    owner_rank=owner_rank,
+                    chunk_shape=(chunk_size, *tensor.shape[1:]),
+                    dtype=tensor.dtype,
+                    device=tensor.device,
+                    group=group,
+                )
+
+            q_chunk = _owner_chunk(q_norm)
+            k_chunk = _owner_chunk(k_norm)
+            v_chunk = _owner_chunk(v_heads)
+            g_chunk = _owner_chunk(g_vals)
+            beta_chunk = _owner_chunk(beta_vals)
+            out_chunk, state = gdn_recurrent(
+                q_chunk,
+                k_chunk,
+                v_chunk,
+                g_chunk,
+                beta_chunk,
+                state0=state,
+                scale=gdn.head_k_dim ** -0.5,
+            )
+            chunk_dep = out_chunk.reshape(-1)[:1].float().sum() * 0.0
+            dummy_dep = chunk_dep if dummy_dep is None else (dummy_dep + chunk_dep)
+            if rank == owner_rank:
+                recurrent_out = out_chunk
+        if recurrent_out is None:
+            raise RuntimeError("No local recurrent output produced for native multi-rank GDN path.")
+        if dummy_dep is not None:
+            recurrent_out = recurrent_out + dummy_dep.to(recurrent_out.dtype)
+    else:
+        recurrent_out, _ = gdn_recurrent(
+            q_norm,
+            k_norm,
+            v_heads,
+            g_vals,
+            beta_vals,
+            scale=gdn.head_k_dim ** -0.5,
+        )
 
     if gdn.use_gate:
         gate_vals = linear_bf16(hidden_rows, gdn.g_proj.weight, gdn.g_proj.bias).view(seq_len, gdn.num_v_heads, gdn.head_v_dim).contiguous()
@@ -1147,6 +1477,7 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
             ).strip().lower() in {"1", "true", "yes", "on"}
             native_ops = _get_native_train_ops() if (native_training_slices and self.training and x.dtype == torch.bfloat16) else None
             linear_bf16 = native_ops[2] if native_ops is not None else None
+            layernorm_affine = native_ops[4] if native_ops is not None else None
 
             t_in = sinusoidal_embedding_1d(self.freq_dim, timestep)
             if linear_bf16 is not None:
@@ -1160,11 +1491,18 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
 
             if first_frame_latents is not None and self.use_first_frame_cond:
                 first_frame_latents = first_frame_latents.to(context.device)
-                img_context = self.image_downsample(first_frame_latents.squeeze(2))
+                if linear_bf16 is not None:
+                    img_context = _native_image_downsample(self, first_frame_latents)
+                else:
+                    img_context = self.image_downsample(first_frame_latents.squeeze(2))
                 _, _, fh, fw = img_context.shape
                 img_context = img_context.flatten(2).transpose(-2, -1)
-                img_context = self.image_embedding(img_context)
-                img_context = self.image_pos_embed(img_context, h=fh, w=fw)
+                if linear_bf16 is not None and layernorm_affine is not None:
+                    img_context = _native_mlp_rows(layernorm_affine, linear_bf16, img_context, self.image_embedding)
+                    img_context = _native_pos_embed_2d(img_context, fh, fw)
+                else:
+                    img_context = self.image_embedding(img_context)
+                    img_context = self.image_pos_embed(img_context, h=fh, w=fw)
                 context = torch.cat([img_context, context], dim=1)
                 if context_mask is not None:
                     context_mask = torch.cat([
@@ -1177,18 +1515,56 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
 
             if self.has_image_input:
                 x = torch.cat([x, y], dim=1)
-                clip_embdding = self.img_emb(clip_feature)
+                if linear_bf16 is not None and layernorm_affine is not None:
+                    clip_embdding = _native_mlp_rows(layernorm_affine, linear_bf16, clip_feature, self.img_emb)
+                else:
+                    clip_embdding = self.img_emb(clip_feature)
                 context = torch.cat([clip_embdding, context], dim=1)
 
-            x, (f, h, w) = self.patchify(x)
-            if x.dim() == 5:
-                x = x.flatten(2).transpose(-2, -1).contiguous()
+            if linear_bf16 is not None:
+                x, (f, h, w) = _native_patchify(self, x)
+            else:
+                x, (f, h, w) = self.patchify(x)
             grid_size = (f, h, w)
-            freqs = torch.cat([
-                self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-                self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-            ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+            use_unified_sequence_parallel = getattr(self, "use_seq_parallel", False)
+            cp_world_size = 0
+            if use_unified_sequence_parallel:
+                from kairos.modules.utils.parallel_utils import parallel_state
+                cp_world_size = parallel_state.get_context_parallel_world_size()
+            if use_unified_sequence_parallel and cp_world_size > 1:
+                from kairos.modules.utils.parallel_utils import parallel_state
+                from kairos.modules.utils.tp_utils import _distribute_input_sp
+                cp_rank = parallel_state.get_context_parallel_rank()
+                x_full = rearrange(x, 'b c f h w -> b (f h w) c')
+                x = _distribute_input_sp(x_full, parallel_state.get_context_parallel_group())
+                del x_full
+
+                total_tokens = f * h * w
+                assert total_tokens % cp_world_size == 0
+                local_tokens = total_tokens // cp_world_size
+                start = cp_rank * local_tokens
+                end = start + local_tokens
+                global_token_idx = torch.arange(start, end, device=x.device)
+                frame_idx = global_token_idx // (h * w)
+                rem = global_token_idx % (h * w)
+                h_idx = rem // w
+                w_idx = rem % w
+                freq_f_table = self.freqs[0] if self.freqs[0].device == x.device else self.freqs[0].to(x.device)
+                freq_h_table = self.freqs[1] if self.freqs[1].device == x.device else self.freqs[1].to(x.device)
+                freq_w_table = self.freqs[2] if self.freqs[2].device == x.device else self.freqs[2].to(x.device)
+                freqs = torch.cat([
+                    freq_f_table.index_select(0, frame_idx),
+                    freq_h_table.index_select(0, h_idx),
+                    freq_w_table.index_select(0, w_idx),
+                ], dim=-1).unsqueeze(1)
+            else:
+                if x.dim() == 5:
+                    x = x.flatten(2).transpose(-2, -1).contiguous()
+                freqs = torch.cat([
+                    self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                    self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                    self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+                ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
             return x, context, t, t_mod, freqs, grid_size, context_mask, (f, h, w)
 
     def _run_orig_blocks(
@@ -1210,34 +1586,49 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
             def custom_forward(*inputs, **kwargs):
                 block_x, block_context, block_t_mod, block_freqs, block_grid_size = inputs
                 block_context_mask = kwargs.get("context_mask")
-                if (
-                    native_training_slices
-                    and self.training
-                    and _can_use_native_quadratic_slices(module, block_x, block_t_mod)
-                ):
-                    return _run_quadratic_block_native_slices(
-                        module,
-                        block_x,
-                        block_context,
-                        block_t_mod,
-                        block_freqs,
-                        block_grid_size,
-                        context_mask=block_context_mask,
-                    )
-                if (
-                    native_training_slices
-                    and self.training
-                    and _can_use_native_gdn_slices(module, block_x, block_t_mod)
-                ):
-                    return _run_gdn_block_native_slices(
-                        module,
-                        block_x,
-                        block_context,
-                        block_t_mod,
-                        block_freqs,
-                        block_grid_size,
-                        context_mask=block_context_mask,
-                    )
+                if native_training_slices and self.training:
+                    if module.use_linear_attn:
+                        reason = _native_gdn_slice_reason(module, block_x, block_t_mod)
+                        if reason is None:
+                            return _run_gdn_block_native_slices(
+                                module,
+                                block_x,
+                                block_context,
+                                block_t_mod,
+                                block_freqs,
+                                block_grid_size,
+                                context_mask=block_context_mask,
+                            )
+                        self._kairos_engine_native_fallback_counts[reason] = (
+                            self._kairos_engine_native_fallback_counts.get(reason, 0) + 1
+                        )
+                        self._kairos_engine_native_last_fallback = {
+                            "kind": "gdn",
+                            "reason": reason,
+                            "shape": tuple(block_x.shape),
+                            "dtype": str(block_x.dtype),
+                        }
+                    else:
+                        reason = _native_quadratic_slice_reason(module, block_x, block_t_mod)
+                        if reason is None:
+                            return _run_quadratic_block_native_slices(
+                                module,
+                                block_x,
+                                block_context,
+                                block_t_mod,
+                                block_freqs,
+                                block_grid_size,
+                                context_mask=block_context_mask,
+                            )
+                        self._kairos_engine_native_fallback_counts[reason] = (
+                            self._kairos_engine_native_fallback_counts.get(reason, 0) + 1
+                        )
+                        self._kairos_engine_native_last_fallback = {
+                            "kind": "quadratic",
+                            "reason": reason,
+                            "shape": tuple(block_x.shape),
+                            "dtype": str(block_x.dtype),
+                        }
                 return module(*inputs, **kwargs)
             return custom_forward
 
@@ -1302,8 +1693,7 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
             use_gradient_checkpointing_offload=False,
             first_frame_latents=None,
         ):
-            x, context, t, t_mod, freqs, grid_size, context_mask, f_hw = _prepare_forward_inputs(
-                self,
+            train_state = self._kairos_engine_make_train_state(
                 x,
                 timestep,
                 context,
@@ -1312,27 +1702,12 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
                 y=y,
                 first_frame_latents=first_frame_latents,
             )
-            x = _run_orig_blocks(
-                self,
-                x,
-                context,
-                t_mod,
-                freqs,
-                grid_size,
-                context_mask=context_mask,
+            prepared_state = self._kairos_engine_train_prepare_state(train_state)
+            return self._kairos_engine_execute_prepared(
+                prepared_state,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             )
-            native_training_slices = os.environ.get(
-                "KAIROS_ENGINE_NATIVE_TRAINING_SLICES", "1"
-            ).strip().lower() in {"1", "true", "yes", "on"}
-            if native_training_slices and self.training and x.dtype == torch.bfloat16:
-                linear_bf16 = _get_native_train_ops()[2]
-                x = _native_head_forward(self, x, t, linear_bf16)
-            else:
-                x = self.head(x, t)
-            x = self.unpatchify(x, f_hw)
-            return x
 
     def _engine_inference_forward(
         self,
@@ -1378,16 +1753,16 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
                 )
 
             if self.idx == nl - 1:
-                return self._first._result
+                return self._first_runner._result
             return x
 
     first = Runner(0)
     runners = [first]
     for i in range(1, nl):
         r = Runner(i)
-        r._first = first
+        object.__setattr__(r, "_first_runner", first)
         runners.append(r)
-    first._first = first
+    object.__setattr__(first, "_first_runner", first)
     first._ca_cache_key = None
     first._ca_cache_ptr_key = None
     first._ca_cache_ctx_rows = None
@@ -1397,9 +1772,21 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
     setattr(transformer, block_name, nn.ModuleList(runners))
     transformer._kairos_engine_run_blocks = _run_engine_blocks
     transformer._kairos_engine_orig_blocks = nn.ModuleList(orig_blocks)
+    transformer._kairos_engine_native_fallback_counts = {}
+    transformer._kairos_engine_native_last_fallback = None
 
     if not hasattr(transformer, "_kairos_engine_orig_forward"):
         transformer._kairos_engine_orig_forward = transformer.forward
+
+    def _native_training_fallback_report(self):
+        return {
+            "counts": dict(self._kairos_engine_native_fallback_counts),
+            "last": self._kairos_engine_native_last_fallback,
+        }
+
+    def _reset_native_training_fallback_report(self):
+        self._kairos_engine_native_fallback_counts = {}
+        self._kairos_engine_native_last_fallback = None
 
     if enable_training_bridge is None:
         enable_training_bridge = os.environ.get(
@@ -1425,6 +1812,171 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
         first_frame_t = first_frame_latents if first_frame_latents is not None else _empty_like_ref(x)
         return context_mask_t, clip_feature_t, y_t, first_frame_t
 
+    _TRAIN_STATE_KEYS = (
+        "x",
+        "timestep",
+        "context",
+        "context_mask",
+        "clip_feature",
+        "y",
+        "first_frame_latents",
+    )
+    _TRAIN_OPTIONAL_KEYS = (
+        "context_mask",
+        "clip_feature",
+        "y",
+        "first_frame_latents",
+    )
+    _TRAIN_GRAD_KEYS = (
+        "x",
+        "context",
+        "clip_feature",
+        "y",
+        "first_frame_latents",
+    )
+
+    def _make_engine_train_state(
+        self,
+        x,
+        timestep,
+        context,
+        context_mask=None,
+        clip_feature=None,
+        y=None,
+        first_frame_latents=None,
+    ):
+        context_mask_t, clip_feature_t, y_t, first_frame_t = _pack_bridge_inputs(
+            x,
+            context_mask=context_mask,
+            clip_feature=clip_feature,
+            y=y,
+            first_frame_latents=first_frame_latents,
+        )
+        return {
+            "x": x,
+            "timestep": timestep,
+            "context": context,
+            "context_mask": context_mask_t,
+            "clip_feature": clip_feature_t,
+            "y": y_t,
+            "first_frame_latents": first_frame_t,
+        }
+
+    def _engine_train_state_tensors(train_state, detach=False):
+        tensors = []
+        for key in _TRAIN_STATE_KEYS:
+            tensor = train_state[key]
+            tensors.append(tensor.detach() if detach else tensor)
+        return tuple(tensors)
+
+    def _engine_train_state_meta(train_state):
+        meta = {
+            "cuda_autocast_enabled": torch.is_autocast_enabled("cuda"),
+            "cuda_autocast_dtype": torch.get_autocast_dtype("cuda"),
+            "has": {},
+            "requires_grad": {},
+        }
+        for key in _TRAIN_OPTIONAL_KEYS:
+            meta["has"][key] = train_state[key].numel() != 0
+        for key in _TRAIN_GRAD_KEYS:
+            meta["requires_grad"][key] = train_state[key].requires_grad
+        return meta
+
+    def _restore_engine_train_state(state_tensors, state_meta):
+        train_state = {}
+        for key, tensor in zip(_TRAIN_STATE_KEYS, state_tensors):
+            restored = tensor.detach()
+            if key in _TRAIN_GRAD_KEYS:
+                restored = restored.requires_grad_(state_meta["requires_grad"][key])
+            train_state[key] = restored
+        for key in _TRAIN_OPTIONAL_KEYS:
+            if not state_meta["has"][key]:
+                train_state[key] = None
+        return train_state
+
+    def _engine_inference_forward_state(self, train_state):
+        return _engine_inference_forward(
+            self,
+            train_state["x"],
+            train_state["timestep"],
+            train_state["context"],
+            context_mask=train_state["context_mask"],
+            clip_feature=train_state["clip_feature"],
+            y=train_state["y"],
+            first_frame_latents=train_state["first_frame_latents"],
+        )
+
+    def _engine_train_prepare_state(self, train_state):
+        context_mask = train_state["context_mask"]
+        clip_feature = train_state["clip_feature"]
+        y = train_state["y"]
+        first_frame_latents = train_state["first_frame_latents"]
+        if context_mask is not None and context_mask.numel() == 0:
+            context_mask = None
+        if clip_feature is not None and clip_feature.numel() == 0:
+            clip_feature = None
+        if y is not None and y.numel() == 0:
+            y = None
+        if first_frame_latents is not None and first_frame_latents.numel() == 0:
+            first_frame_latents = None
+        x, context, t, t_mod, freqs, grid_size, context_mask, f_hw = _prepare_forward_inputs(
+            self,
+            train_state["x"],
+            train_state["timestep"],
+            train_state["context"],
+            context_mask=context_mask,
+            clip_feature=clip_feature,
+            y=y,
+            first_frame_latents=first_frame_latents,
+        )
+        return {
+            "x": x,
+            "context": context,
+            "t": t,
+            "t_mod": t_mod,
+            "freqs": freqs,
+            "grid_size": grid_size,
+            "context_mask": context_mask,
+            "f_hw": f_hw,
+        }
+
+    def _engine_execute_prepared(
+        self,
+        prepared_state,
+        use_gradient_checkpointing=False,
+        use_gradient_checkpointing_offload=False,
+    ):
+        x = _run_orig_blocks(
+            self,
+            prepared_state["x"],
+            prepared_state["context"],
+            prepared_state["t_mod"],
+            prepared_state["freqs"],
+            prepared_state["grid_size"],
+            context_mask=prepared_state["context_mask"],
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+        )
+        native_training_slices = os.environ.get(
+            "KAIROS_ENGINE_NATIVE_TRAINING_SLICES", "1"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if native_training_slices and self.training and x.dtype == torch.bfloat16:
+            linear_bf16 = _get_native_train_ops()[2]
+            x = _native_head_forward(self, x, prepared_state["t"], linear_bf16)
+        else:
+            x = self.head(x, prepared_state["t"])
+        x = self.unpatchify(x, prepared_state["f_hw"])
+        return x
+
+    def _engine_train_execute_prepared(self, prepared_state):
+        return self._kairos_engine_execute_prepared(
+            prepared_state,
+            use_gradient_checkpointing=backward_checkpoint,
+            use_gradient_checkpointing_offload=(
+                backward_checkpoint and backward_checkpoint_offload
+            ),
+        )
+
     def _engine_train_recompute(
         self,
         x,
@@ -1435,20 +1987,20 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
         y=None,
         first_frame_latents=None,
     ):
-        return _orig_model_forward(
-            self,
+        train_state = self._kairos_engine_make_train_state(
             x,
             timestep,
             context,
             context_mask=context_mask,
             clip_feature=clip_feature,
             y=y,
-            use_gradient_checkpointing=backward_checkpoint,
-            use_gradient_checkpointing_offload=(
-                backward_checkpoint and backward_checkpoint_offload
-            ),
             first_frame_latents=first_frame_latents,
         )
+        return self._kairos_engine_train_recompute_state(train_state)
+
+    def _engine_train_recompute_state(self, train_state):
+        prepared_state = self._kairos_engine_train_prepare_state(train_state)
+        return self._kairos_engine_train_execute_prepared(prepared_state)
 
     class _EngineBackwardBridge(torch.autograd.Function):
 
@@ -1465,87 +2017,41 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
             *params,
         ):
             ctx.params = params
-            ctx.cuda_autocast_enabled = torch.is_autocast_enabled("cuda")
-            ctx.cuda_autocast_dtype = torch.get_autocast_dtype("cuda")
-            ctx.has_context_mask = context_mask_t.numel() != 0
-            ctx.has_clip_feature = clip_feature_t.numel() != 0
-            ctx.has_y = y_t.numel() != 0
-            ctx.has_first_frame = first_frame_latents_t.numel() != 0
-            ctx.x_requires_grad = x.requires_grad
-            ctx.context_requires_grad = context.requires_grad
-            ctx.clip_feature_requires_grad = clip_feature_t.requires_grad
-            ctx.y_requires_grad = y_t.requires_grad
-            ctx.first_frame_requires_grad = first_frame_latents_t.requires_grad
-            ctx.save_for_backward(
-                x.detach(),
-                timestep.detach(),
-                context.detach(),
-                context_mask_t.detach(),
-                clip_feature_t.detach(),
-                y_t.detach(),
-                first_frame_latents_t.detach(),
-            )
+            train_state = {
+                "x": x,
+                "timestep": timestep,
+                "context": context,
+                "context_mask": context_mask_t,
+                "clip_feature": clip_feature_t,
+                "y": y_t,
+                "first_frame_latents": first_frame_latents_t,
+            }
+            ctx.train_state_meta = _engine_train_state_meta(train_state)
+            ctx.save_for_backward(*_engine_train_state_tensors(train_state, detach=True))
             with torch.no_grad():
-                return _engine_inference_forward(
-                    transformer,
-                    x,
-                    timestep,
-                    context,
-                    context_mask=context_mask_t if ctx.has_context_mask else None,
-                    clip_feature=clip_feature_t if ctx.has_clip_feature else None,
-                    y=y_t if ctx.has_y else None,
-                    first_frame_latents=first_frame_latents_t if ctx.has_first_frame else None,
-                )
+                prepared_state = transformer._kairos_engine_train_prepare_state(train_state)
+                return transformer._kairos_engine_train_execute_prepared(prepared_state)
 
         @staticmethod
         def backward(ctx, grad_output):
-            (x, timestep, context, context_mask_t,
-             clip_feature_t, y_t, first_frame_latents_t) = ctx.saved_tensors
-
-            x_r = x.detach().requires_grad_(ctx.x_requires_grad)
-            context_r = context.detach().requires_grad_(ctx.context_requires_grad)
-            clip_feature_r = None
-            y_r = None
-            first_frame_r = None
-            if ctx.has_clip_feature:
-                clip_feature_r = clip_feature_t.detach().requires_grad_(ctx.clip_feature_requires_grad)
-            if ctx.has_y:
-                y_r = y_t.detach().requires_grad_(ctx.y_requires_grad)
-            if ctx.has_first_frame:
-                first_frame_r = first_frame_latents_t.detach().requires_grad_(ctx.first_frame_requires_grad)
-
-            grad_targets = []
-            grad_slots = []
-            for name, tensor in (
-                ("x", x_r),
-                ("context", context_r),
-                ("clip_feature", clip_feature_r),
-                ("y", y_r),
-                ("first_frame_latents", first_frame_r),
-            ):
-                if tensor is not None and tensor.requires_grad:
-                    grad_targets.append(tensor)
-                    grad_slots.append(name)
+            train_state = _restore_engine_train_state(ctx.saved_tensors, ctx.train_state_meta)
+            grad_slots = [
+                key
+                for key in _TRAIN_GRAD_KEYS
+                if train_state[key] is not None and train_state[key].requires_grad
+            ]
 
             with torch.enable_grad(), torch.amp.autocast(
                 "cuda",
-                dtype=ctx.cuda_autocast_dtype,
-                enabled=ctx.cuda_autocast_enabled,
+                dtype=ctx.train_state_meta["cuda_autocast_dtype"],
+                enabled=ctx.train_state_meta["cuda_autocast_enabled"],
             ):
                 if backward_release_engine_weights:
                     ext.release_loaded_weights()
                     transformer._kairos_engine_block_versions = None
                 if backward_checkpoint_offload:
                     torch.cuda.empty_cache()
-                out = transformer._kairos_engine_train_recompute(
-                    x_r,
-                    timestep,
-                    context_r,
-                    context_mask=context_mask_t if ctx.has_context_mask else None,
-                    clip_feature=clip_feature_r,
-                    y=y_r,
-                    first_frame_latents=first_frame_r,
-                )
+                out = transformer._kairos_engine_train_recompute_state(train_state)
                 torch.autograd.backward(out, grad_output)
 
             grad_x = None
@@ -1555,13 +2061,21 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
             grad_first_frame = None
             param_grads = [None] * len(ctx.params)
             grad_by_slot = {
-                "x": x_r.grad if x_r.requires_grad else None,
-                "context": context_r.grad if context_r.requires_grad else None,
-                "clip_feature": clip_feature_r.grad if clip_feature_r is not None and clip_feature_r.requires_grad else None,
-                "y": y_r.grad if y_r is not None and y_r.requires_grad else None,
+                "x": train_state["x"].grad if train_state["x"].requires_grad else None,
+                "context": train_state["context"].grad if train_state["context"].requires_grad else None,
+                "clip_feature": (
+                    train_state["clip_feature"].grad
+                    if train_state["clip_feature"] is not None and train_state["clip_feature"].requires_grad
+                    else None
+                ),
+                "y": (
+                    train_state["y"].grad
+                    if train_state["y"] is not None and train_state["y"].requires_grad
+                    else None
+                ),
                 "first_frame_latents": (
-                    first_frame_r.grad
-                    if first_frame_r is not None and first_frame_r.requires_grad
+                    train_state["first_frame_latents"].grad
+                    if train_state["first_frame_latents"] is not None and train_state["first_frame_latents"].requires_grad
                     else None
                 ),
             }
@@ -1600,21 +2114,17 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
         first_frame_latents=None,
     ):
         params = tuple(p for p in self.parameters() if p.requires_grad)
-        context_mask_t, clip_feature_t, y_t, first_frame_t = _pack_bridge_inputs(
+        train_state = self._kairos_engine_make_train_state(
             x,
+            timestep,
+            context,
             context_mask=context_mask,
             clip_feature=clip_feature,
             y=y,
             first_frame_latents=first_frame_latents,
         )
         return _EngineBackwardBridge.apply(
-            x,
-            timestep,
-            context,
-            context_mask_t,
-            clip_feature_t,
-            y_t,
-            first_frame_t,
+            *_engine_train_state_tensors(train_state, detach=False),
             *params,
         )
 
@@ -1631,47 +2141,43 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
         first_frame_latents=None,
         **kwargs,
     ):
-        if kwargs:
-            return _orig_model_forward(
-                self,
-                x,
-                timestep,
-                context,
-                context_mask=context_mask,
-                clip_feature=clip_feature,
-                y=y,
-                use_gradient_checkpointing=use_gradient_checkpointing,
-                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-                first_frame_latents=first_frame_latents,
-            )
+        # KairosDiT.forward accepts **kwargs but ignores them; keep the engine
+        # state pipeline active instead of bouncing through the old wrapper.
+        del kwargs
 
         if use_gradient_checkpointing or use_gradient_checkpointing_offload:
-            return _orig_model_forward(
-                self,
+            train_state = self._kairos_engine_make_train_state(
                 x,
                 timestep,
                 context,
                 context_mask=context_mask,
                 clip_feature=clip_feature,
                 y=y,
+                first_frame_latents=first_frame_latents,
+            )
+            prepared_state = self._kairos_engine_train_prepare_state(train_state)
+            return self._kairos_engine_execute_prepared(
+                prepared_state,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-                first_frame_latents=first_frame_latents,
-                )
+            )
 
         if self.training:
             if not enable_training_bridge:
-                return _orig_model_forward(
-                    self,
+                train_state = self._kairos_engine_make_train_state(
                     x,
                     timestep,
                     context,
                     context_mask=context_mask,
                     clip_feature=clip_feature,
                     y=y,
+                    first_frame_latents=first_frame_latents,
+                )
+                prepared_state = self._kairos_engine_train_prepare_state(train_state)
+                return self._kairos_engine_execute_prepared(
+                    prepared_state,
                     use_gradient_checkpointing=False,
                     use_gradient_checkpointing_offload=False,
-                    first_frame_latents=first_frame_latents,
                 )
 
             return self._kairos_engine_train_forward(
@@ -1696,8 +2202,16 @@ def patch_engine(transformer, max_seq, ctx_len, seq_list=None, verbose=True,
         )
 
     transformer._kairos_engine_inference_forward = types.MethodType(_engine_inference_forward, transformer)
+    transformer._kairos_engine_inference_forward_state = types.MethodType(_engine_inference_forward_state, transformer)
+    transformer._kairos_engine_make_train_state = types.MethodType(_make_engine_train_state, transformer)
+    transformer._kairos_engine_train_prepare_state = types.MethodType(_engine_train_prepare_state, transformer)
+    transformer._kairos_engine_execute_prepared = types.MethodType(_engine_execute_prepared, transformer)
+    transformer._kairos_engine_train_execute_prepared = types.MethodType(_engine_train_execute_prepared, transformer)
     transformer._kairos_engine_train_recompute = types.MethodType(_engine_train_recompute, transformer)
+    transformer._kairos_engine_train_recompute_state = types.MethodType(_engine_train_recompute_state, transformer)
     transformer._kairos_engine_train_forward = types.MethodType(_engine_train_forward, transformer)
+    transformer._kairos_engine_native_training_fallback_report = types.MethodType(_native_training_fallback_report, transformer)
+    transformer._kairos_engine_reset_native_training_fallback_report = types.MethodType(_reset_native_training_fallback_report, transformer)
     transformer.forward = types.MethodType(_engine_forward, transformer)
 
     if verbose:

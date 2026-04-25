@@ -11,12 +11,19 @@ from kairos.third_party.fla.utils import autotune_cache_kwargs, check_shared_mem
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 
-from kairos.modules.utils import FLAGS_KAIROS_IS_METAX
+from kairos.modules.utils import FLAGS_KAIROS_IS_METAX, FLAGS_KAIROS_CUDA_SM
 
 if FLAGS_KAIROS_IS_METAX:
     num_stages_range = [1]
     num_warps_range = [4]
     BV_range = [16]
+elif FLAGS_KAIROS_CUDA_SM in [120, 121]:
+    # Blackwell GeForce has a tighter shared-memory limit than the larger
+    # Hopper/Ampere server configs these autotune ranges were tuned on.
+    # Keep the search in the portion of the space that fits on 5090-class GPUs.
+    num_stages_range = [1]
+    num_warps_range = [2, 4]
+    BV_range = [16, 32]
 else:
     num_stages_range = [2, 3, 4]
     num_warps_range = [2, 4]
@@ -227,9 +234,13 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 @triton.autotune(
     configs=[
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in ([4, 3, 2] if check_shared_mem('ampere') else [1])
-        for BV in [64, 32]
+        for num_warps in ([2, 4] if FLAGS_KAIROS_CUDA_SM in [120, 121] else [2, 4])
+        for num_stages in (
+            [1]
+            if FLAGS_KAIROS_CUDA_SM in [120, 121]
+            else ([4, 3, 2] if check_shared_mem('ampere') else [1])
+        )
+        for BV in ([32, 16] if FLAGS_KAIROS_CUDA_SM in [120, 121] else [64, 32])
     ],
     key=['H', 'K', 'V', 'BT', 'BV', 'USE_G'],
     use_cuda_graph=use_cuda_graph,
