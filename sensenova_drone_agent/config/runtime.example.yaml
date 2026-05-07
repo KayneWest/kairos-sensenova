@@ -1,5 +1,5 @@
 runtime:
-  mode: "mpc"  # mpc | policy | hybrid
+  mode: "mpc"  # mpc | policy | hybrid | grounded_world_model
 
 camera:
   width: 640
@@ -29,6 +29,12 @@ policy:
   checkpoint_path: ""
   input_dim: null
   confidence_threshold: 0.75
+
+grounded_world_model:
+  backend: "bc_surrogate"  # bc_surrogate | kairos_python
+  checkpoint_path: ""
+  next_observation_source: "real_gazebo_camera_after_actuation"
+  generated_rollouts_used_as_state: false
 
 hybrid:
   use_policy_when_confident: true

@@ -58,6 +58,16 @@ class KairosWorldModelAdapter(ABC):
         _ = (world_state, memory, goal)
         return None
 
+    def propose_movement(
+        self,
+        world_state: WorldState,
+        memory: RealObservationMemory,
+        goal: GoalSpec,
+        episode_step_dir: str | None = None,
+    ):
+        _ = (world_state, memory, goal, episode_step_dir)
+        return None
+
 
 class SubprocessKairosAdapter(KairosWorldModelAdapter):
     """
@@ -508,4 +518,16 @@ class PythonKairosAdapter(KairosWorldModelAdapter):
         _ = (world_state, memory, action_condition, goal, out_dir, return_type)
         raise NotImplementedError(
             "TODO: call Kairos pipeline directly instead of subprocess for native latent/state rollouts."
+        )
+
+    def propose_movement(
+        self,
+        world_state: WorldState,
+        memory: RealObservationMemory,
+        goal: GoalSpec,
+        episode_step_dir: str | None = None,
+    ):
+        _ = (world_state, memory, goal, episode_step_dir)
+        raise NotImplementedError(
+            "TODO: expose Kairos h_t or movement logits and return a GroundedMovementProposal."
         )

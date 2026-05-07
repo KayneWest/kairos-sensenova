@@ -11,6 +11,11 @@ from sensenova_drone.bc_data import ACTION_VOCAB, BCEpisodeStep, export_bc_manif
 from sensenova_drone.bc_infer import BCPrediction, BCPolicyRunner, load_bc_policy_runner
 from sensenova_drone.bc_model import ImageBCPolicy
 from sensenova_drone.control_adapter import DroneToKairosControlAdapter
+from sensenova_drone.grounded_world_model import (
+    BCGroundedWorldModelAdapter,
+    GroundedMovementProposal,
+    GroundedWorldModelMovementPlanner,
+)
 from sensenova_drone.kairos_adapter import (
     KairosWorldModelAdapter,
     PythonKairosAdapter,
@@ -38,6 +43,7 @@ __all__ = [
     "ACTION_VOCAB",
     "ActionSequence",
     "BCEpisodeStep",
+    "BCGroundedWorldModelAdapter",
     "BCPolicyRunner",
     "BCPrediction",
     "CameraIntrinsics",
@@ -47,6 +53,8 @@ __all__ = [
     "DroneCommand",
     "DroneToKairosControlAdapter",
     "GoalSpec",
+    "GroundedMovementProposal",
+    "GroundedWorldModelMovementPlanner",
     "ImageBCPolicy",
     "KairosActionCondition",
     "KairosMPCPlanner",

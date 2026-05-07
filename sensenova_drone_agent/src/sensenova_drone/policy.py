@@ -160,9 +160,11 @@ class RuntimeModePlanner:
         mpc_planner,
         cfg: dict,
         policy_planner: PolicyRuntimePlanner | None = None,
+        grounded_world_model_planner=None,
     ):
         self.mpc_planner = mpc_planner
         self.policy_planner = policy_planner
+        self.grounded_world_model_planner = grounded_world_model_planner
         self.cfg = cfg
 
     def plan(
@@ -182,6 +184,23 @@ class RuntimeModePlanner:
                 raise RuntimeError("Policy mode requested, but no policy planner is configured.")
             plan = self.policy_planner.plan(world_state, memory, goal, episode_step_dir=episode_step_dir)
             plan.metadata = {**(plan.metadata or {}), "runtime_mode": "policy"}
+            return plan
+
+        if mode in {"grounded_world_model", "world_model_policy"}:
+            if self.grounded_world_model_planner is None:
+                raise RuntimeError(
+                    "Grounded world-model mode requested, but no grounded planner is configured."
+                )
+            plan = self.grounded_world_model_planner.plan(
+                world_state,
+                memory,
+                goal,
+                episode_step_dir=episode_step_dir,
+            )
+            plan.metadata = {
+                **(plan.metadata or {}),
+                "runtime_mode": "grounded_world_model",
+            }
             return plan
 
         if mode == "hybrid":

@@ -126,6 +126,17 @@ def _candidate_rollouts(plan) -> list[dict[str, Any]]:
     if isinstance(plan, CandidatePlan):
         return list(plan.diagnostics.get("all_candidates", []))
     if isinstance(plan, PolicyOutput):
+        if plan.metadata and plan.metadata.get("mode") == "grounded_world_model":
+            return [
+                {
+                    "action_sequence": [plan.action.value],
+                    "rollout_success": None,
+                    "score": None,
+                    "world_model_proposal": _to_serializable(
+                        plan.metadata.get("proposal_metadata", {})
+                    ),
+                }
+            ]
         return []
     return []
 
@@ -137,6 +148,8 @@ def _decision_rule(plan) -> str:
             "argmax_A R(Kairos rollout under candidate action sequence A)",
         )
     if isinstance(plan, PolicyOutput):
+        if plan.metadata and plan.metadata.get("decision_rule"):
+            return str(plan.metadata["decision_rule"])
         return "argmax(action_logits)"
     return "unknown"
 
