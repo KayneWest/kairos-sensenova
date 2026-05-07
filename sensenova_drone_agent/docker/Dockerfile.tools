@@ -1,0 +1,50 @@
+ARG PX4_TOOLS_BASE_IMAGE=sensenova_drone_agent-px4-source-sim:local
+FROM ${PX4_TOOLS_BASE_IMAGE}
+
+ARG ROS_DISTRO=jazzy
+ENV DEBIAN_FRONTEND=noninteractive
+ENV ROS_DISTRO=${ROS_DISTRO}
+ENV VIRTUAL_ENV=/opt/drone-sim-venv
+ENV PATH=${VIRTUAL_ENV}/bin:${PATH}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        software-properties-common \
+        curl \
+        gnupg \
+        lsb-release \
+        ca-certificates \
+        python3-pip \
+        python3-venv \
+        python3-dev \
+        ffmpeg \
+    && add-apt-repository -y universe \
+    && ROS_APT_SOURCE_VERSION="$(curl -s https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest | grep -F 'tag_name' | awk -F'\"' '{print $4}')" \
+    && curl -L -o /tmp/ros2-apt-source.deb \
+         "https://github.com/ros-infrastructure/ros-apt-source/releases/download/${ROS_APT_SOURCE_VERSION}/ros2-apt-source_${ROS_APT_SOURCE_VERSION}.$(. /etc/os-release && echo ${UBUNTU_CODENAME:-${VERSION_CODENAME}})_all.deb" \
+    && dpkg -i /tmp/ros2-apt-source.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ros-${ROS_DISTRO}-ros-base \
+        ros-${ROS_DISTRO}-rqt-image-view \
+        ros-${ROS_DISTRO}-cv-bridge \
+        ros-${ROS_DISTRO}-image-transport \
+        ros-${ROS_DISTRO}-ros-gz \
+        ros-${ROS_DISTRO}-ros-gz-image \
+        ros-${ROS_DISTRO}-ros-gz-bridge \
+    && python3 -m venv "${VIRTUAL_ENV}" \
+    && "${VIRTUAL_ENV}/bin/pip" install --upgrade pip \
+    && "${VIRTUAL_ENV}/bin/pip" install --index-url https://download.pytorch.org/whl/cpu torch \
+    && "${VIRTUAL_ENV}/bin/pip" install \
+        mavsdk \
+        "numpy<2" \
+        pillow \
+        opencv-python \
+        pyyaml \
+        pytest \
+    && rm -f /tmp/ros2-apt-source.deb \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/tools-entrypoint.sh /usr/local/bin/drone-sim-tools-entrypoint.sh
+RUN chmod +x /usr/local/bin/drone-sim-tools-entrypoint.sh

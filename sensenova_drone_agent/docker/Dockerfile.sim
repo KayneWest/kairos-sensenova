@@ -1,0 +1,16 @@
+ARG PX4_DEV_IMAGE=px4io/px4-dev:v1.17.0-rc2
+FROM ${PX4_DEV_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV RUNS_IN_DOCKER=true
+ENV PX4_SIM_HOME=/workspace/.px4-sim-home
+ENV HOME=${PX4_SIM_HOME}
+
+COPY third_party/PX4-Autopilot/Tools/setup/requirements.txt /tmp/requirements.txt
+COPY third_party/PX4-Autopilot/Tools/setup/ubuntu.sh /tmp/ubuntu.sh
+
+RUN bash /tmp/ubuntu.sh --no-nuttx \
+    && mkdir -p "${PX4_SIM_HOME}" \
+    && rm -f /tmp/requirements.txt /tmp/ubuntu.sh \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*

@@ -1,0 +1,70 @@
+runtime:
+  mode: "mpc"  # mpc | policy | hybrid
+
+camera:
+  width: 640
+  height: 480
+  fx: null
+  fy: null
+  cx: null
+  cy: null
+  camera_info_topic: ""
+
+state_estimator:
+  pose_source: "mavsdk"  # mavsdk | ros_odom | gazebo | mock | none
+  ros_odom_topic: ""
+  mock_pose:
+    position_xyz: [0.0, 0.0, 1.5]
+    orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+
+planner:
+  use_kairos_rollouts: true
+  rollout_return_type: "video"
+  candidate_actions:
+    - "hover"
+    - "yaw_left"
+    - "yaw_right"
+
+policy:
+  checkpoint_path: ""
+  input_dim: null
+  confidence_threshold: 0.75
+
+hybrid:
+  use_policy_when_confident: true
+  fallback_to_mpc: true
+
+kairos:
+  repo_root: "/home/mkrzus/kairos-sensenova"
+  template_request_json: "/home/mkrzus/kairos-sensenova/examples/example_i2v.json"
+  inference_script: "/home/mkrzus/kairos-sensenova/examples/inference.py"
+  python_executable: "python3"
+  execute_subprocess: false
+  subprocess_timeout_s: 600
+  camera_control_speed: 1.0
+
+actions:
+  hover:
+    duration_s: 0.5
+  yaw_left:
+    yawspeed_deg_s: -5.0
+    duration_s: 0.5
+  yaw_right:
+    yawspeed_deg_s: 5.0
+    duration_s: 0.5
+
+safety:
+  max_linear_speed_m_s: 0.5
+  max_yawspeed_deg_s: 10.0
+  max_duration_s: 1.0
+  allow_translation_without_pose: true
+
+scoring:
+  base_reward: 0.0
+  rollout_success_bonus: 1.0
+  rollout_failure_bonus: -0.25
+  goal_prompt_bonus: 0.1
+  action_bias:
+    hover: 0.0
+    yaw_left: 0.0
+    yaw_right: 0.0

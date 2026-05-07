@@ -1,0 +1,51 @@
+services:
+  sim:
+    image: sensenova_drone_agent-px4-source-sim:local
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sim
+      args:
+        PX4_DEV_IMAGE: ${PX4_DEV_IMAGE:-px4io/px4-dev:v1.17.0-rc2}
+    network_mode: host
+    stdin_open: true
+    tty: true
+    working_dir: /workspace/third_party/PX4-Autopilot
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      PX4_SIM_MODEL: ${PX4_SIM_MODEL:-gz_x500_depth}
+      PX4_GZ_WORLD: ${PX4_GZ_WORLD:-}
+      PX4_GZ_MODEL_POSE: ${PX4_GZ_MODEL_POSE:-}
+      HEADLESS: ${HEADLESS:-1}
+      DISPLAY: ${DISPLAY:-}
+      GZ_PARTITION: ${GZ_PARTITION:-sensenova_drone_agent}
+      QT_X11_NO_MITSHM: "1"
+      HOME: /workspace/.px4-sim-home
+    volumes:
+      - .:/workspace
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    command: ["bash", "-lc", "mkdir -p /workspace/.px4-sim-home && make px4_sitl gz_x500_depth"]
+
+  tools:
+    image: sensenova_drone_agent-tools:local
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.tools
+      args:
+        PX4_TOOLS_BASE_IMAGE: ${PX4_TOOLS_BASE_IMAGE:-sensenova_drone_agent-px4-source-sim:local}
+        ROS_DISTRO: ${ROS_DISTRO:-jazzy}
+    network_mode: host
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      ROS_DISTRO: ${ROS_DISTRO:-jazzy}
+      DISPLAY: ${DISPLAY:-}
+      GZ_PARTITION: ${GZ_PARTITION:-sensenova_drone_agent}
+      QT_X11_NO_MITSHM: "1"
+      HOME: /workspace/.tools-home
+    volumes:
+      - .:/workspace
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    entrypoint: ["/usr/local/bin/drone-sim-tools-entrypoint.sh"]
+    command: ["sleep", "infinity"]

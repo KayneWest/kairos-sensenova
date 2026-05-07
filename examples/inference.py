@@ -1,6 +1,7 @@
 import sys
 import os
 import argparse
+from pathlib import Path
 
 import time
 from mmengine import Config
@@ -13,6 +14,9 @@ from kairos.modules.utils.prompt_rewriter import PromptRewriter
 import torch
 from PIL import Image
 from kairos.modules.utils import save_video, save_image, parallel_state, FLAGS_KAIROS_PLAT_DEVICE
+
+
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 def parse_args():
     parser = argparse.ArgumentParser(description='TRAIN_MODEL_LOOP')
@@ -68,6 +72,57 @@ def print_gpu_memory(device_id=0):
     print(f"  缓存显存：{cached:.2f} GB")
     print(f"  总显存：{total:.2f} GB")
     print(f"  实际使用率：{used/total*100:.2f}%")
+
+
+def _load_pil_image(path: str | Path) -> Image.Image:
+    return Image.open(path).convert("RGB")
+
+
+def _load_input_video_directory(path: Path) -> list[Image.Image]:
+    frame_paths = sorted(
+        frame_path for frame_path in path.iterdir()
+        if frame_path.is_file() and frame_path.suffix.lower() in IMAGE_SUFFIXES
+    )
+    if not frame_paths:
+        raise ValueError(f"No frame images found under input_video directory: {path}")
+    return [_load_pil_image(frame_path) for frame_path in frame_paths]
+
+
+def _materialize_input_video(spec):
+    if spec is None:
+        return None
+
+    if isinstance(spec, str):
+        if not spec:
+            return None
+        path = Path(spec)
+        if path.is_dir():
+            return [_load_input_video_directory(path)]
+        raise ValueError(
+            f"Unsupported input_video string path: {path}. "
+            "Use a directory containing ordered frame images."
+        )
+
+    if isinstance(spec, list):
+        if not spec:
+            return None
+
+        if all(isinstance(item, str) for item in spec):
+            paths = [Path(item) for item in spec]
+            if all(path.is_dir() for path in paths):
+                return [_load_input_video_directory(path) for path in paths]
+            if all(path.is_file() for path in paths):
+                return [[_load_pil_image(path) for path in paths]]
+
+        if all(isinstance(item, list) for item in spec):
+            videos = []
+            for item in spec:
+                if not all(isinstance(frame, str) for frame in item):
+                    raise ValueError("Nested input_video lists must contain only frame paths.")
+                videos.append([_load_pil_image(frame) for frame in item])
+            return videos
+
+    return spec
 
 if __name__ == '__main__':
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -191,6 +246,13 @@ if __name__ == '__main__':
             image = Image.open(input_args_d['input_image'])
             input_args_d['input_image'] = [image]
 
+    if 'input_video' in input_args_d:
+        materialized_input_video = _materialize_input_video(input_args_d['input_video'])
+        if materialized_input_video is None:
+            input_args_d.pop('input_video', None)
+        else:
+            input_args_d['input_video'] = materialized_input_video
+
     input_args_d.pop('raw_prompt', '') 
 
     # add prompt prefix in ti2v mode
@@ -225,4 +287,3 @@ if __name__ == '__main__':
 
     if dist.is_initialized():
         dist.destroy_process_group()
-
