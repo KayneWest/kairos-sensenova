@@ -174,6 +174,36 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-11 TRACK 2: DAGGER CYCLE 1 — STRICT GATE PASSES (first time)
+
+collect_dagger_episodes.py ran the act_bc_think agent for 400 episodes
+(387 collisions — its own failures became training data) -> RTG relabel ->
+retrain planner+BC on base(w2)+dagger(w1) mix
+(drone_v4_dagger_manifest.json) -> n=1000 eval
+(closed_loop_drone_game_v12_dagger_c1):
+
+  act_bc_think 6.1% success, return +1.54 (FIRST positive-return agent)
+  vs act_bc: success +5.6pp [+4.2,+7.1]; return +6.92 CI-clean
+  vs random: success +4.7pp [+2.9,+6.4]; return +3.99 CI-clean
+  bc_thinking_wins = True
+
+2026-07-12: SEED-2 REPEAT CONFIRMS (closed_loop_drone_game_v12_dagger_c1_seed2):
+think 5.7% / return +1.60, bc_thinking_wins=True, all comparisons CI-clean,
+magnitudes matching seed 1. CLAIMABLE under the two-seed rule. Paper
+abstract/§6/§9 updated with the constructive conclusion (failure is
+distributional; one DAgger round suffices in this domain). Next optional:
+DAgger cycle 2 with the improved agent (expect further gains).
+
+Distribution-gap hypothesis CONFIRMED behaviorally. Claimability pended the
+independent-training-seed repeat (RUNNING, GPU 0: runs
+drone_game_v8_dagger_c1_seed2 / drone_bc_chunk_head_dagger_c1_seed2.pt /
+closed_loop_drone_game_v12_dagger_c1_seed2; same DAgger data, fresh
+planner/BC/eval seeds). If it repeats: update paper §6/§10 (DAgger converts
+the reversal into a consistent win = paper #2 opening result or a §6 coda),
+memory, and consider cycle 2 (collect with the improved agent).
+Paper draft v1.1 committed (e2ba702); campaign commit e224bba, branch
+thinking-in-frames-campaign, NOT pushed.
+
 ## 2026-07-11 H16 VERDICT (task 17 CLOSED) — WORKSTREAM RUN QUEUE EMPTY
 
 Horizon-tail curriculum did NOT close h16 (audit decision_quality_audit_v7_h16):

@@ -21,10 +21,13 @@ reproducible phase transition grounds exact action timing (error ratios
 ~1.0 → 11–27x). Any act-time head given the plan token
 learns to bypass imagination; plan-dropout is the general cure. In a
 closed-loop drone game, selecting behavior-prior candidates by imagined
-value beats acting without thinking in one seed (success +1.4pp, return
-+1.74; n = 1000, CI-clean) and *reverses, CI-clean, in a second seed with
-equal-or-better offline metrics*: offline decision-quality gates do not
-predict even the sign of act-time selection value.
+value beats acting without thinking in one seed (n = 1000, CI-clean) and
+*reverses, CI-clean, in a second seed with equal-or-better offline metrics*:
+offline decision-quality gates do not predict even the sign of act-time
+selection value. The gap is distributional, and one DAgger iteration closes
+it: after training on 400 episodes of the agent's own experience, thinking
+beats both controls in both seeds (success 5.7–6.1% vs 0.1–0.5% without
+thinking; positive mean return; all CIs clear of zero).
 
 ## 1. Introduction
 
@@ -327,6 +330,23 @@ preferences are seed-fragile in ways invisible to every offline gate. This
 is the sharpest form of our central methodological finding and the direct
 motivation for policy-in-imagination over act-time value search (§10).
 
+**One DAgger iteration closes the gap — consistently.** If seed-fragility
+is distributional, training on the agent's own visited states should remove
+it. We collected 400 episodes with the think-then-act agent itself (387
+ended in collision — its failures became supervision), relabeled with
+return-to-go, retrained the planner and BC head on the mixed data, and
+re-evaluated at n = 1000 — then repeated the entire training with an
+independent seed. Both seeds pass the strict gate: success 6.1% / 5.7%
+versus 0.5% / 0.1% for the same behavior prior acting without thinking
+(delta +5.6pp in both, CIs clear of zero) and 1.4% / 2.2% for random
+selection among identical candidates (+4.7pp / +3.5pp, CI-clean); mean
+return turns positive in both seeds (+1.54 / +1.60) against negative for
+every control. The pre-DAgger reversal and post-DAgger consistency together
+give the paper's constructive conclusion: act-time value selection fails
+not intrinsically but *distributionally*, and a single round of on-policy
+data collection is sufficient, in this domain, to convert imagination into
+a reliable behavioral advantage.
+
 ## 7. Visible thinking traces
 
 A decoder-only, motion-weighted fine-tune of the frozen tokenizer (encoder
@@ -401,10 +421,12 @@ We claim: the offline think-then-act loop closes, repeatably (two seeds),
 with transfer of *selection* to a held-out source; timing grounding is
 achievable and its data-identifiability is measurable (DROID's shift-1
 action cosine of 0.91 makes timing unidentifiable there — a data property);
-and offline decision-quality metrics do not predict the sign of closed-loop
-selection value (two-seed reversal, both CI-clean). We do not claim: any
-closed-loop behavioral improvement from thinking (single-seed only, not
-robust); real-drone control; robot-source acting transfer; or long-horizon
+offline decision-quality metrics do not predict the sign of closed-loop
+selection value (two-seed reversal, both CI-clean); and one DAgger iteration
+restores a two-seed-consistent behavioral win for thinking (success and
+return over both controls, all CIs clear, n = 1000 x 2 seeds). We do not
+claim: behavioral improvement without on-policy data (refuted by the
+reversal); real-drone control; robot-source acting transfer; or long-horizon
 (h16) parity — improved from 3.4–28x worse than persistence to 1.7–2.8x,
 but open: a horizon-tail curriculum did not close it (expert 3.12 / SOAR
 6.98 at h16; held-out Bridge improved 11.8 → 6.7, with h8 at 0.86 — below
