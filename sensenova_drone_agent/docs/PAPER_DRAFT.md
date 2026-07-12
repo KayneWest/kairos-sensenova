@@ -1,42 +1,30 @@
 # From Scene Priors to Decision-Quality Imagination: Retrofitting Action Grounding into Video World-Model Latent Spaces
 
-*Draft v1 — 2026-07-10. Numbers are final from the July 2026 campaign; see
+*Draft v1.1 — 2026-07-11. Numbers are final from the July 2026 campaign; see
 WORKLOG.md for artifact paths. Bracketed notes mark writing TODOs.*
 
 ## Abstract
 
-Video world models promise agents that can *think in frames*: imagine
-candidate futures under different actions, evaluate them, and act on the
-best one. We study this think-then-act loop directly, on top of a frozen
-video tokenizer, using a latent imagination planner that proposes
-action-conditioned futures, scores them, and inverts selected futures into
-actions. Our first contribution is negative and methodological: the
-standard training-time selection metric is circular, and under an external
-audit — future-error against the real future, persistence baselines, and
-in-distribution candidate banks — the planner's scorer was almost perfectly
+Video world models promise agents that *think in frames*: imagine futures
+under candidate actions, evaluate them, act on the best. We study this loop
+directly, atop a frozen video tokenizer, with a latent planner that
+imagines, scores, and inverts futures into actions. Our first contribution
+is methodological: the standard training-time selection metric is
+circular — under an external audit (future error vs the real future,
+persistence baselines, candidate banks) the scorer was near-perfectly
 *anti-correlated* with reality on robot data (r = −0.97) while the training
-metric read healthy. We introduce a decision-quality audit and use it to
-drive four verified fixes — candidate-ranking supervision, unit-norm plan
-tokens, reward-path stop-gradients, and per-step plan conditioning — which
-close the offline loop: candidate selection beats random on every trained
-source and transfers to a never-trained source (98–100% of contexts), while
-a reproducible phase transition grounds exact action timing (wrong-timing
-error ratios rising from 1.0 to 11–22x). We further show a symmetric
-shortcut failure: *any* act-time head given the plan token learns to route
-around imagination (the inverse-dynamics head decodes actions from the plan;
-the scorer becomes Q(state, plan)); plan-dropout training is the general
-cure, demonstrated twice. Finally, we evaluate the loop in a closed-loop
-drone navigation game across nine controlled rounds, contributing a
-structural dataset finding (window enumeration never places terminal
-transitions inside scored futures), a diagnosis of offline-MPC model
-exploitation, and a two-seed behavioral test whose outcome sharpens that
-diagnosis: selecting among behavior-prior candidates by imagined value beats
-acting without thinking in one training seed (success +1.4pp CI [+0.4,+2.6];
-return +1.74 CI [+1.20,+2.25]; n = 1000 matched episodes) and *reverses,
-CI-clean, in a second seed whose offline metrics are equal or better* —
-offline decision-quality gates do not predict even the sign of act-time
-selection value. We release the audit, harnesses, and counterfactual
-branching tools. [~200 words; trim to venue limit]
+metric read healthy. Four audit-driven fixes — candidate-ranking
+supervision, unit-norm plan tokens, reward-path stop-gradients, and
+per-step plan conditioning — close the offline loop: selection beats random
+on every trained source and transfers to a never-trained source, while a
+reproducible phase transition grounds exact action timing (error ratios
+~1.0 → 11–27x). Any act-time head given the plan token
+learns to bypass imagination; plan-dropout is the general cure. In a
+closed-loop drone game, selecting behavior-prior candidates by imagined
+value beats acting without thinking in one seed (success +1.4pp, return
++1.74; n = 1000, CI-clean) and *reverses, CI-clean, in a second seed with
+equal-or-better offline metrics*: offline decision-quality gates do not
+predict even the sign of act-time selection value.
 
 ## 1. Introduction
 
@@ -75,8 +63,9 @@ Contributions:
 3. **A reproducible timing phase transition** (§4.3, Fig. 1): with an
    *absolute* contrast margin, the margin-to-error ratio anneals upward as
    fidelity improves, and once easy negatives saturate, gradient
-   concentrates on timing negatives — wrong-timing error ratios jump from
-   1.0 to 5–22x within ~20k steps, in both seeds, with onset tracking the
+   concentrates on timing negatives — wrong-timing error ratios move off
+   1.0 (reaching 5.3x within ~18k steps of onset in the control arm and
+   11–27x at the final checkpoints), in both seeds, with onset tracking the
    transition rather than a step count.
 4. **The plan-shortcut symmetry** (§5): any head that receives the plan
    token at act time learns to bypass imagination — the inverse-dynamics
@@ -93,9 +82,13 @@ Contributions:
    without ever seeing an outcome; absorbing-state padding fixes it — a
    diagnosis of offline-MPC model exploitation, and a behavior-anchored
    remedy under which thinking beats acting-without-thinking on success and
-   return with CIs clear of zero at n = 1000.
+   return with CIs clear of zero at n = 1000 — followed by a full-stack
+   repeat in an independent seed in which every comparison *reverses*,
+   CI-clean, under equal-or-better offline metrics. The behavioral claim is
+   therefore withdrawn; the seed-level sign instability is the sharper
+   finding.
 
-Throughout we maintain a strict claim discipline (§8): no claims about real
+Throughout we maintain a strict claim discipline (§9): no claims about real
 drones; margins reported with CIs; unresolved comparisons stated as such.
 
 ## 2. Setup
@@ -165,8 +158,9 @@ against the real future (gradients confined to the scorer head).
 construction. Ranking alone repaired the scorer (fidelity correlation
 −0.97 → +0.64 on SOAR; −0.96 → +0.38 held-out) but exposed a latent bug:
 once the scorer is fidelity-sensitive, the *undetached reward-regression
-path* drags imagined futures toward score targets — proposer fidelity
-collapsed 5–10x in both arms. **Stop-gradients on all scorer inputs in the
+path* drags imagined futures toward score targets — in both arms true-plan
+future error collapsed from 0.7–1.5x persistence to 8–18x, with train
+future loss rising 5–10x. **Stop-gradients on all scorer inputs in the
 reward loss** (Dreamer-style head-only training) eliminated the collapse.
 
 A margin ablation produced a clean dichotomy: a *relative* contrast margin
@@ -195,11 +189,49 @@ scorer's transient robot-source inversion tracks the transition, not the
 step count, and *recovers* (Fig. 3), motivating per-seed, metric-based
 checkpoint selection.
 
-**Final offline results** (seed 2, 210k): all three game sources pass 6/6
-gates (timing 11–27x, selection beats random 87–93%); SOAR 5/6 (timing
-grounded at 5.0, selection 87%); held-out Bridge 5/6 with selection beating
-random in 100% of contexts. The single failing robot gate everywhere is the
-true-vs-shuffle *score margin*. [Table 1: per-source gate table]
+**Final offline results** (Table 1): the seed-1 full sweep at 210k passes
+6/6 gates on all three game sources (timing 11–15x, zero 10–13x, selection
+beats random 92–93%, persistence 0.30–0.41); the headline seed-2 final
+(210k) is the best overall artifact — expert 6/6 (timing 27x), SOAR 5/6
+(timing grounded at 5.0, selection beats random 87%), and held-out Bridge
+5/6 with selection beating random in 100% of contexts. The single failing
+robot gate at the headline checkpoint is the true-vs-shuffle *score margin*.
+
+**Table 1a — decision-quality gates at the 130k baseline** (256
+contexts/source; mse ratios > 1 good; fid_corr on bank candidates;
+sel−rand @ K=64 in future-MSE, < 0 good). Persistence at 130k: trained
+robot sources 0.52–0.94 at h4/h8 with h16 collapse (3.4–5.8x); held-out
+Bridge worse than persistence at all horizons (3.2 / 5.6 / 19x). No source
+passes all gates.
+
+| source | zero | shuffle | tshift | fid_corr | sel−rand @K64 | verdict |
+|---|---|---|---|---|---|---|
+| dreamer4_hf_expert | 4.33 | 1.23 | 1.03 | +0.02 | +0.0010 | scorer flat |
+| dreamer4_hf_mixed_small | 5.63 | 1.14 | 1.02 | −0.08 | +0.0026 | scorer harmful |
+| dreamer4_hf_mixed_large | 6.28 | 1.22 | 1.00 | −0.17 | +0.0029 | scorer harmful |
+| soar_native_v2 | 10.19 | 1.71 | 1.01 | −0.97 | +0.0328 | scorer inverted |
+| hf_robot_droid | 11.65 | 1.00 | 1.00 | +0.15 | +0.0004 | actions ignored beyond zero |
+| hf_robot_fractal | 1.91 | 1.01 | 1.01 | −0.40 | +0.0147 | scorer inverted |
+| hf_robot_bridge (held out) | 2.59 | 1.74 | 1.04 | −0.96 | +0.0114 | scorer inverted |
+| robonet_sample_64 | 1.06 | 1.05 | 1.01 | −0.27 | −0.0040 | spurious pass (tiny source) |
+
+**Table 1b — final rankfix checkpoints** (same battery; persist = true-plan
+future error over persistence, < 1 good; n/r = not re-recorded in the audit
+doc for that checkpoint — closest recorded values are the rows above/below).
+[consolidate n/r cells from output/decision_quality_audit_* JSONs on release]
+
+| source | checkpoint | fid_corr | zero | shuffle | tshift | persist h4/h8 | persist h16 | beats-rand @K64 | gates |
+|---|---|---|---|---|---|---|---|---|---|
+| expert | armE 150k (seed 1) | +0.50 | 11.95 | 7.97 | 2.92 | 0.43 / 0.40 | n/r | 91% | 6/6 |
+| SOAR | armE 150k (seed 1) | +0.59 | 22.96 | 1.52 | 1.03 | 0.49 / 0.63 | n/r | 88% | 5/6 |
+| Bridge (held out) | armE 150k (seed 1) | +0.89 | 18.40 | 2.48 | 1.12 | 1.16 / 1.60 | n/r | 98% | 5/6 |
+| expert + mixed_small + mixed_large | armE 210k (seed 1, full sweep) | n/r | 10–13 | n/r | 11–15 | 0.30–0.41 | n/r | 92–93% | 6/6 each |
+| expert | armD 210k (control) | n/r | 17.45 | 24.29 | 22.10 | 0.28 / 0.40 | 2.81 | n/r | 6/6 |
+| SOAR | armD 210k (control) | n/r | 37.29 | 1.34 | 3.59 | 0.18 / 0.21 | 1.69 | n/r | 4/6 |
+| Bridge (held out) | armD 210k (control) | n/r | 28.99 | 1.61 | 1.88 | 0.21 / 0.36 | 2.27 | n/r | 5/6 |
+| expert | armE_seed2 210k (headline) | n/r | n/r | n/r | 27 | n/r | n/r | n/r | 6/6 |
+| SOAR | armE_seed2 210k (headline) | +0.33 | n/r | n/r | 4.99 | n/r | n/r | 87% | 5/6 |
+| Bridge (held out) | armE_seed2 210k (headline) | +0.66 | n/r | n/r | 2.36 | n/r | n/r | 100% | 5/6 |
 
 ## 5. Acting on thoughts: the plan-shortcut symmetry
 
@@ -219,8 +251,8 @@ Context cannot explain the target; only the future can. With these, offline
 acting passes 5/5 gates on game data (selected actions beat random
 candidates with CI, beat the blind mean-action prior, and improve
 monotonically with K) and 4/5 on SOAR. Margins are thin (~1.5% of action
-error) relative to the oracle ceiling — the 128-d plan bottleneck —
-and Bridge transfer remains open.
+error on game data, ~0.7% on SOAR) relative to the oracle ceiling — the
+128-d plan bottleneck — and Bridge transfer remains open (1/5 gates).
 
 The same disease reappeared in the closed-loop scorer (§6): given the plan,
 it became Q(state, plan) and ignored an imagined future that correctly
@@ -238,7 +270,23 @@ success). In-domain offline metrics are near-ceiling (value correlation
 evaluation uses matched episode seeds across policies and paired bootstrap
 CIs.
 
-Nine rounds, each removing one verified defect [Table 2: round table]:
+**Table 2 — closed-loop rounds** (each removes one verified defect;
+"heuristic ceiling" = scripted expert at 41.5% success).
+
+| Round | Defect found | Fix | Behavioral outcome |
+|---|---|---|---|
+| 1 | Plan-free discrete-argmax decoding collapses to 3 of 9 actions (forward 65%, yaw never; 45% accuracy even on real futures) — the mean-action trap in discrete form | Action-native MPC: candidates are action chunks encoded via the plan encoder; the winner's own actions execute (no inverse head) | All imagination policies crash in ~9 steps |
+| 2 | Scorer myopia: 8-step shaped return rewards charging at the goal; the collision lies beyond the credit window | Relabel rewards as full-episode discounted return-to-go (gamma 0.99) | Crashes even faster (5.9 steps) while "winning" short-horizon return |
+| 3 | Return-to-go value labels alone change nothing | Retrain scorer as episode-value head (gamma 0) | Behavior identical to round 2 — exposes round 4 |
+| 4 | Structural data bug: window enumeration can never place an episode's terminal transition inside the scored future; the planner never trained on a future containing a collision (pre-collision contexts ~0.6% of windows) | Absorbing-state padding in the collector (repeated final frame, hover action, zero reward) | Behavior still identical — exposes round 5 |
+| 5 | Scorer plan-shortcut (the §5 disease): scorer routes through the plan token, Q(ctx, plan), scoring forward +16.8 while the imagined future correctly predicts the crash | Score-plan-dropout 0.5 + act-time plan-free scoring | First behavioral movement: survival 5.9 → 14.0 steps, first success (0.5%), paired return +4.0 [+3.3, +4.7] |
+| 6 | Hypothesis: missing counterfactual data at decision points | True counterfactual branch data via env snapshot/restore — all 9 actions from the same state (4,221 branches at blocked-front states) | Offline objectives improve; closed-loop regresses (6-step crashes, negative return delta vs random selection) |
+| 7 | Act-time argmax searches outside behavior support (offline-MPC model exploitation) | BC-anchored thinking: BC chunk head proposes K = 32 chunks; imagination + plan-free value select among them | First behavioral positive: think 3.5% success / −1.04 return vs BC 0.0% / −3.53; think−BC success +3.5pp [+1.0, +6.5], return +2.49 [+1.57, +3.63] |
+| 8 | Weak BC anchor (60% action accuracy); statistical power | Stronger anchor (plateaus at 60.9% — encoder-capped, not data-capped) + powered eval, n = 1000 matched seeds | CI-clean within seed: think 2.8% / −0.42 vs BC 1.4% / −2.16; success +1.4pp [+0.4, +2.6], return +1.74 [+1.20, +2.25]; return vs random +1.78 (25.7 vs 37.2 steps) |
+| 9b | Seed-robustness untested | Full-stack repeat with an independent training seed (fresh eval seeds, n = 1000) | Sign reversal, CI-clean both sides: think 0.9% vs BC 2.2% success; think−BC success −1.3pp [−2.3, −0.3], return −2.26 [−2.73, −1.83] — despite equal-or-better offline metrics |
+| PMPO | Act-time argmax over a seed-fragile value head is the residual failure | Offline PMPO policy trained in imagination (K = 16 sampled chunks, sign-of-advantage weighting, KL to a built-in BC prior; two seeds, n = 1000) | Learns survival (72–76 steps, few collisions) but ~0% success; return-vs-BC flips sign across seeds; thinking adds nothing over the policy — no cross-seed-consistent win |
+
+Nine rounds, each removing one verified defect (Table 2):
 inverse-head discrete-argmax collapse (the mean-action trap in argmax
 form); scorer myopia under 8-step shaped returns; return-to-go value
 labels; a **structural dataset finding** — window enumeration requires
@@ -269,14 +317,15 @@ goal-reaching versus random selection (+1.78 return; 25.7 vs 37.2 steps).
 A full-stack repeat with an independent training seed **reversed every
 comparison with CIs clear of zero** (think 0.9% vs BC 2.2% success; return
 −2.26 vs BC) — despite the repeat seed's *offline* metrics being equal or
-better (scorer fidelity +0.78 vs +0.57; identical BC accuracy). We
+better (scorer fidelity +0.78 vs +0.57, return correlation +0.78 vs +0.76,
+near-identical BC accuracy 60.7% vs 60.9%). We
 therefore do not claim a behavioral improvement. What the two-seed test
 establishes instead is stronger than the positive would have been: offline
 decision-quality metrics, even in-domain and near ceiling, do not predict
 the **sign** of act-time selection value; the value head's act-time
 preferences are seed-fragile in ways invisible to every offline gate. This
 is the sharpest form of our central methodological finding and the direct
-motivation for policy-in-imagination over act-time value search (§9).
+motivation for policy-in-imagination over act-time value search (§10).
 
 ## 7. Visible thinking traces
 
@@ -288,7 +337,65 @@ Real-robot scenes render layout but lose detail — a decoder-capacity limit,
 not a latent one (reconstruction of *real* latents has the same limit), so
 quantitative claims on robot data rest on the latent-space audit.
 
-## 8. Honest claims and limitations
+## 8. Related work
+
+**Learning behaviors inside learned world models.** The Dreamer line trains
+a policy by backpropagating through (or bootstrapping values within)
+imagined latent rollouts of a recurrent state-space model, from DreamerV2's
+discrete latents [Hafner et al., 2021 — verify] to DreamerV3's
+domain-general recipe — including the stop-gradient, head-only training of
+reward and value predictors that we rediscovered as our reward-detach fix
+[Hafner et al., 2023 — verify] — and Dreamer 4's scaled, action-conditioned
+video tokenizer trained largely from offline video [Hafner et al., 2025 —
+verify]. Earlier work planned online against learned latent dynamics with
+sampling-based MPC (PlaNet [Hafner et al., 2019 — verify]; PETS [Chua et
+al., 2018 — verify]) or hybridized value learning with short-horizon latent
+search (TD-MPC2 [Hansen et al., 2024 — verify]). Our setting differs in
+that the visual model comes first: like the line of work that retrofits
+action interfaces onto frozen video generative models (latent-action and
+playable world models such as Genie [Bruce et al., 2024 — verify] and
+interactive/neural game engines [Valevski et al., 2024 — verify]), we keep
+the tokenizer frozen and ask whether a planner bolted onto its latent space
+supports act-time selection. Our two-seed reversal is, in effect, an
+empirical argument for Dreamer's core design choice — train a policy in
+imagination rather than search over a learned value at act time.
+
+**Evaluating world models as decision-makers.** Video world models are
+usually evaluated by generation fidelity (e.g., FVD [Unterthiner et al.,
+2018 — verify]) or by reward/return prediction, neither of which measures
+whether the model's rankings of *candidate* futures are trustworthy; recent
+work has begun probing action controllability and physical consistency
+directly [Bruce et al., 2024 — verify; Kang et al., 2024 — verify]. Our
+audit contributes external decision-quality proxies — future error of
+selected candidates against the realized future, persistence baselines,
+oracle rank of the true plan, in-distribution candidate banks — and two
+cautionary findings for this literature: training-time selection metrics
+computed in the scorer's own score space can be circular, and even
+externally-validated offline gates fail to predict the sign of closed-loop
+selection value across seeds.
+
+**Offline model-based RL, model exploitation, and action-chunk policies.**
+That optimizing against a learned model exploits its errors is a classic
+observation: offline model-based methods answer with ensemble-uncertainty
+penalties (MOPO [Yu et al., 2020 — verify]; MOReL [Kidambi et al., 2020 —
+verify]) or short, truncated rollouts (MBPO [Janner et al., 2019 —
+verify]), while model-free offline RL constrains the policy to the behavior
+distribution (BCQ [Fujimoto et al., 2019 — verify]; CQL [Kumar et al.,
+2020 — verify]; TD3+BC [Fujimoto & Gu, 2021 — verify]). Our BC-anchored
+candidate restriction is the search-space analogue of behavior
+regularization, and our PMPO instantiation follows the
+KL-to-prior-weighted-regression family (MPO [Abdolmaleki et al., 2018 —
+verify]). Finally, our planner's action-chunk plans and inverse-dynamics
+decoding connect to action-chunking policies (ACT [Zhao et al., 2023 —
+verify]; diffusion policies [Chi et al., 2023 — verify]) and to
+vision-language-action models that emit chunked actions directly from
+context (RT-2 [Brohan et al., 2023 — verify]; OpenVLA [Kim et al., 2024 —
+verify]; pi-0 [Black et al., 2024 — verify]). The plan-shortcut symmetry
+we document is a hazard specifically for such hybrids: any act-time head
+that can read the action content from a plan/context token will route
+around the world model unless trained not to.
+
+## 9. Honest claims and limitations
 
 We claim: the offline think-then-act loop closes, repeatably (two seeds),
 with transfer of *selection* to a held-out source; timing grounding is
@@ -298,22 +405,28 @@ and offline decision-quality metrics do not predict the sign of closed-loop
 selection value (two-seed reversal, both CI-clean). We do not claim: any
 closed-loop behavioral improvement from thinking (single-seed only, not
 robust); real-drone control; robot-source acting transfer; or long-horizon
-(h16) parity — improved from 3–28x worse than persistence to 1.7–2.8x, but
-open.
+(h16) parity — improved from 3.4–28x worse than persistence to 1.7–2.8x,
+but open: a horizon-tail curriculum did not close it (expert 3.12 / SOAR
+6.98 at h16; held-out Bridge improved 11.8 → 6.7, with h8 at 0.86 — below
+persistence on the held-out source for the first time), and that run is
+confounded by a regressed lineage, so the gate is not passed and a clean
+retest from the headline checkpoint remains open.
 
-## 9. Future work
+## 10. Future work
 
 Policy-in-imagination with a control-purposed encoder (the identified root
 constraint); source-balanced ranking to remove the scorer transient; online
 iteration to close the remaining distribution gap. A first lightweight
-instantiation of the policy route (offline PMPO against the frozen planner's
-imagination, KL to a BC prior, two seeds at n = 1000) learned collision
-avoidance but not goal-reaching, with seed-inconsistent returns — consistent
-with our central finding, and indicating that behavioral closure requires
-online interaction or substantially longer imagination-RL rather than
-offline-only training.
+instantiation of the policy route (offline PMPO in the planner's imagination
+against its plan-free value, with a KL to a built-in BC prior whose gradients
+shape the context encoder; two seeds at n = 1000) learned survival (72–76
+steps, few collisions) but not goal-reaching (~0% success), with
+return-vs-BC flipping sign across seeds and thinking adding nothing over the
+policy alone — consistent with our central finding, and indicating that
+behavioral closure requires online interaction or substantially longer
+imagination-RL rather than offline-only training.
 
-## 10. Reproducibility
+## 11. Reproducibility
 
 All experiments run in a single container; every training run, audit, and
 eval is a script with a logged manifest. [artifact list = §10 of
