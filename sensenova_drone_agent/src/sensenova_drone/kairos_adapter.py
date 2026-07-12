@@ -483,9 +483,26 @@ class PythonKairosAdapter(KairosWorldModelAdapter):
     def __init__(self, cfg: dict, logger: logging.Logger | None = None):
         self.cfg = cfg
         self.logger = logger or logging.getLogger(__name__)
+        self._feature_extractor = None
 
     def encode_observation(self, frame_rgb, frame_path: str | None = None) -> ObservationEncoding:
-        _ = (frame_rgb, frame_path)
+        feature_cfg = self.cfg.get("kairos_features", {})
+        if feature_cfg.get("backend") == "vae":
+            try:
+                extractor = self._get_feature_extractor(feature_cfg)
+                payload = extractor.encode_image(frame_path or frame_rgb)
+                return ObservationEncoding(
+                    latent=payload["latent"],
+                    image_features=payload["image_features"],
+                    frame_path=frame_path,
+                    metadata=payload["metadata"],
+                )
+            except Exception as exc:
+                if not bool(feature_cfg.get("fallback_to_frame_path", True)):
+                    raise
+                self.logger.warning("Kairos VAE feature extraction failed; falling back to frame path: %s", exc)
+
+        _ = frame_rgb
         return ObservationEncoding(
             latent=None,
             image_features=None,
@@ -494,8 +511,31 @@ class PythonKairosAdapter(KairosWorldModelAdapter):
                 "backend": "python_api",
                 "latent_available": False,
                 "status": "TODO: use Kairos/Wan VAE to encode frame into latent.",
+                "feature_backend": feature_cfg.get("backend", "none"),
             },
         )
+
+    def _get_feature_extractor(self, feature_cfg: dict):
+        if self._feature_extractor is not None:
+            return self._feature_extractor
+        from sensenova_drone.kairos_features import KairosVAEFeatureExtractor
+
+        kairos_cfg = self.cfg.get("kairos", {})
+        self._feature_extractor = KairosVAEFeatureExtractor(
+            config_file=feature_cfg.get(
+                "config_file",
+                kairos_cfg.get("config_file", "/home/mkrzus/kairos-sensenova/kairos/configs/kairos_4b_config_DMD.py"),
+            ),
+            repo_root=feature_cfg.get("repo_root", kairos_cfg.get("repo_root", "/home/mkrzus/kairos-sensenova")),
+            device=feature_cfg.get("device", "cuda"),
+            dtype=feature_cfg.get("dtype", "bfloat16"),
+            height=int(feature_cfg.get("height", 480)),
+            width=int(feature_cfg.get("width", 832)),
+            tiled=bool(feature_cfg.get("tiled", True)),
+            tile_size=tuple(feature_cfg.get("tile_size", [30, 52])),
+            tile_stride=tuple(feature_cfg.get("tile_stride", [15, 26])),
+        )
+        return self._feature_extractor
 
     def encode_observation_and_memory(
         self,

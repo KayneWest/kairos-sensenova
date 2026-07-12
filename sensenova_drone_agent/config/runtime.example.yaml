@@ -49,6 +49,19 @@ kairos:
   subprocess_timeout_s: 600
   camera_control_speed: 1.0
 
+kairos_features:
+  backend: "none"  # none | vae
+  config_file: "/home/mkrzus/kairos-sensenova/kairos/configs/kairos_4b_config_DMD.py"
+  repo_root: "/home/mkrzus/kairos-sensenova"
+  device: "cuda"
+  dtype: "bfloat16"
+  height: 480
+  width: 832
+  tiled: true
+  tile_size: [30, 52]
+  tile_stride: [15, 26]
+  fallback_to_frame_path: true
+
 actions:
   hover:
     duration_s: 0.5

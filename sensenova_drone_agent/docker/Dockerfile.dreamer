@@ -1,0 +1,49 @@
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PYTHONPATH=/workspace/dreamerv3:/workspace/sensenova_drone_agent/src:/workspace/sensenova_drone_agent
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    git \
+    libgl1 \
+    libglib2.0-0 \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --upgrade pip setuptools wheel
+
+# Minimal DreamerV3 stack for the Sensenova vector-latent experiment.
+# Avoid Dreamer's full environment dependency set; we only need JAX CPU,
+# Elements/Portal/Ninjax, and PyTorch for the frozen world-model encoder.
+RUN pip install \
+    "numpy<2" \
+    "jax[cpu]==0.4.33" \
+    chex \
+    optax \
+    einops \
+    "elements>=3.19.1" \
+    "portal>=3.5.0" \
+    "ninjax>=3.5.1" \
+    ruamel.yaml \
+    scope \
+    tqdm \
+    colored_traceback \
+    pillow \
+    gymnasium
+
+# RTX 50-series / Blackwell needs a CUDA build. The local host driver supports
+# CUDA 13.1, and PyTorch cu128 wheels are compatible through the NVIDIA runtime.
+RUN pip install \
+    --index-url https://download.pytorch.org/whl/cu128 \
+    "torch==2.9.1+cu128"
+
+# Data-prep path for TFDS robotics datasets such as RoboNet. Keep this in the
+# Dreamer image so exporters can write torch-native WMDataset shards directly.
+RUN pip install \
+    "tensorflow-cpu==2.16.2" \
+    "tensorflow-datasets==4.9.7" \
+    importlib_resources \
+    gdown
+
+WORKDIR /workspace

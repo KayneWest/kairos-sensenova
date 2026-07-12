@@ -1,0 +1,24 @@
+FROM sensenova_drone_agent-dreamer:local
+
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PYTHONPATH=/workspace/sensenova_drone_agent/src:/workspace/sensenova_drone_agent:/workspace
+
+# Install only the runtime dependencies needed by the environments. The package
+# metadata currently asks for newer broad dependencies, so install the repo
+# itself without dependencies to avoid perturbing the working Kairos/Dreamer image.
+RUN pip install \
+    "setuptools<81" \
+    pybullet==3.2.7 \
+    scipy \
+    transforms3d \
+    matplotlib \
+    control \
+  && pip install --no-deps \
+    "gym-pybullet-drones @ git+https://github.com/learnsyslab/gym-pybullet-drones.git@90b178aba69b09085dd70e7a1e88bb58ca00b4c9"
+
+RUN pip install \
+    --index-url https://download.pytorch.org/whl/cpu \
+    "torchvision==0.20.1+cpu"
+
+WORKDIR /workspace
