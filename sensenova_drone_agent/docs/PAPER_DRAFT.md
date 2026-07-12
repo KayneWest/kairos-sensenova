@@ -1,6 +1,6 @@
 # From Scene Priors to Decision-Quality Imagination: Retrofitting Action Grounding into Video World-Model Latent Spaces
 
-*Draft v1.1 — 2026-07-11. Numbers are final from the July 2026 campaign; see
+*Draft v1.2 — 2026-07-12. Numbers are final from the July 2026 campaign; see
 WORKLOG.md for artifact paths. Bracketed notes mark writing TODOs.*
 
 ## Abstract
@@ -89,7 +89,9 @@ Contributions:
    repeat in an independent seed in which every comparison *reverses*,
    CI-clean, under equal-or-better offline metrics. The behavioral claim is
    therefore withdrawn; the seed-level sign instability is the sharper
-   finding.
+   finding — and one DAgger iteration on the agent's own episodes restores
+   the win *consistently in both seeds* (Fig. 2, right panels), showing the
+   failure is distributional rather than intrinsic.
 
 Throughout we maintain a strict claim discipline (§9): no claims about real
 drones; margins reported with CIs; unresolved comparisons stated as such.
@@ -109,7 +111,9 @@ training entirely and serves as the held-out source.
 future, u); an inverse-dynamics head maps (context, future, u) to an action
 chunk. Contrast losses require wrong-action plans (zero, shuffled,
 time-shifted, permuted, reversed) to imagine worse futures. Context length
-8, horizon 8, at 128×128 resolution. [architecture figure TODO]
+8, horizon 8, at 128×128 resolution. Fig. 0 shows the perceive/think/act
+lanes, the placement of the four fixes (§4), and the plan-free act-time
+heads (§5).
 
 **Gates.** For proposing: wrong-over-true error ratios and
 true-over-persistence at h ∈ {4, 8, 16}. For evaluating: scorer–fidelity
@@ -194,7 +198,7 @@ checkpoint selection.
 
 **Final offline results** (Table 1): the seed-1 full sweep at 210k passes
 6/6 gates on all three game sources (timing 11–15x, zero 10–13x, selection
-beats random 92–93%, persistence 0.30–0.41); the headline seed-2 final
+beats random 93–94%, persistence 0.30–0.41); the headline seed-2 final
 (210k) is the best overall artifact — expert 6/6 (timing 27x), SOAR 5/6
 (timing grounded at 5.0, selection beats random 87%), and held-out Bridge
 5/6 with selection beating random in 100% of contexts. The single failing
@@ -219,22 +223,23 @@ passes all gates.
 | robonet_sample_64 | 1.06 | 1.05 | 1.01 | −0.27 | −0.0040 | spurious pass (tiny source) |
 
 **Table 1b — final rankfix checkpoints** (same battery; persist = true-plan
-future error over persistence, < 1 good; n/r = not re-recorded in the audit
-doc for that checkpoint — closest recorded values are the rows above/below).
-[consolidate n/r cells from output/decision_quality_audit_* JSONs on release]
+future error over persistence, < 1 good; all cells re-extracted from the
+per-run `output/decision_quality_audit_*/summary.json` records).
 
 | source | checkpoint | fid_corr | zero | shuffle | tshift | persist h4/h8 | persist h16 | beats-rand @K64 | gates |
 |---|---|---|---|---|---|---|---|---|---|
-| expert | armE 150k (seed 1) | +0.50 | 11.95 | 7.97 | 2.92 | 0.43 / 0.40 | n/r | 91% | 6/6 |
-| SOAR | armE 150k (seed 1) | +0.59 | 22.96 | 1.52 | 1.03 | 0.49 / 0.63 | n/r | 88% | 5/6 |
-| Bridge (held out) | armE 150k (seed 1) | +0.89 | 18.40 | 2.48 | 1.12 | 1.16 / 1.60 | n/r | 98% | 5/6 |
-| expert + mixed_small + mixed_large | armE 210k (seed 1, full sweep) | n/r | 10–13 | n/r | 11–15 | 0.30–0.41 | n/r | 92–93% | 6/6 each |
-| expert | armD 210k (control) | n/r | 17.45 | 24.29 | 22.10 | 0.28 / 0.40 | 2.81 | n/r | 6/6 |
-| SOAR | armD 210k (control) | n/r | 37.29 | 1.34 | 3.59 | 0.18 / 0.21 | 1.69 | n/r | 4/6 |
-| Bridge (held out) | armD 210k (control) | n/r | 28.99 | 1.61 | 1.88 | 0.21 / 0.36 | 2.27 | n/r | 5/6 |
-| expert | armE_seed2 210k (headline) | n/r | n/r | n/r | 27 | n/r | n/r | n/r | 6/6 |
-| SOAR | armE_seed2 210k (headline) | +0.33 | n/r | n/r | 4.99 | n/r | n/r | 87% | 5/6 |
-| Bridge (held out) | armE_seed2 210k (headline) | +0.66 | n/r | n/r | 2.36 | n/r | n/r | 100% | 5/6 |
+| expert | armE 150k (seed 1) | +0.50 | 11.95 | 7.97 | 2.92 | 0.43 / 0.40 | 2.48 | 91% | 6/6 |
+| SOAR | armE 150k (seed 1) | +0.59 | 22.96 | 1.52 | 1.02 | 0.49 / 0.63 | 5.42 | 88% | 5/6 |
+| Bridge (held out) | armE 150k (seed 1) | +0.89 | 18.40 | 2.48 | 1.12 | 1.16 / 1.60 | 5.45 | 99% | 5/6 |
+| expert | armE 210k (seed 1, full sweep) | +0.57 | 9.59 | 12.26 | 11.49 | 0.36 / 0.36 | 2.21 | 93% | 6/6 |
+| mixed_small | armE 210k (seed 1, full sweep) | +0.66 | 11.02 | 15.63 | 14.00 | 0.37 / 0.41 | 2.06 | 94% | 6/6 |
+| mixed_large | armE 210k (seed 1, full sweep) | +0.63 | 12.71 | 17.72 | 15.05 | 0.32 / 0.30 | 2.09 | 94% | 6/6 |
+| expert | armD 210k (control) | +0.43 | 17.45 | 24.29 | 22.10 | 0.28 / 0.40 | 2.81 | 96% | 6/6 |
+| SOAR | armD 210k (control) | +0.48 | 37.29 | 1.34 | 3.59 | 0.18 / 0.21 | 1.69 | 77% | 4/6 |
+| Bridge (held out) | armD 210k (control) | +0.66 | 28.99 | 1.61 | 1.88 | 0.21 / 0.36 | 2.27 | 84% | 5/6 |
+| expert | armE_seed2 210k (headline) | +0.51 | 26.56 | 29.04 | 27.01 | 0.21 / 0.20 | 2.28 | 87% | 6/6 |
+| SOAR | armE_seed2 210k (headline) | +0.33 | 43.75 | 2.95 | 4.99 | 0.32 / 0.51 | 4.36 | 87% | 5/6 |
+| Bridge (held out) | armE_seed2 210k (headline) | +0.66 | 31.79 | 4.04 | 2.36 | 0.75 / 1.20 | 11.81 | 100% | 5/6 |
 
 ## 5. Acting on thoughts: the plan-shortcut symmetry
 
@@ -313,7 +318,7 @@ trains a policy inside imagination rather than searching at act time.
 candidates to a behavior prior's support — a BC chunk head proposes K = 32
 plausible action chunks; imagination and the plan-free value scorer select
 among them — produced, in the first training seed, a CI-clean behavioral
-positive (Fig. 2): 2.8% success and −0.42 return for think-then-act versus
+positive (Fig. 2, first panel): 2.8% success and −0.42 return for think-then-act versus
 1.4% / −2.16 for the same BC acting without thinking (success +1.4pp,
 CI [+0.4, +2.6]; return +1.74, CI [+1.20, +2.25]), with directed
 goal-reaching versus random selection (+1.78 return; 25.7 vs 37.2 steps).
@@ -336,7 +341,8 @@ it. We collected 400 episodes with the think-then-act agent itself (387
 ended in collision — its failures became supervision), relabeled with
 return-to-go, retrained the planner and BC head on the mixed data, and
 re-evaluated at n = 1000 — then repeated the entire training with an
-independent seed. Both seeds pass the strict gate: success 6.1% / 5.7%
+independent seed. Both seeds pass the strict gate (Fig. 2, right two
+panels): success 6.1% / 5.7%
 versus 0.5% / 0.1% for the same behavior prior acting without thinking
 (delta +5.6pp in both, CIs clear of zero) and 1.4% / 2.2% for random
 selection among identical candidates (+4.7pp / +3.5pp, CI-clean); mean
@@ -351,8 +357,11 @@ a reliable behavioral advantage.
 
 A decoder-only, motion-weighted fine-tune of the frozen tokenizer (encoder
 untouched) renders imagined futures legibly on game scenes: candidate rows
-visibly differ, and a walker advances across imagined frames.
-[Fig. 4: trace grid from output/imagination_traces_armE_latest_v2dec/]
+visibly differ, and a walker advances across imagined frames. Fig. 4 shows
+a held-out expert context where the decoded imagination is visibly
+action-conditioned and the selection machinery works end-to-end: the
+selected candidate's future error (0.0034) nearly matches the true plan's
+(0.0028), while a random plan is 5.8x worse and a zeroed plan 16x worse.
 Real-robot scenes render layout but lose detail — a decoder-capacity limit,
 not a latent one (reconstruction of *real* latents has the same limit), so
 quantitative claims on robot data rest on the latent-space audit.
@@ -451,10 +460,40 @@ imagination-RL rather than offline-only training.
 ## 11. Reproducibility
 
 All experiments run in a single container; every training run, audit, and
-eval is a script with a logged manifest. [artifact list = §10 of
-PAPER_SKELETON.md; consolidate on release]
+eval is a script with a logged manifest.
+
+**Scripts** (all under `scripts/`): `train_latent_imagination_planner.py`
+(planner + all four fixes as flags),
+`eval_latent_imagination_decision_quality.py` (the external audit),
+`eval_act_by_imagination.py` (offline acting gates),
+`eval_gym_drone_game_act_by_imagination.py` (closed-loop, matched seeds,
+paired bootstrap), `collect_gym_drone_game_dreamer4_dataset.py`
+(`--pad-terminal` absorbing states), `collect_gym_drone_game_branch_dataset.py`
+(env snapshot/restore counterfactuals), `relabel_rewards_return_to_go.py`,
+`train_drone_bc_chunk_head.py` (behavior prior),
+`train_drone_imagination_policy.py` (offline PMPO),
+`collect_dagger_episodes.py` (the DAgger loop-closer),
+`decode_imagination_traces.py` + `finetune_tokenizer_decoder.py`
+(visible thinking), `make_paper_figures.py`.
+
+**Headline checkpoints** (under `output/`): offline —
+`latent_imagination_planner_all_data_v3_rankfix_armE_seed2/planner_ckpts/final.pt`;
+robot offline acting — `..._all_data_v5_crossinv/planner_ckpts/final.pt`;
+drone closed-loop (post-DAgger, both seeds) —
+`..._drone_game_v8_dagger_c1{,_seed2}/planner_ckpts/final.pt` with
+`drone_bc_chunk_head_dagger_c1{,_seed2}.pt`.
+
+**Key result records** (under `output/`): decision-quality audits
+(`decision_quality_audit_*`); closed-loop evals
+`closed_loop_drone_game_v9_power` (seed-1 win), `v10_power_seed2`
+(reversal), `v11_pmpo_s2026090{1,2}` (PMPO), `v12_dagger_c1{,_seed2}`
+(post-DAgger consistency). **Source docs:**
+`DECISION_QUALITY_AUDIT_RESULTS.md`, `ACT_BY_IMAGINATION_HARNESS.md`,
+`WORKLOG.md`.
 
 ---
-*Figures: output/paper_figures/fig1_training_dynamics.png,
-fig2_closed_loop.png, fig3_two_seed_scorer.png; trace grids under
+*Figures: output/paper_figures/fig0_architecture.png,
+fig1_training_dynamics.png, fig2_closed_loop.png (four-panel arc:
+pre-DAgger win/reversal, post-DAgger two-seed consistency),
+fig3_two_seed_scorer.png, fig4_trace_grid.png; full trace grids under
 output/imagination_traces_armE_latest_v2dec/.*

@@ -174,6 +174,63 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-12 DAGGER CYCLE 2 — COLLECTION DONE, TRAINING BLOCKED (machine reboot; waiting on shared GPU)
+
+CHAIN: `scripts/experiments/run_dagger_cycle2.sh` — the full 2-seed cycle-2
+recipe (exact cycle-1 chain with c1->c2 bumped), setsid-detached, RESUMABLE:
+every step skips itself if its artifact already exists. Status file:
+`output/dagger_c2_chain_status.log`.
+
+DONE (survived on disk):
+- [1/9] Collection: 400 episodes with the cycle-1 winner agent (planner
+  drone_game_v8_dagger_c1 + drone_bc_chunk_head_dagger_c1.pt, collect seed
+  20270200) -> `data/gym_drone_game_dreamer4/dagger_c2` (19,635 frames).
+  24/400 success (6.0% — matches the cycle-1 eval rate), 376 collisions,
+  ~49 frames/ep vs ~40 in cycle-1 collection (agent survives longer).
+  Cycle-2 training now sees ~2x the success episodes cycle 1 had (24 vs 13).
+- [2/9] RTG relabel -> `dagger_c2_rtg`. [3/9] manifest
+  `drone_v5_dagger2_manifest.json` (base w2 + dagger_c1_rtg w1 + dagger_c2_rtg w1).
+
+BLOCKED: [4/9] planner seed1 died at init 08:54:02 with
+cudaErrorDevicesUnavailable (GPU became busy — the neighbor project took the
+devices), and the MACHINE REBOOTED ~11:52. Diagnostic note: our GPU load had
+been dead since 08:54, so this shutdown happened with ONLY the neighbor
+research job running — the instability is not (only) our dual-load.
+USER CALL: wait for the other research to finish before resuming GPU work.
+
+RESUME (one command, once GPUs are free; guard must be alive — check
+`cat /tmp/sda_thermal_guard.pid`, relaunch with
+`setsid nohup bash sensenova_drone_agent/scripts/experiments/thermal_guard.sh &`):
+
+  setsid nohup bash sensenova_drone_agent/scripts/experiments/run_dagger_cycle2.sh \
+    > sensenova_drone_agent/output/dagger_c2_chain.log 2>&1 &
+
+Chain resumes at [4/9]: planner drone_game_v9_dagger_c2 (SEED=20260710, 60k)
+-> BC head drone_bc_chunk_head_dagger_c2.pt (drone_bc_v2 data, 15k, hidden
+1024) -> n=1000 eval closed_loop_drone_game_v13_dagger_c2 (eval seed
+20260710, matched to cycle 1) -> seed2 repeat (SEED=20260711 / BC 20260712 /
+eval 20270300 -> closed_loop_drone_game_v13_dagger_c2_seed2). Question: do
+gains compound from ~6% toward the 41.5% heuristic ceiling?
+
+Thermal guard UPDATED (and relaunched post-reboot): power trigger is now
+TOTAL draw across both GPUs (pause >=950W sum, resume <=780W sum,
+per-dimension hysteresis) instead of 520W per-GPU max — the old rule
+thrashed on the neighbor job's solo ~600W bursts, which are safe alone; the
+shutdown risk it models is combined load. Temp rule unchanged (80C/68C).
+
+PAPER TRACK COMPLETE (2026-07-12, no GPU): `make_paper_figures.py` now
+renders 5 figures to `output/paper_figures/`: fig0_architecture
+(perceive/think/act lanes + the four fixes + plan-free act-time heads),
+fig1 (unchanged), fig2 REBUILT as the four-panel arc (pre-DAgger seed-1
+win -> seed-2 reversal -> post-DAgger consistency in both seeds — the
+whole paper in one figure), fig3 (unchanged), fig4_trace_grid (expert
+ctx 3: selected 0.0034 ~ true 0.0028, random 5.8x, zero-plan 16x worse;
+walker visibly action-conditioned). PAPER_DRAFT.md bumped to v1.2: all
+figure references wired (Fig 0/2/4), contribution 5 now carries the DAgger
+ending, Table 1b fully populated from the audit JSONs (no n/r cells left),
+§11 artifact list consolidated inline. Remaining paper TODOs: none
+structural — only [verify] citation markers in §8 and final polish.
+
 ## 2026-07-11 TRACK 2: DAGGER CYCLE 1 — STRICT GATE PASSES (first time)
 
 collect_dagger_episodes.py ran the act_bc_think agent for 400 episodes
