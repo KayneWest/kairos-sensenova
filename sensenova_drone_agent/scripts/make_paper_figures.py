@@ -270,6 +270,55 @@ def fig4_trace_grid():
     plt.close(fig)
 
 
+def fig5_dagger_cycles():
+    # The iteration arc: think-success across DAgger data recipes, two seeds
+    # each. Cycle 1 passes the strict gate twice; every recipe containing
+    # cycle-2 data fails, and pure replacement re-inverts selection.
+    recipes = [
+        ("cycle 1\nbase + c1 (1/3)", ["closed_loop_drone_game_v12_dagger_c1",
+                                      "closed_loop_drone_game_v12_dagger_c1_seed2"], True),
+        ("cycle 2\n+ c2 (1/2)", ["closed_loop_drone_game_v13_dagger_c2",
+                                 "closed_loop_drone_game_v13_dagger_c2_seed2"], False),
+        ("cycle 2b\n+ c2 (1/3)", ["closed_loop_drone_game_v14_dagger_c2_rebal",
+                                  "closed_loop_drone_game_v14_dagger_c2_rebal_seed2"], False),
+        ("cycle 2c\nbase + c2 only (1/3)", ["closed_loop_drone_game_v15_dagger_c2_only",
+                                            "closed_loop_drone_game_v15_dagger_c2_only_seed2"], False),
+    ]
+    series = [("act_bc_think", "think, then act", BLUE, "o", 62),
+              ("act_bc", "act without thinking", GRAY, "s", 30),
+              ("act_bc_random", "imagine, pick at random", LGRAY, "^", 34)]
+    fig, ax = plt.subplots(figsize=(7.6, 3.2), constrained_layout=True)
+    for xi, (label, runs, gate) in enumerate(recipes):
+        for si, run in enumerate(runs):
+            p = ROOT / "output" / run / "summary.json"
+            if not p.exists():
+                ax.annotate("seed 2\nrunning", (xi + 0.13, 0.4), ha="center", fontsize=7,
+                            color=MUTED, style="italic")
+                continue
+            s = json.loads(p.read_text())["per_policy"]
+            x = xi + (-0.13 if si == 0 else 0.13)
+            for key, _, color, marker, size in series:
+                ax.scatter(x, s[key]["success_rate"] * 100, color=color, marker=marker,
+                           s=size, zorder=3, edgecolor="white", linewidth=0.8)
+        ax.annotate("gate " + ("PASS x2" if gate else "fail"),
+                    (xi, -1.55), ha="center", fontsize=8,
+                    color=(BLUE if gate else RED), fontweight="bold",
+                    annotation_clip=False)
+    for key, name, color, marker, size in series:
+        ax.scatter([], [], color=color, marker=marker, s=size, label=name,
+                   edgecolor="white", linewidth=0.8)
+    ax.legend(loc="upper right", frameon=False, fontsize=8)
+    ax.set_xticks(range(len(recipes)))
+    ax.set_xticklabels([r[0] for r in recipes], fontsize=8.5)
+    ax.set_ylabel("success rate (%)")
+    ax.set_ylim(-0.3, 7.2)
+    ax.set_xlim(-0.5, len(recipes) - 0.5)
+    ax.set_title("Self-improvement is a repair, not a ladder (two seeds per recipe, n=1000 per point)",
+                 fontsize=9.5)
+    fig.savefig(OUT / "fig5_dagger_cycles.png", dpi=200)
+    plt.close(fig)
+
+
 if __name__ == "__main__":
-    fig0_architecture(); fig1(); fig2(); fig3(); fig4_trace_grid()
+    fig0_architecture(); fig1(); fig2(); fig3(); fig4_trace_grid(); fig5_dagger_cycles()
     print(json.dumps({"phase": "figures_done", "out": str(OUT), "files": sorted(p.name for p in OUT.glob("*.png"))}))

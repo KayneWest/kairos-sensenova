@@ -24,6 +24,9 @@ FIGURES = {
                  "seed-2 reversal, and post-DAgger consistency in both seeds (n = 1000 per panel)."),
     "@@FIG4@@": ("fig4_trace_grid.png", "Figure 4 — Thinking in frames: decoded imagined futures on a held-out "
                  "expert context. Selected ≈ true plan; random and zeroed plans imagine visibly worse futures."),
+    "@@FIG5@@": ("fig5_dagger_cycles.png", "Figure 5 — Self-improvement is a repair, not a ladder: think-success "
+                 "across DAgger data recipes, two seeds each. Cycle 1 passes the strict gate twice; every recipe "
+                 "containing second-round self-data fails, and pure replacement re-inverts selection."),
 }
 
 # Insert placeholders after the paragraph that first cites each figure.
@@ -31,6 +34,7 @@ ANCHORS = [
     ("heads (§5).", "@@FIG0@@"),
     ("checkpoint selection.", "@@FIG1@@\n\n@@FIG3@@"),
     ("a reliable behavioral advantage.", "@@FIG2@@"),
+    ("self-improvement ladder.", "@@FIG5@@"),
     ("rest on the latent-space audit.", "@@FIG4@@"),
 ]
 for anchor, placeholder in ANCHORS:

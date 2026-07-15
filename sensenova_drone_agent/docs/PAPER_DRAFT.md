@@ -1,6 +1,6 @@
 # From Scene Priors to Decision-Quality Imagination: Retrofitting Action Grounding into Video World-Model Latent Spaces
 
-*Draft v1.2 — 2026-07-12. Numbers are final from the July 2026 campaign; see
+*Draft v1.3 — 2026-07-15. Numbers are final from the July 2026 campaign; see
 WORKLOG.md for artifact paths. Bracketed notes mark writing TODOs.*
 
 ## Abstract
@@ -27,7 +27,11 @@ offline decision-quality gates do not predict even the sign of act-time
 selection value. The gap is distributional, and one DAgger iteration closes
 it: after training on 400 episodes of the agent's own experience, thinking
 beats both controls in both seeds (success 5.7–6.1% vs 0.1–0.5% without
-thinking; positive mean return; all CIs clear of zero).
+thinking; positive mean return; all CIs clear of zero). The repair does not
+iterate: a second round of self-collected data fails at every mixture
+tested, and training on the improved agent's failure-concentrated episodes
+re-inverts selection to worse-than-random — without expert corrections, an
+improving agent's crashes become evidence against its own best behavior.
 
 ## 1. Introduction
 
@@ -91,7 +95,8 @@ Contributions:
    therefore withdrawn; the seed-level sign instability is the sharper
    finding — and one DAgger iteration on the agent's own episodes restores
    the win *consistently in both seeds* (Fig. 2, right panels), showing the
-   failure is distributional rather than intrinsic.
+   failure is distributional rather than intrinsic. Iterating the repair
+   does not compound (§6, Fig. 5).
 
 Throughout we maintain a strict claim discipline (§9): no claims about real
 drones; margins reported with CIs; unresolved comparisons stated as such.
@@ -353,6 +358,32 @@ not intrinsically but *distributionally*, and a single round of on-policy
 data collection is sufficient, in this domain, to convert imagination into
 a reliable behavioral advantage.
 
+**Iterating the loop: a repair, not a ladder (Fig. 5).** A second round —
+collect 400 episodes with the improved cycle-1 agent (24 successes versus
+cycle 1's 13; longer, more purposeful episodes; still 94% collisions),
+retrain, and re-evaluate at n = 1000 with two independent training seeds
+per configuration — fails to reproduce the win under *every* data recipe
+tested. Accumulating the new data (DAgger fraction ½): 0.3% / 2.2% success,
+seed 1 CI-clean below both controls. Rebalancing to cycle 1's ⅓ fraction:
+partial recovery in one seed (2.9%, beating the prior CI-clean but tying
+random selection) and null in the other (0.7%). Replacing the old
+self-data entirely (base + cycle-2 data only — the exact cycle-1 recipe
+shape with fresher data): the strongest failure — 0/1000 successes, mean
+return −8.69, selection CI-clean *worse than random* (return −6.18): the
+scorer inversion of §3 re-emerges, produced this time by the data rather
+than the objective. [cycle-2c second seed running at draft time; all other
+cells are two-seed.] The mechanism is visible in the data's shape: the
+improved agent's episodes are long, goal-directed flights that mostly end
+in collision, so return-to-go labeling attaches negative outcomes to
+goal-approaching futures. As the agent improves, its failures concentrate
+along its best trajectories, and outcome-labeled self-experience becomes
+negative evidence against goal-directed action. Classic DAgger escapes
+this by querying an expert on the visited states; self-imitation has no
+such corrective signal and no reason to improve monotonically. The
+constructive conclusion above therefore carries a sharp boundary:
+on-policy data closes the distribution gap *once*; it is not, by itself, a
+self-improvement ladder.
+
 ## 7. Visible thinking traces
 
 A decoder-only, motion-weighted fine-tune of the frozen tokenizer (encoder
@@ -435,7 +466,10 @@ selection value (two-seed reversal, both CI-clean); and one DAgger iteration
 restores a two-seed-consistent behavioral win for thinking (success and
 return over both controls, all CIs clear, n = 1000 x 2 seeds). We do not
 claim: behavioral improvement without on-policy data (refuted by the
-reversal); real-drone control; robot-source acting transfer; or long-horizon
+reversal); iterated self-improvement from outcome-labeled self-data (a
+second self-collection round fails the strict gate under accumulation,
+rebalancing, and replacement, and replacement re-inverts selection to
+CI-clean worse-than-random); real-drone control; robot-source acting transfer; or long-horizon
 (h16) parity — improved from 3.4–28x worse than persistence to 1.7–2.8x,
 but open: a horizon-tail curriculum did not close it (expert 3.12 / SOAR
 6.98 at h16; held-out Bridge improved 11.8 → 6.7, with h8 at 0.86 — below
@@ -455,7 +489,11 @@ steps, few collisions) but not goal-reaching (~0% success), with
 return-vs-BC flipping sign across seeds and thinking adding nothing over the
 policy alone — consistent with our central finding, and indicating that
 behavioral closure requires online interaction or substantially longer
-imagination-RL rather than offline-only training.
+imagination-RL rather than offline-only training. For making the DAgger
+repair iterate, the cycle-2 arc identifies the levers: success-preserving
+replay (the improved agent's rare successful episodes are the diluted
+signal) or expert-corrected relabeling of visited states, in place of raw
+outcome-labeled self-imitation.
 
 ## 11. Reproducibility
 
@@ -495,5 +533,6 @@ drone closed-loop (post-DAgger, both seeds) —
 *Figures: output/paper_figures/fig0_architecture.png,
 fig1_training_dynamics.png, fig2_closed_loop.png (four-panel arc:
 pre-DAgger win/reversal, post-DAgger two-seed consistency),
-fig3_two_seed_scorer.png, fig4_trace_grid.png; full trace grids under
+fig3_two_seed_scorer.png, fig4_trace_grid.png, fig5_dagger_cycles.png
+(the iteration arc: repair, not ladder); full trace grids under
 output/imagination_traces_armE_latest_v2dec/.*
