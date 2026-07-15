@@ -174,7 +174,38 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
-## 2026-07-15 CYCLE 2b VERDICT: REBALANCE DOES NOT RESTORE THE WIN — CYCLE 2c (REPLACEMENT TEST) RUNNING
+## 2026-07-15 CYCLE-2 ARC COMPLETE: REPAIR, NOT LADDER (all cells two-seed; paper v1.3 final)
+
+CYCLE 2c VERDICT (closed_loop_drone_game_v15_dagger_c2_only{,_seed2}):
+replacement (base w2 + c2 w1, no c1 — exact c1 recipe shape, fresher data)
+is the STRONGEST failure, both seeds: think 0.0%/0.5% success, returns
+-8.69/-2.60, collision 95/99%; selection WORSE THAN RANDOM CI-clean on
+success in both (seed1 -1.7pp + return -6.18; seed2 -1.4pp [-2.4,-0.5]).
+The §3 scorer inversion re-emerges from DATA (not objective).
+
+FINAL ARC (think success s1/s2, strict gate):
+  c1  base+c1 (1/3):      6.1 / 5.7   PASS PASS   <- the only stable recipe
+  c2  +c2 (1/2):          0.3 / 2.2   fail fail
+  c2b +c2 (1/3):          2.9 / 0.7   fail fail
+  c2c base+c2 only (1/3): 0.0 / 0.5   fail fail (selection < random, both)
+MECHANISM: improved agent's episodes = long goal-directed flights ending
+in collision; RTG labels attach negative outcomes to goal-approaching
+futures -> value head learns "approaching goal predicts death." As agents
+improve, failures concentrate along best trajectories; outcome-labeled
+self-imitation becomes anti-goal evidence. Classic DAgger avoids this via
+expert corrections on visited states.
+KEY INSIGHT (paper-worthy): thinking is an AMPLIFIER, not a safety net —
+across judges, random selection stays 1.3-2.2% while think-selection spans
+0.0-6.1%: argmax over K futures multiplies judge quality in either sign.
+
+Paper v1.3 FINAL: abstract boundary sentence, §6 coda (two-seed
+throughout), §9 disclaims iterated self-improvement, §10 levers
+(success-preserving replay / expert relabeling / online value / uncertainty
+scoring), Fig 5 = the arc. All formats regenerated (HTML/PDF/artifact).
+Next campaigns (open): success-upweighted replay test; online value
+learning; uncertainty-penalized scoring.
+
+## 2026-07-15 CYCLE 2b VERDICT: REBALANCE DID NOT RESTORE THE WIN — CYCLE 2c (REPLACEMENT TEST) RAN
 
 c2b (same data as c2, dagger fraction restored to 1/3) two-seed verdict:
   seed1 (closed_loop_drone_game_v14_dagger_c2_rebal): think 2.9% / -0.32 vs

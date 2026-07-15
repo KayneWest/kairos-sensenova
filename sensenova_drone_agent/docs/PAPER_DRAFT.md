@@ -368,11 +368,11 @@ seed 1 CI-clean below both controls. Rebalancing to cycle 1's ⅓ fraction:
 partial recovery in one seed (2.9%, beating the prior CI-clean but tying
 random selection) and null in the other (0.7%). Replacing the old
 self-data entirely (base + cycle-2 data only — the exact cycle-1 recipe
-shape with fresher data): the strongest failure — 0/1000 successes, mean
-return −8.69, selection CI-clean *worse than random* (return −6.18): the
+shape with fresher data): the strongest failure, in both seeds — 0/1000
+and 5/1000 successes, with selection *worse than random* CI-clean (seed 1:
+return −6.18, success −1.7pp; seed 2: success −1.4pp [−2.4, −0.5]): the
 scorer inversion of §3 re-emerges, produced this time by the data rather
-than the objective. [cycle-2c second seed running at draft time; all other
-cells are two-seed.] The mechanism is visible in the data's shape: the
+than the objective. The mechanism is visible in the data's shape: the
 improved agent's episodes are long, goal-directed flights that mostly end
 in collision, so return-to-go labeling attaches negative outcomes to
 goal-approaching futures. As the agent improves, its failures concentrate
