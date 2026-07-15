@@ -174,6 +174,29 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-14 DAGGER CYCLE 2 RUNNING (GPU 1) + THERMAL GUARD v3 UNDER SYSTEMD
+
+GPUs freed (other research done for now); chain relaunched 19:44 CT and
+correctly SKIPPED collect/relabel (cycle-2 data already on disk) — planner
+seed1 drone_game_v9_dagger_c2 training (~9 steps/s, 60k ~1.8h), then BC ->
+eval v13_dagger_c2 -> seed2 repeat. Monitor live on
+output/dagger_c2_chain_status.log. User: run as many cycles as we want —
+if cycle 2 compounds, cycle 3 = same script with c2->c3 bumped (and add a
+thermal_gate() between stages, per optimal-z pattern; do NOT edit
+run_dagger_cycle2.sh while it is executing — bash reads scripts lazily).
+
+THERMAL GUARD v3 (commit 2e96f95), lessons transplanted from the user's
+~/optimal-z agent's guard ON THIS SAME BOX: (1) sustained rules — 10-min
+avg max-temp >=72C forces 180s cooldown (heat-soak: this box held 79C/588W
+sustained without crossing any instant trip), 5-min avg total power >=850W
+forces 90s cooldown; instant trips unchanged (80C / 950W sum). (2)
+PERSISTENCE: now runs as user systemd unit sda-thermal-guard.service
+(Restart=on-failure, loginctl linger) — survives reboots/session
+teardowns; the setsid guard died on all three reboots to date. Manage via
+`systemctl --user {status,stop,restart} sda-thermal-guard`. Caveat: paused
+containers keep VRAM (guard sheds heat/power, never frees the card).
+Neighbor project runs its own SIGSTOP-based guard for its processes.
+
 ## 2026-07-12 DAGGER CYCLE 2 — COLLECTION DONE, TRAINING BLOCKED (machine reboot; waiting on shared GPU)
 
 CHAIN: `scripts/experiments/run_dagger_cycle2.sh` — the full 2-seed cycle-2
