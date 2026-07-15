@@ -174,7 +174,32 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
-## 2026-07-15 DAGGER CYCLE 2 VERDICT: REGRESSION IN BOTH SEEDS — CYCLE 2b (REBALANCE TEST) RUNNING
+## 2026-07-15 CYCLE 2b VERDICT: REBALANCE DOES NOT RESTORE THE WIN — CYCLE 2c (REPLACEMENT TEST) RUNNING
+
+c2b (same data as c2, dagger fraction restored to 1/3) two-seed verdict:
+  seed1 (closed_loop_drone_game_v14_dagger_c2_rebal): think 2.9% / -0.32 vs
+    bc 0.3% / -6.56 vs random 2.1% / -1.99 — beats BC CI-clean (success
+    +2.6pp [+1.5,+3.8], return +6.24) but ties random on success
+    (+0.8pp CI spans 0) -> strict gate FAILS.
+  seed2 (..._seed2): think 0.7% / -2.57 vs bc 0.7% vs random 1.3% — NULL
+    on success (ties bc exactly, -0.6pp vs random spans 0); only returns
+    positive. Gate FAILS.
+Partial-dilution conclusion: fraction explains some of c2's collapse
+(seed1 0.3->2.9) but NO mix containing c2 data passes the gate in any
+seed. Running arc: c1 6.1/5.7 gate PASS both; c2 0.3/2.2 FAIL; c2b
+2.9/0.7 FAIL.
+
+CYCLE 2c RUNNING (launched ~09:40, `run_dagger_cycle2c.sh`): the
+replacement test — exact c1 recipe shape with newer data, base w2 +
+dagger_c2_rtg w1 ONLY (no c1 data). Manifest drone_v7_dagger2_only;
+planners drone_game_v11_dagger_c2_only{,_seed2}; BC heads
+drone_bc_chunk_head_dagger_c2_only{,_seed2}.pt; evals
+closed_loop_drone_game_v15_dagger_c2_only{,_seed2}. Wins => compounding =
+rolling replacement of self-data. Fails => c2 data itself is the problem;
+cycle-1 was a one-time distributional repair. Status:
+output/dagger_c2c_chain_status.log.
+
+## 2026-07-15 DAGGER CYCLE 2 VERDICT: REGRESSION IN BOTH SEEDS — CYCLE 2b (REBALANCE TEST) RAN
 
 Cycle-2 chain completed 01:52. TWO-SEED VERDICT: naive DAgger accumulation
 does NOT compound — it destroyed the cycle-1 win.
