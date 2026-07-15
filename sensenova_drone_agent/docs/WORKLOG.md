@@ -174,6 +174,41 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-15 DAGGER CYCLE 2 VERDICT: REGRESSION IN BOTH SEEDS — CYCLE 2b (REBALANCE TEST) RUNNING
+
+Cycle-2 chain completed 01:52. TWO-SEED VERDICT: naive DAgger accumulation
+does NOT compound — it destroyed the cycle-1 win.
+  seed1 (closed_loop_drone_game_v13_dagger_c2):     think 0.3% success /
+    -3.39 return, collision 99.1% — CI-clean WORSE than act_bc (success
+    -1.1pp [-2.0,-0.3]) and act_bc_random (-1.8pp, return -0.92) on
+    success; return-vs-bc still +1.79 CI-clean (charges goal, then crashes).
+  seed2 (v13_dagger_c2_seed2): think 2.2% / -1.17 vs bc 1.7% / -1.18 vs
+    random 1.7% / -2.48 — NULL: all success CIs span zero; only
+    return-vs-random positive (+1.31).
+  bc_thinking_wins=false in both. Compare cycle 1: 6.1% / 5.7%, wins both.
+Not a chain bug: BC head acc 61% (= c1), episodes ~36 steps, matched eval
+seeds. The single changed variable: training mix DAgger fraction went 1/3
+(c1) -> 1/2 (c2), both DAgger sets ~94% collisions.
+
+HYPOTHESIS: failure-data dilution of the success signal. TEST RUNNING
+(cycle 2b, `scripts/experiments/run_dagger_cycle2b.sh`, launched 02:15,
+GPU 1, no new collection): retrain on the SAME data with dagger fraction
+restored to 1/3 — manifest drone_v6_dagger2_rebal (base w4 + c1 w1 + c2
+w1) -> planner drone_game_v10_dagger_c2_rebal{,_seed2} -> BC heads
+drone_bc_chunk_head_dagger_c2_rebal{,_seed2}.pt -> evals
+closed_loop_drone_game_v14_dagger_c2_rebal{,_seed2} (matched eval seeds).
+If think returns to ~6%: dilution confirmed, and the compounding recipe is
+fraction-controlled replay. If not: the cycle-1 win is fragile to
+retraining with any new data — sharper negative. Status:
+output/dagger_c2b_chain_status.log. Chain adds thermal_gate() between
+stages (settle to <=75C / <=600W, max 15min wait).
+
+PAPER IMPACT (apply after c2b lands, one pass): §6 DAgger paragraph keeps
+the c1 two-seed claim (still true) but gains a coda — a second naive
+accumulation round regresses (0.3%/2.2%, gate fails both seeds); §9 add
+"we do not claim: iterated self-improvement from naive data accumulation";
+Fig 2 possibly gains the c2 panels or a cycle-curve.
+
 ## 2026-07-14 DAGGER CYCLE 2 RUNNING (GPU 1) + THERMAL GUARD v3 UNDER SYSTEMD
 
 GPUs freed (other research done for now); chain relaunched 19:44 CT and
