@@ -86,37 +86,37 @@ EOF
 st "=== DIFFUSION-THINK CAMPAIGN START (GPU 1) ==="
 
 st "[1/6] train proposer seed1 (30k, cond on c1 encoders)"
-train_proposer latent_diffusion_proposer_v1 drone_game_v8_dagger_c1 20260710
+train_proposer latent_diffusion_proposer_v2 drone_game_v8_dagger_c1 20260710
 
 st "[2/6] lambda sweep (n=200, good judge)"
 for pair in "0.25 l025" "1.0 l1" "4.0 l4" "16.0 l16"; do
   set -- $pair
   run_eval "diffusion_lambda_sweep_$2" drone_game_v8_dagger_c1 drone_game_v8_dagger_c1 \
-    drone_bc_chunk_head_dagger_c1.pt latent_diffusion_proposer_v1 "$1" 200 20260710 "diff_guided"
+    drone_bc_chunk_head_dagger_c1.pt latent_diffusion_proposer_v2 "$1" 200 20260710 "diff_guided"
 done
 LAM=$(pick_lambda)
 st "lambda picked: ${LAM}"
 
 st "[3/6] full evals seed1: good judge (c1) + inverted judge (c2c), n=1000, lambda=${LAM}"
 run_eval closed_loop_drone_game_v16_diffthink_goodjudge drone_game_v8_dagger_c1 drone_game_v8_dagger_c1 \
-  drone_bc_chunk_head_dagger_c1.pt latent_diffusion_proposer_v1 "$LAM" 1000 20260710 \
+  drone_bc_chunk_head_dagger_c1.pt latent_diffusion_proposer_v2 "$LAM" 1000 20260710 \
   "bc,bc_random,diff_prior,diff_argmax,diff_guided"
 python3 -c "import json; d=json.load(open('${SDA}/output/closed_loop_drone_game_v16_diffthink_goodjudge/summary.json')); print(json.dumps({k:v for k,v in d['gates'].items() if k.endswith('_wins')}))" | tee -a "$STATUS"
 run_eval closed_loop_drone_game_v16_diffthink_badjudge drone_game_v8_dagger_c1 drone_game_v11_dagger_c2_only \
-  drone_bc_chunk_head_dagger_c1.pt latent_diffusion_proposer_v1 "$LAM" 1000 20260710 \
+  drone_bc_chunk_head_dagger_c1.pt latent_diffusion_proposer_v2 "$LAM" 1000 20260710 \
   "bc,bc_random,diff_prior,diff_argmax,diff_guided"
 python3 -c "import json; d=json.load(open('${SDA}/output/closed_loop_drone_game_v16_diffthink_badjudge/summary.json')); print(json.dumps({k:v for k,v in d['gates'].items() if k.endswith('_wins')}))" | tee -a "$STATUS"
 
 st "[4/6] train proposer seed2 (cond on c1_seed2 encoders)"
-train_proposer latent_diffusion_proposer_v1_seed2 drone_game_v8_dagger_c1_seed2 20260711
+train_proposer latent_diffusion_proposer_v2_seed2 drone_game_v8_dagger_c1_seed2 20260711
 
 st "[5/6] full evals seed2 (judges c1_seed2 / c2c_seed2, eval seed 20270300, lambda=${LAM})"
 run_eval closed_loop_drone_game_v16_diffthink_goodjudge_seed2 drone_game_v8_dagger_c1_seed2 drone_game_v8_dagger_c1_seed2 \
-  drone_bc_chunk_head_dagger_c1_seed2.pt latent_diffusion_proposer_v1_seed2 "$LAM" 1000 20270300 \
+  drone_bc_chunk_head_dagger_c1_seed2.pt latent_diffusion_proposer_v2_seed2 "$LAM" 1000 20270300 \
   "bc,bc_random,diff_prior,diff_argmax,diff_guided"
 python3 -c "import json; d=json.load(open('${SDA}/output/closed_loop_drone_game_v16_diffthink_goodjudge_seed2/summary.json')); print(json.dumps({k:v for k,v in d['gates'].items() if k.endswith('_wins')}))" | tee -a "$STATUS"
 run_eval closed_loop_drone_game_v16_diffthink_badjudge_seed2 drone_game_v8_dagger_c1_seed2 drone_game_v11_dagger_c2_only_seed2 \
-  drone_bc_chunk_head_dagger_c1_seed2.pt latent_diffusion_proposer_v1_seed2 "$LAM" 1000 20270300 \
+  drone_bc_chunk_head_dagger_c1_seed2.pt latent_diffusion_proposer_v2_seed2 "$LAM" 1000 20270300 \
   "bc,bc_random,diff_prior,diff_argmax,diff_guided"
 python3 -c "import json; d=json.load(open('${SDA}/output/closed_loop_drone_game_v16_diffthink_badjudge_seed2/summary.json')); print(json.dumps({k:v for k,v in d['gates'].items() if k.endswith('_wins')}))" | tee -a "$STATUS"
 

@@ -60,13 +60,13 @@ class Stack:
         dck = torch.load(resolve_path(args.diffusion_ckpt), map_location="cpu", weights_only=False)
         dc = dck["config"]
         self.diff = DiffusionProposer(x_dim=dc["x_dim"], ctx_dim=dc["ctx_dim"], plan_dim=dc["plan_dim"],
-                                      width=dc["width"], depth=dc["depth"]).to(device)
+                                      z_dim=dc["z_dim"], width=dc["width"], depth=dc["depth"]).to(device)
         self.diff.load_state_dict(dck["model"])
         self.diff.eval()
         self.T = int(dc["diffusion_T"])
         self.ddim_steps = int(args.ddim_steps or dc["ddim_steps"])
-        self.mu = float(dck["norm"]["mu"])
-        self.sigma = float(dck["norm"]["sigma"])
+        self.mu = dck["norm"]["mu"].to(device)        # per-dim, (h*z_dim,)
+        self.sigma = dck["norm"]["sigma"].to(device)  # per-dim, (h*z_dim,)
         self.h = int(self.cfg.horizon)
 
     @torch.no_grad()
@@ -83,12 +83,18 @@ class Stack:
         acts = actions.clamp(-1, 1) * amask
         return ctx_z, self.planner.encode_context(ctx_z, acts), self.judge.encode_context(ctx_z, acts)
 
-    def judge_score_fn(self, ctx_h_judge):
-        """Score UNNORMALIZED flattened futures with the judge, plan-free."""
+    def to_future(self, x_norm_flat, last_z):
+        """Normalized persistence-delta -> absolute future latents (B, h, z)."""
+        delta = x_norm_flat * self.sigma[None, :] + self.mu[None, :]
+        fut = delta.view(-1, self.h, self.z_dim) + last_z[:, None, :]
+        return fut
+
+    def judge_score_fn(self, ctx_h_judge, last_z):
+        """Score futures (from normalized deltas) with the judge, plan-free."""
         zero_plan = torch.zeros((1, self.judge.plan_dim), device=self.device)
 
         def fn(x0_norm_flat):
-            fut = (x0_norm_flat * self.sigma + self.mu).view(-1, self.h, self.z_dim)
+            fut = self.to_future(x0_norm_flat, last_z.expand(x0_norm_flat.shape[0], -1))
             chj = ctx_h_judge.expand(fut.shape[0], -1)
             zp = zero_plan.expand(fut.shape[0], -1)
             return self.judge.score_future(chj, fut, zp)
@@ -97,6 +103,7 @@ class Stack:
 
 def plan_chunk_diffusion(stack: Stack, *, policy, frames, act_hist, K, rng, lam, gen):
     ctx_z, ctx_h, ctx_h_j = stack.encode_ctx(frames, act_hist)
+    last_z = ctx_z[:, -1]  # (1, z_dim)
     h, dev = stack.h, stack.device
     with torch.no_grad():
         logits = stack.bc_head(ctx_h)[0] / 0.8  # bc_temperature matched to prior evals
@@ -118,22 +125,23 @@ def plan_chunk_diffusion(stack: Stack, *, policy, frames, act_hist, K, rng, lam,
                 onehot[i, t, a] = 1.0
         with torch.no_grad():
             chr_ = ctx_h.expand(len(chunks), -1)
+            lzr = last_z.expand(len(chunks), -1)
             plans = stack.planner.encode_plan(chr_, onehot)
-            x = ddim_sample(stack.diff, ctx_h=chr_, plan=plans, steps=stack.ddim_steps, T=stack.T,
+            x = ddim_sample(stack.diff, ctx_h=chr_, plan=plans, last_z=lzr, steps=stack.ddim_steps, T=stack.T,
                             shape=(len(chunks), stack.h * stack.z_dim), device=dev, generator=gen)
-            scores = stack.judge_score_fn(ctx_h_j)(x)
+            scores = stack.judge_score_fn(ctx_h_j, last_z)(x)
         pick = int(scores.argmax())
         return list(chunks[pick])
 
     if policy in ("diff_prior", "diff_guided"):
         scale = 0.0 if policy == "diff_prior" else float(lam)
         zero_plan = torch.zeros((1, stack.planner.plan_dim), device=dev)
-        x = ddim_sample(stack.diff, ctx_h=ctx_h, plan=zero_plan, steps=stack.ddim_steps, T=stack.T,
+        x = ddim_sample(stack.diff, ctx_h=ctx_h, plan=zero_plan, last_z=last_z, steps=stack.ddim_steps, T=stack.T,
                         shape=(1, stack.h * stack.z_dim), device=dev, generator=gen,
-                        guidance_fn=stack.judge_score_fn(ctx_h_j) if scale > 0 else None,
+                        guidance_fn=stack.judge_score_fn(ctx_h_j, last_z) if scale > 0 else None,
                         guidance_scale=scale)
         with torch.no_grad():
-            fut = (x * stack.sigma + stack.mu).view(1, stack.h, stack.z_dim)
+            fut = stack.to_future(x, last_z)
             act_logits = stack.planner.inverse_actions(ctx_h, fut, zero_plan)[0]
         return [int(i) for i in act_logits.argmax(dim=-1).tolist()]
 

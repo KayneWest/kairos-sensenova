@@ -68,14 +68,16 @@ class FiLMBlock(nn.Module):
 class DiffusionProposer(nn.Module):
     """Epsilon-predictor over the flattened future chunk (horizon * z_dim)."""
 
-    def __init__(self, *, x_dim: int, ctx_dim: int, plan_dim: int, width: int = 2048, depth: int = 4, t_dim: int = 256):
+    def __init__(self, *, x_dim: int, ctx_dim: int, plan_dim: int, z_dim: int, width: int = 2048, depth: int = 4, t_dim: int = 256):
         super().__init__()
         self.x_dim, self.ctx_dim, self.plan_dim = int(x_dim), int(ctx_dim), int(plan_dim)
+        self.z_dim = int(z_dim)
         self.width, self.depth, self.t_dim = int(width), int(depth), int(t_dim)
         cond_dim = 512
         self.t_mlp = nn.Sequential(nn.Linear(t_dim, cond_dim), nn.SiLU(), nn.Linear(cond_dim, cond_dim))
         self.ctx_proj = nn.Linear(ctx_dim, cond_dim)
         self.plan_proj = nn.Linear(plan_dim, cond_dim)
+        self.z_proj = nn.Linear(z_dim, cond_dim)  # last ctx frame latent — the anchor the delta continues from
         self.in_proj = nn.Linear(x_dim, width)
         self.blocks = nn.ModuleList([FiLMBlock(width, cond_dim) for _ in range(depth)])
         self.out_norm = nn.LayerNorm(width)
@@ -89,8 +91,8 @@ class DiffusionProposer(nn.Module):
         ang = t.float()[:, None] * freqs[None, :]
         return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
 
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor, ctx_h: torch.Tensor, plan: torch.Tensor) -> torch.Tensor:
-        cond = self.t_mlp(self.time_embed(t)) + self.ctx_proj(ctx_h) + self.plan_proj(plan)
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, ctx_h: torch.Tensor, plan: torch.Tensor, last_z: torch.Tensor) -> torch.Tensor:
+        cond = self.t_mlp(self.time_embed(t)) + self.ctx_proj(ctx_h) + self.plan_proj(plan) + self.z_proj(last_z)
         h = self.in_proj(x_t)
         for blk in self.blocks:
             h = blk(h, cond)
@@ -98,7 +100,7 @@ class DiffusionProposer(nn.Module):
 
 
 @torch.no_grad()
-def ddim_sample(model, *, ctx_h, plan, steps, T, shape, device, generator=None,
+def ddim_sample(model, *, ctx_h, plan, last_z, steps, T, shape, device, generator=None,
                 guidance_fn=None, guidance_scale=0.0):
     """DDIM sampling; optional value guidance shifts x_t toward higher score.
 
@@ -114,13 +116,13 @@ def ddim_sample(model, *, ctx_h, plan, steps, T, shape, device, generator=None,
         if guidance_fn is not None and guidance_scale > 0:
             with torch.enable_grad():
                 x_req = x.detach().requires_grad_(True)
-                eps = model(x_req, tb, ctx_h, plan)
+                eps = model(x_req, tb, ctx_h, plan, last_z)
                 x0 = (x_req - (1 - ab_t).sqrt() * eps) / ab_t.sqrt()
                 score = guidance_fn(x0).sum()
                 grad = torch.autograd.grad(score, x_req)[0]
             eps = eps.detach() - guidance_scale * (1 - ab_t).sqrt() * grad
         else:
-            eps = model(x, tb, ctx_h, plan)
+            eps = model(x, tb, ctx_h, plan, last_z)
         x0 = (x - (1 - ab_t).sqrt() * eps) / ab_t.sqrt()
         x0 = x0.clamp(-4.0, 4.0)
         if i == len(ts) - 1:
@@ -198,7 +200,7 @@ def main() -> int:
                         drop_last=True, collate_fn=collate_batch, persistent_workers=args.num_workers > 0)
     x_dim = cfg.horizon * z_dim
     model = DiffusionProposer(x_dim=x_dim, ctx_dim=cfg.hidden_dim, plan_dim=cfg.plan_dim,
-                              width=args.width, depth=args.depth).to(device)
+                              z_dim=z_dim, width=args.width, depth=args.depth).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     scaler = torch.amp.GradScaler("cuda")
     n_params = sum(q.numel() for q in model.parameters())
@@ -219,37 +221,44 @@ def main() -> int:
             ctx_z, ctx_actions, future_z, future_actions, _fm, _rw = split_batch(batch, cfg)
             ctx_h = planner.encode_context(ctx_z, ctx_actions)
             plan = planner.encode_plan(ctx_h, future_actions)
-        return ctx_z, ctx_h, plan, future_z
+            last_z = ctx_z[:, -1]
+            delta = (future_z - last_z[:, None, :]).flatten(1)
+        return ctx_h, plan, last_z, delta, future_z
 
-    # --- normalization stats over the future chunk ---
+    # --- per-dim normalization stats over the persistence DELTA ---
     print(json.dumps({"phase": "norm_stats", "batches": args.norm_batches}), flush=True)
-    acc, acc2, n_acc = 0.0, 0.0, 0
+    acc = torch.zeros(x_dim, device=device)
+    acc2 = torch.zeros(x_dim, device=device)
+    n_acc = 0
     for _ in range(args.norm_batches):
-        _, _, _, future_z = prep(next(it))
-        f = future_z.flatten(1)
-        acc += f.sum().item()
-        acc2 += (f ** 2).sum().item()
-        n_acc += f.numel()
+        _, _, _, delta, _ = prep(next(it))
+        acc += delta.sum(dim=0)
+        acc2 += (delta ** 2).sum(dim=0)
+        n_acc += delta.shape[0]
     mu = acc / n_acc
-    sigma = math.sqrt(max(1e-8, acc2 / n_acc - mu ** 2))
-    print(json.dumps({"phase": "norm_stats_done", "mu": mu, "sigma": sigma}), flush=True)
+    sigma = (acc2 / n_acc - mu ** 2).clamp_min(1e-8).sqrt().clamp_min(1e-3)
+    print(json.dumps({"phase": "norm_stats_done", "mu_mean": float(mu.mean()), "sigma_mean": float(sigma.mean())}), flush=True)
 
     # fixed eval batch (held aside from the stream, not strictly held out —
     # generative MSE here is a training diagnostic; decision-quality is
     # measured downstream)
     eval_raw = next(it)
-    eval_ctx_z, eval_ctx_h, eval_plan, eval_future = prep(eval_raw)
+    eval_ctx_h, eval_plan, eval_last_z, eval_delta, eval_future = prep(eval_raw)
     ns_eval = min(args.eval_samples, eval_ctx_h.shape[0])
     eval_ctx_h, eval_plan = eval_ctx_h[:ns_eval], eval_plan[:ns_eval]
-    eval_future_n = ((eval_future[:ns_eval].flatten(1) - mu) / sigma)
-    eval_persist = eval_ctx_z[:ns_eval, -1][:, None, :].expand(-1, cfg.horizon, -1).flatten(1)
-    persist_mse = torch.nn.functional.mse_loss(eval_persist, eval_future[:ns_eval].flatten(1)).item()
+    eval_last_z, eval_future = eval_last_z[:ns_eval], eval_future[:ns_eval].flatten(1)
+    persist_mse = torch.nn.functional.mse_loss(
+        eval_last_z[:, None, :].expand(-1, cfg.horizon, -1).flatten(1), eval_future).item()
+
+    def denorm_to_future(x_norm):
+        delta = x_norm * sigma[None, :] + mu[None, :]
+        return delta + eval_last_z[:, None, :].expand(-1, cfg.horizon, -1).flatten(1)
 
     started = time.time()
     T = args.diffusion_T
     for step in range(1, args.steps + 1):
-        _, ctx_h, plan, future_z = prep(next(it))
-        x0 = ((future_z.flatten(1) - mu) / sigma)
+        ctx_h, plan, last_z, delta, _ = prep(next(it))
+        x0 = (delta - mu[None, :]) / sigma[None, :]
         if args.plan_dropout > 0:
             drop = (torch.rand(plan.shape[0], 1, device=device) < args.plan_dropout).float()
             plan = plan * (1 - drop)
@@ -258,7 +267,7 @@ def main() -> int:
         noise = torch.randn_like(x0)
         x_t = ab.sqrt() * x0 + (1 - ab).sqrt() * noise
         with torch.amp.autocast("cuda"):
-            eps = model(x_t, t, ctx_h, plan)
+            eps = model(x_t, t, ctx_h, plan, last_z)
             loss = torch.nn.functional.mse_loss(eps.float(), noise)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -276,13 +285,13 @@ def main() -> int:
             model.eval()
             gen = torch.Generator(device=device.type).manual_seed(args.seed + step)
             with torch.no_grad():
-                s_plan = ddim_sample(model, ctx_h=eval_ctx_h, plan=eval_plan, steps=args.ddim_steps,
-                                     T=T, shape=eval_future_n.shape, device=device, generator=gen)
-                s_free = ddim_sample(model, ctx_h=eval_ctx_h, plan=torch.zeros_like(eval_plan),
-                                     steps=args.ddim_steps, T=T, shape=eval_future_n.shape,
+                s_plan = ddim_sample(model, ctx_h=eval_ctx_h, plan=eval_plan, last_z=eval_last_z,
+                                     steps=args.ddim_steps, T=T, shape=(ns_eval, x_dim), device=device, generator=gen)
+                s_free = ddim_sample(model, ctx_h=eval_ctx_h, plan=torch.zeros_like(eval_plan), last_z=eval_last_z,
+                                     steps=args.ddim_steps, T=T, shape=(ns_eval, x_dim),
                                      device=device, generator=gen)
-            mse_plan = torch.nn.functional.mse_loss(s_plan * sigma + mu, eval_future_n * sigma + mu).item()
-            mse_free = torch.nn.functional.mse_loss(s_free * sigma + mu, eval_future_n * sigma + mu).item()
+            mse_plan = torch.nn.functional.mse_loss(denorm_to_future(s_plan), eval_future).item()
+            mse_free = torch.nn.functional.mse_loss(denorm_to_future(s_free), eval_future).item()
             row = {"step": step, "eval": True, "sample_mse_plan": mse_plan, "sample_mse_planfree": mse_free,
                    "persist_mse": persist_mse, "plan_over_free": mse_plan / max(1e-9, mse_free)}
             print(json.dumps(row), flush=True)
@@ -294,7 +303,7 @@ def main() -> int:
             "config": {"x_dim": x_dim, "ctx_dim": cfg.hidden_dim, "plan_dim": cfg.plan_dim,
                        "width": args.width, "depth": args.depth, "diffusion_T": T,
                        "horizon": cfg.horizon, "z_dim": z_dim, "ddim_steps": args.ddim_steps},
-            "norm": {"mu": mu, "sigma": sigma},
+            "norm": {"mu": mu.cpu(), "sigma": sigma.cpu(), "parameterization": "persistence_delta_perdim"},
             "planner_ckpt": str(args.planner_ckpt), "step": args.steps}
     torch.save(ckpt, out_dir / "final.pt")
     print(json.dumps({"phase": "done", "out": str(out_dir / "final.pt")}), flush=True)
