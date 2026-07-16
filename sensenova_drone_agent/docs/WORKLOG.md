@@ -174,6 +174,38 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-16 DIFFUSION-THINK CAMPAIGN RUNNING (GPU 1): does guided generation bound the amplifier?
+
+USER IDEA -> CAMPAIGN: treat latent->image as diffusion; "force z down a
+thinking trajectory before releasing it" = value-GUIDED denoising (soft,
+prior-anchored optimization) vs our argmax-over-K (hard optimizer that the
+amplifier finding indicts). Unique asset: certified-good judge (c1) +
+certified-inverted judge (c2c) from the cycle-2 arc.
+
+NEW CODE (commit pending this entry):
+- scripts/train_latent_diffusion_proposer.py — eps-pred FiLM-MLP (60M) over
+  flattened future chunk (8x512=4096), cosine DDPM T=1000, DDIM 30,
+  conditioned on FROZEN c1 planner ctx_h + plan (dropout 0.5 -> plan-free
+  sampling works); ddim_sample() supports value guidance (grad of judge
+  score wrt x_t through the x0 estimate). Trains on drone_v4_dagger
+  manifest (the c1 winning mix). ~2.4 steps/s -> 30k ~= 3.5h.
+- scripts/eval_gym_drone_game_diffusion_think.py — closed-loop, matched
+  seeds, policies: bc / bc_random / diff_prior (lambda=0 control) /
+  diff_argmax (K BC candidates, plan-conditioned samples, judge argmax) /
+  diff_guided (ONE plan-free sample steered by judge gradient, plan-free
+  inverse decode). Proposer stack fixed; JUDGE swappable (--judge-ckpt).
+  Paired bootstrap gates incl. diff_{argmax,guided}_wins.
+- scripts/experiments/run_diffusion_think_campaign.sh — chain: train
+  proposer s1 -> lambda sweep {0.25,1,4,16} n=200 on GOOD judge -> full
+  n=1000 evals under good (v16_diffthink_goodjudge) AND inverted
+  (v16_diffthink_badjudge) judges -> repeat full stack seed2 (c1_seed2 /
+  c2c_seed2 judges, eval seed 20270300).
+PREDICTION: argmax flips sign with the judge (known); guided degrades
+toward the prior under the inverted judge (floor rises from
+worse-than-random to ~BC) while retaining a win under the good judge.
+Status: output/diffusion_think_chain_status.log. ETA ~12h.
+After results: update paper (new §; likely paper-2 opener) + this log.
+
 ## 2026-07-15 CYCLE-2 ARC COMPLETE: REPAIR, NOT LADDER (all cells two-seed; paper v1.3 final)
 
 CYCLE 2c VERDICT (closed_loop_drone_game_v15_dagger_c2_only{,_seed2}):
