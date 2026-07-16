@@ -111,7 +111,7 @@ def plan_chunk_diffusion(stack: Stack, *, policy, frames, act_hist, K, rng, lam,
     if policy == "bc":
         return [int(i) for i in logits.argmax(dim=-1).tolist()]
 
-    if policy in ("bc_random", "diff_argmax"):
+    if policy in ("bc_random", "diff_argmax", "gru_argmax"):
         probs = torch.softmax(logits, dim=-1)
         with torch.no_grad():
             samples = torch.multinomial(probs, K - 1, replacement=True, generator=None).T
@@ -125,11 +125,22 @@ def plan_chunk_diffusion(stack: Stack, *, policy, frames, act_hist, K, rng, lam,
                 onehot[i, t, a] = 1.0
         with torch.no_grad():
             chr_ = ctx_h.expand(len(chunks), -1)
-            lzr = last_z.expand(len(chunks), -1)
             plans = stack.planner.encode_plan(chr_, onehot)
-            x = ddim_sample(stack.diff, ctx_h=chr_, plan=plans, last_z=lzr, steps=stack.ddim_steps, T=stack.T,
-                            shape=(len(chunks), stack.h * stack.z_dim), device=dev, generator=gen)
-            scores = stack.judge_score_fn(ctx_h_j, last_z)(x)
+            if policy == "gru_argmax":
+                # act_bc_think with a swappable judge: the ACTION-CONDITIONED
+                # GRU proposer imagines each candidate's future; the judge
+                # (its own ctx encoder + scorer, plan-free) picks. This is
+                # the true hard-optimizer/amplifier arm.
+                czr = ctx_z.expand(len(chunks), *ctx_z.shape[1:])
+                futures = stack.planner.propose_future(czr, chr_, plans, horizon=h)
+                chj = ctx_h_j.expand(len(chunks), -1)
+                zp = torch.zeros((len(chunks), stack.judge.plan_dim), device=dev)
+                scores = stack.judge.score_future(chj, futures, zp)
+            else:
+                lzr = last_z.expand(len(chunks), -1)
+                x = ddim_sample(stack.diff, ctx_h=chr_, plan=plans, last_z=lzr, steps=stack.ddim_steps, T=stack.T,
+                                shape=(len(chunks), stack.h * stack.z_dim), device=dev, generator=gen)
+                scores = stack.judge_score_fn(ctx_h_j, last_z)(x)
         pick = int(scores.argmax())
         return list(chunks[pick])
 
@@ -230,7 +241,7 @@ def main() -> int:
         print(json.dumps({"policy": policy, **per_policy[policy]}), flush=True)
 
     gates = {}
-    for think in ("diff_argmax", "diff_guided", "diff_prior"):
+    for think in ("diff_argmax", "diff_guided", "diff_prior", "gru_argmax"):
         if think not in per_policy:
             continue
         for ctrl in ("bc", "bc_random", "diff_prior"):
@@ -238,7 +249,7 @@ def main() -> int:
                 continue
             gates[f"{think}_vs_{ctrl}_return"] = paired_ci(returns[think], returns[ctrl])
             gates[f"{think}_vs_{ctrl}_success"] = paired_ci(succ[think], succ[ctrl])
-    for think in ("diff_argmax", "diff_guided"):
+    for think in ("diff_argmax", "diff_guided", "gru_argmax"):
         if think in per_policy and "bc" in per_policy and "bc_random" in per_policy:
             gates[f"{think}_wins"] = bool(
                 gates[f"{think}_vs_bc_success"]["ci_lo"] > 0
