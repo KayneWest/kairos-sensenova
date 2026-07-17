@@ -319,6 +319,69 @@ def fig5_dagger_cycles():
     plt.close(fig)
 
 
+def fig6_decomposition():
+    # The judge/imagination exchange: think-success follows the proposer in
+    # all 8 cells; the judge is irrelevant everywhere. Right panel: the
+    # value-guided diffusion test — guidance on an action-blind prior
+    # collapses into passivity under either judge.
+    fig, axes = plt.subplots(1, 2, figsize=(10.2, 3.3), width_ratios=[1.15, 1],
+                             constrained_layout=True)
+
+    ax = axes[0]
+    cells = [
+        ("healthy imagination\n(cycle-1 proposer)", 0, [
+            ("honest judge", ["closed_loop_drone_game_v16_diffthink_goodjudge_gruarg",
+                              "closed_loop_drone_game_v17_decomp_c1prop-goodjudge_seed2"]),
+            ('"inverted" judge', ["closed_loop_drone_game_v16_diffthink_badjudge_gruarg",
+                                  "closed_loop_drone_game_v17_decomp_c1prop-badjudge_seed2"])]),
+        ("poisoned imagination\n(cycle-2c proposer)", 1, [
+            ("honest judge", ["closed_loop_drone_game_v17_decomp_c2cprop-goodjudge",
+                              "closed_loop_drone_game_v17_decomp_c2cprop-goodjudge_seed2"]),
+            ('"inverted" judge', ["closed_loop_drone_game_v17_decomp_c2cprop-badjudge",
+                                  "closed_loop_drone_game_v17_decomp_c2cprop-badjudge_seed2"])]),
+    ]
+    for label, gi, judges in cells:
+        for ji, (jlabel, runs) in enumerate(judges):
+            x = gi * 2 + ji * 0.7
+            for si, run in enumerate(runs):
+                s = json.loads((ROOT / "output" / run / "summary.json").read_text())
+                y = s["per_policy"]["gru_argmax"]["success_rate"] * 100
+                ax.scatter(x + (-0.1 if si == 0 else 0.1), y, color=BLUE, s=60,
+                           zorder=3, edgecolor="white", linewidth=0.8)
+            ax.annotate(jlabel, (x, -0.75), ha="center", fontsize=7.6, color=MUTED,
+                        annotation_clip=False)
+        ax.annotate(label, (gi * 2 + 0.35, -1.7), ha="center", fontsize=8.5,
+                    color=INK, fontweight="bold", annotation_clip=False)
+    ax.axhline(2.0, color=LGRAY, lw=1, ls="--")
+    ax.annotate("random-selection band (~1.5-2.5%)", (1.35, 2.25), fontsize=7.4, color=MUTED, ha="center")
+    ax.set_xticks([])
+    ax.set_ylabel("think success (%)")
+    ax.set_ylim(-0.3, 7.2)
+    ax.set_xlim(-0.5, 3.2)
+    ax.set_title("Exchange test: success follows the imagination,\nnever the judge (2 seeds x 4 cells, n=1000)", fontsize=9)
+
+    ax = axes[1]
+    pols = [("bc", "BC\n(no think)", GRAY), ("bc_random", "random\nselect", LGRAY),
+            ("diff_argmax", "diffusion\nargmax", "#7ca6d8"), ("diff_prior", "diffusion\nprior", "#b9cfe8"),
+            ("diff_guided", "diffusion\nguided", BLUE)]
+    runs = ["closed_loop_drone_game_v16_diffthink_goodjudge", "closed_loop_drone_game_v16_diffthink_goodjudge_seed2"]
+    for pi, (key, label, color) in enumerate(pols):
+        for si, run in enumerate(runs):
+            s = json.loads((ROOT / "output" / run / "summary.json").read_text())
+            y = s["per_policy"][key]["success_rate"] * 100
+            ax.scatter(pi + (-0.12 if si == 0 else 0.12), y, color=color, s=55,
+                       zorder=3, edgecolor="white", linewidth=0.8)
+        ax.annotate(label, (pi, -0.75), ha="center", fontsize=7.6, color=MUTED,
+                    annotation_clip=False)
+    ax.axhline(6.1, color=RED, lw=1, ls=":")
+    ax.annotate("GRU argmax reference (6.1%)", (2.0, 6.35), fontsize=7.4, color=RED, ha="center")
+    ax.set_xticks([])
+    ax.set_ylim(-0.3, 7.2)
+    ax.set_title("Value-guided diffusion: an action-blind prior\ngives guidance nothing to steer (good judge)", fontsize=9)
+    fig.savefig(OUT / "fig6_decomposition.png", dpi=200)
+    plt.close(fig)
+
+
 if __name__ == "__main__":
-    fig0_architecture(); fig1(); fig2(); fig3(); fig4_trace_grid(); fig5_dagger_cycles()
+    fig0_architecture(); fig1(); fig2(); fig3(); fig4_trace_grid(); fig5_dagger_cycles(); fig6_decomposition()
     print(json.dumps({"phase": "figures_done", "out": str(OUT), "files": sorted(p.name for p in OUT.glob("*.png"))}))

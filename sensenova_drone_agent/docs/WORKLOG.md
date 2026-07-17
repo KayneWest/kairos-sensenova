@@ -174,6 +174,31 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-17 DIFFUSION-THINK CAMPAIGN COMPLETE (TWO-SEED) — PAPER v1.4 FINAL
+
+Seed-2 diffusion evals mirror seed 1 exactly: diff_prior/diff_guided 0%
+success with 56-80% timeouts under both judges; diff_argmax judge-
+invariant at bc_random level; proposer v2_seed2 plan-conditioning inert
+(ratio 1.007) — the scene-prior finding is two-seed. All diffusion-thread
+claims now two-seed-consistent
+(closed_loop_drone_game_v16_diffthink_{good,bad}judge{,_seed2}).
+
+PAPER v1.4 (all formats regenerated, artifact same URL): abstract carries
+the exchange + guided-diffusion results; new contribution 6; §6 coda
+mechanism CORRECTED (poison = learned dynamics, not value head); new §6.1
+(exchange test, the 8-cell table) and §6.2 (guided generation: likelihood
+is not enough; guidance can't rescue an action-blind prior; floor property
+holds vacuously); §9 claims updated both directions; §10 next levers
+(dynamics-aimed repair, contrast-trained generative proposer, plan-token
+gradient ascent on the unit-norm sphere, exchange-decompose the v9/v10
+reversal stacks); Fig 6 = exchange grid + diffusion floors.
+
+CAMPAIGN-LEVEL TAKEAWAY (for talks): the campaign opened with a judge
+that LOOKED broken (r=-0.97) where the real cause was training signals,
+and closes with a judge that looked broken where the real cause was the
+imagination. Both times the value head was the symptom. Thinking-in-frames
+lives or dies on the action-causal quality of the frames.
+
 ## 2026-07-16 NIGHT: DECOMPOSITION COMPLETE (TWO-SEED, 8 CELLS) — THE IMAGINATION IS THE POISON, UNANIMOUSLY
 
 gru_argmax (BC candidates -> proposer imagines -> judge picks, matched

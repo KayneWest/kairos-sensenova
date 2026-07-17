@@ -26,12 +26,17 @@ FIGURES = {
     "@@FIG5@@": ("fig5_dagger_cycles.png", "Figure 5 — Self-improvement is a repair, not a ladder: think-success "
                  "across DAgger data recipes, two seeds each. Cycle 1 passes the strict gate twice; every recipe "
                  "containing second-round self-data fails, and pure replacement re-inverts selection."),
+    "@@FIG6@@": ("fig6_decomposition.png", "Figure 6 — Left: the judge/imagination exchange — think-success follows "
+                 "the imagination in all 8 cells (2 seeds x 4 configurations) and is invariant to the judge. Right: "
+                 "value-guided diffusion under the good judge — an action-blind generative prior gives guidance "
+                 "nothing to steer."),
 }
 ANCHORS = [
     ("heads (§5).", "@@FIG0@@"),
     ("checkpoint selection.", "@@FIG1@@\n\n@@FIG3@@"),
     ("a reliable behavioral advantage.", "@@FIG2@@"),
     ("self-improvement ladder.", "@@FIG5@@"),
+    ("second-order by comparison.", "@@FIG6@@"),
     ("rest on the latent-space audit.", "@@FIG4@@"),
 ]
 for anchor, placeholder in ANCHORS:

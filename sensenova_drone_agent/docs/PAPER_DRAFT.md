@@ -1,6 +1,6 @@
 # From Scene Priors to Decision-Quality Imagination: Retrofitting Action Grounding into Video World-Model Latent Spaces
 
-*Draft v1.3 — 2026-07-15. Numbers are final from the July 2026 campaign; see
+*Draft v1.4 — 2026-07-17. Numbers are final from the July 2026 campaign; see
 WORKLOG.md for artifact paths. Bracketed notes mark writing TODOs.*
 
 ## Abstract
@@ -30,8 +30,17 @@ beats both controls in both seeds (success 5.7–6.1% vs 0.1–0.5% without
 thinking; positive mean return; all CIs clear of zero). The repair does not
 iterate: a second round of self-collected data fails at every mixture
 tested, and training on the improved agent's failure-concentrated episodes
-re-inverts selection to worse-than-random — without expert corrections, an
-improving agent's crashes become evidence against its own best behavior.
+re-inverts selection to worse-than-random. A judge/imagination exchange
+experiment localizes that poison: the "inverted" stack's value head ranks a
+healthy model's futures as well as a good one, while no judge rescues
+selection among the poisoned model's futures (8/8 cells, two seeds) —
+failure-concentrated self-training corrupts the *dreams*, not the
+judgment. A complementary test replaces argmax search with value-guided
+diffusion sampling: trained by pure likelihood, the generative proposer
+recapitulates scene priors (action-conditioning inert), and guidance over
+an action-blind prior collapses into passivity under either judge.
+Deliberation needs an action-causal imagination before it needs a better
+judge.
 
 ## 1. Introduction
 
@@ -97,6 +106,14 @@ Contributions:
    the win *consistently in both seeds* (Fig. 2, right panels), showing the
    failure is distributional rather than intrinsic. Iterating the repair
    does not compound (§6, Fig. 5).
+6. **A judge/imagination exchange test that localizes self-training's
+   poison** (§6.1, Fig. 6): swapping value heads and proposers between the
+   healthy and regressed stacks shows closed-loop success follows the
+   imagination in every cell and is invariant to the judge — the
+   "inverted" value head is exonerated. A value-guided diffusion proposer
+   (§6.2) completes the picture: likelihood-only generative training
+   recapitulates the scene-prior failure, and gradient guidance has no
+   leverage on an action-blind prior.
 
 Throughout we maintain a strict claim discipline (§9): no claims about real
 drones; margins reported with CIs; unresolved comparisons stated as such.
@@ -374,15 +391,80 @@ return −6.18, success −1.7pp; seed 2: success −1.4pp [−2.4, −0.5]): th
 scorer inversion of §3 re-emerges, produced this time by the data rather
 than the objective. The mechanism is visible in the data's shape: the
 improved agent's episodes are long, goal-directed flights that mostly end
-in collision, so return-to-go labeling attaches negative outcomes to
-goal-approaching futures. As the agent improves, its failures concentrate
-along its best trajectories, and outcome-labeled self-experience becomes
-negative evidence against goal-directed action. Classic DAgger escapes
+in collision, so the training signal associates goal-directed prefixes
+with crash-shaped continuations. As the agent improves, its failures
+concentrate along its best trajectories, and outcome-labeled
+self-experience becomes negative evidence against goal-directed action —
+and §6.1 shows by direct exchange that this poison settles in the learned
+*dynamics* (the imagination), not the value head, our own first reading
+notwithstanding. Classic DAgger escapes
 this by querying an expert on the visited states; self-imitation has no
 such corrective signal and no reason to improve monotonically. The
 constructive conclusion above therefore carries a sharp boundary:
 on-policy data closes the distribution gap *once*; it is not, by itself, a
 self-improvement ladder.
+
+### 6.1 Where the failure lives: exchanging judges and imaginations (Fig. 6)
+
+The regressed cycle-2c stack selects *worse than random* — but a stack has
+three suspects: its candidate prior, its imagination (proposer), and its
+judge (value head). Because all stacks share one frozen tokenizer latent
+space, components are exchangeable at act time: we run BC-anchored
+argmax thinking with the proposer from one stack and the judge (its own
+context encoder + scorer, plan-free) from another, at n = 1000 with
+matched seeds, two independent training seeds per cell. The result is
+unanimous (success, seed 1 / seed 2; strict gate):
+
+| | honest judge (cycle 1) | "inverted" judge (cycle 2c) |
+|---|---|---|
+| healthy imagination (cycle 1) | 5.3% / 6.2% — pass, pass | 6.2% / 4.5% — pass, pass |
+| poisoned imagination (cycle 2c) | 0.0% / 0.5% — fail, fail | 0.0% / 0.7% — fail, fail |
+
+Success follows the imagination in every cell and is invariant to the
+judge. The cycle-2c value head, certified "inverted" inside its own stack,
+ranks a healthy model's imagined futures as well as the good value head
+does; the good value head is powerless among the poisoned model's futures.
+And since worse-than-random selection requires *anti-correlation*, the
+poisoned proposer is systematically anti-goal: trained on episodes where
+goal-directed flight ends in collision, it imagines crash-shaped futures
+precisely for good action chunks, and an honest judge shown corrupted
+dreams faithfully selects against the goal. This retrospectively re-aims
+the amplifier finding: across every configuration we can decompose,
+deliberation amplifies the quality of the *imagination* (think-success
+spans 0.0–6.2% with the proposer, holding the judge fixed either way).
+Whether the §6 two-seed reversal also localizes to the imagination is open
+forensics — the same exchange applied to those stacks would answer it.
+
+### 6.2 Value-guided generation: soft thinking needs an action-causal prior
+
+If hard argmax amplifies whatever the imagination-judge system believes, a
+natural remedy is *soft* selection: sample one future from a generative
+prior and steer the sampling trajectory with the value gradient
+(classifier-guided diffusion — "force the latent down a thinking
+trajectory before releasing it"), so the prior continuously regularizes
+the optimization. We trained a conditional latent-diffusion proposer over
+future chunks (persistence-delta parameterization, plan-dropout
+conditioning from the frozen planner encoders; sample error at or below
+persistence) and evaluated closed-loop under both judges, two seeds,
+n = 1000, with a guidance-scale sweep.
+
+Two negative results, both two-seed-consistent. First, *likelihood is not
+enough*: the diffusion proposer reaches persistence-level sample quality
+while plan-conditioning stays inert (conditioned vs plan-free sample error
+ratio ~1.0 throughout training) — the scene-prior pathology of §1,
+recapitulated in a second model class; candidate-argmax over its samples
+is judge-noise selection, indistinguishable from random (both judges, both
+seeds). Second, *guidance cannot rescue an action-blind prior*: guided
+sampling collapses into passivity (0% success; 43–80% timeouts; the
+plan-free inverse decodes near-persistence futures as hover — the
+absorbing-state pairing), and the guidance scale is flat over two orders
+of magnitude. The floor property that motivated the design does hold —
+under the inverted judge, guided selection sits at the prior's level
+rather than below random — but it holds vacuously, because guidance has no
+leverage anywhere. The lesson is the same one §6.1 teaches from the other
+side: the binding constraint on thinking-in-frames is the action-causal
+quality of the imagination; search strategy and judge quality are
+second-order by comparison.
 
 ## 7. Visible thinking traces
 
@@ -464,9 +546,12 @@ action cosine of 0.91 makes timing unidentifiable there — a data property);
 offline decision-quality metrics do not predict the sign of closed-loop
 selection value (two-seed reversal, both CI-clean); and one DAgger iteration
 restores a two-seed-consistent behavioral win for thinking (success and
-return over both controls, all CIs clear, n = 1000 x 2 seeds). We do not
-claim: behavioral improvement without on-policy data (refuted by the
-reversal); iterated self-improvement from outcome-labeled self-data (a
+return over both controls, all CIs clear, n = 1000 x 2 seeds). We claim additionally: the self-training poison localizes to the
+imagination, not the value head (8/8 exchange cells, two seeds, Fig. 6);
+and likelihood-only generative proposers recapitulate scene priors, so
+value-guided sampling over them fails softly (two seeds, both judges). We
+do not claim: behavioral improvement without on-policy data (refuted by
+the reversal); iterated self-improvement from outcome-labeled self-data (a
 second self-collection round fails the strict gate under accumulation,
 rebalancing, and replacement, and replacement re-inverts selection to
 CI-clean worse-than-random); real-drone control; robot-source acting transfer; or long-horizon
@@ -493,7 +578,16 @@ imagination-RL rather than offline-only training. For making the DAgger
 repair iterate, the cycle-2 arc identifies the levers: success-preserving
 replay (the improved agent's rare successful episodes are the diluted
 signal) or expert-corrected relabeling of visited states, in place of raw
-outcome-labeled self-imitation.
+outcome-labeled self-imitation — and §6.1 says these interventions should
+be aimed at the *dynamics* training signal, not the value head. For soft
+deliberation, §6.2 makes the prerequisite explicit: an action-causal
+generative proposer (contrast-trained, as the GRU proposer was — not
+likelihood-only), after which guidance has something to steer; a
+plan-token variant (gradient ascent on the judge through the
+action-conditioned proposer, re-projected onto the unit-norm plan sphere
+each step) is the direct next candidate. Decomposing the §6 seed-reversal
+stacks with the §6.1 exchange is cheap and would settle where
+seed-fragility itself lives.
 
 ## 11. Reproducibility
 
@@ -534,5 +628,6 @@ drone closed-loop (post-DAgger, both seeds) —
 fig1_training_dynamics.png, fig2_closed_loop.png (four-panel arc:
 pre-DAgger win/reversal, post-DAgger two-seed consistency),
 fig3_two_seed_scorer.png, fig4_trace_grid.png, fig5_dagger_cycles.png
-(the iteration arc: repair, not ladder); full trace grids under
+(the iteration arc: repair, not ladder), fig6_decomposition.png (the
+exchange test + guided-diffusion floors); full trace grids under
 output/imagination_traces_armE_latest_v2dec/.*
