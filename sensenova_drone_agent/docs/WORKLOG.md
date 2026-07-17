@@ -174,6 +174,47 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-16 EVENING: SEED-1 RESULTS + A MAJOR SURPRISE — THE POISON IS THE IMAGINATION, NOT THE JUDGE
+
+Proposer v1 bug found+fixed: conditioning only on lossy ctx_h and diffusing
+ABSOLUTE latents -> eps-loss plateau 0.55, samples 1000x worse than
+persistence. v2 = persistence-delta parameterization + explicit last_z
+conditioning + per-dim norm (mirrors the GRU's residual design): sample MSE
+0.0048 at 600 steps, beats persistence (commit 8cd75e1).
+
+FINDING 1 (scene-prior disease, generative form): v2 trains to
+persistence-level quality but plan-conditioning stays INERT (plan/free MSE
+ratio ~1.0 for all 30k steps). Pure likelihood recapitulates
+scene-priors-not-action-causality. diff_argmax is therefore judge-noise
+selection; added gru_argmax (action-conditioned GRU proposer + swappable
+judge) as the honest amplifier arm (commit 330664c).
+
+FINDING 2 (seed1, n=1000, good judge): all diffusion arms fail even with
+the good judge — bc 0.5 / bc_random 1.9 / diff_prior 0.9 / diff_argmax 1.6
+(= bc_random, CI spans 0) / diff_guided 0.0% with 70% timeouts. Guidance
+AMPLIFIES PASSIVITY: judge gradient prefers "nothing happens" futures,
+plan-free inverse decodes near-persistence as hover (absorbing-state
+training pairs frozen frames with hover). Lambda sweep flat 0.25-16.
+Under the bad judge diff_guided sits at the prior floor (0.3% vs 0.9%,
+CI spans 0) — floor property holds but vacuously. VERDICT SHAPING UP:
+guidance has no leverage on an action-blind prior; "soft thinking" needs
+an action-causal generative manifold.
+
+FINDING 3 (THE SURPRISE, seed1): gru_argmax with the C2C "inverted" JUDGE
+scores 6.2% success, gate PASS (= c1's 6.1%); with the c1 judge 5.3% PASS
+(cross-validates v12 via the new harness). closed_loop_drone_game_v16_
+diffthink_{good,bad}judge_gruarg. THE C2C SCORER IS FINE when judging C1-
+proposer futures -> cycle-2c's worse-than-random selection does NOT live
+in the value head. Reinterpretation pending confirmation: failure-
+concentrated self-data poisoned the c2c PROPOSER (imagination maps good
+actions to crash-shaped futures; an honest scorer then picks against the
+goal). Paper §6 coda's mechanism sentence will need revision.
+DECOMPOSITION RUNNING (GPU 0, closed_loop_drone_game_v17_decomp_
+c2cprop-{good,bad}judge): c2c proposer+encoder+BC-head under each judge.
+If c2cprop-goodjudge collapses -> imagination is the poison, confirmed.
+
+Chain continues on GPU 1: proposer v2 seed2 training, then seed-2 evals.
+
 ## 2026-07-16 DIFFUSION-THINK CAMPAIGN RUNNING (GPU 1): does guided generation bound the amplifier?
 
 USER IDEA -> CAMPAIGN: treat latent->image as diffusion; "force z down a
