@@ -174,6 +174,41 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-16 NIGHT: DECOMPOSITION COMPLETE (TWO-SEED, 8 CELLS) — THE IMAGINATION IS THE POISON, UNANIMOUSLY
+
+gru_argmax (BC candidates -> proposer imagines -> judge picks, matched
+seeds, n=1000/cell), success s1/s2, gate:
+  c1 imagination x c1 judge:   5.3 / 6.2  PASS PASS
+  c1 imagination x c2c judge:  6.2 / 4.5  PASS PASS
+  c2c imagination x c1 judge:  0.0 / 0.5  fail fail
+  c2c imagination x c2c judge: 0.0 / 0.7  fail fail
+(v16_diffthink_{good,bad}judge_gruarg{,_seed2}, v17_decomp_*{,_seed2})
+
+CONCLUSION (two-seed, decisive): performance follows the PROPOSER in
+every cell; the judge is irrelevant in every cell. The c2c "inversion"
+never lived in the value head — the c2c scorer ranks c1-imagined futures
+as well as the c1 scorer does. Failure-concentrated self-data poisoned
+the IMAGINATION: and since worse-than-random selection (v15) requires
+anti-correlation, the c2c proposer is SYSTEMATICALLY anti-goal — trained
+on 94% "goal-directed flight -> crash" episodes, it imagines crash-shaped
+futures precisely for good actions, so even an honest judge picks against
+the goal. Corrupted dreams, honest judge.
+
+REINTERPRETATIONS REQUIRED:
+- Paper §6 cycle-2 coda mechanism sentence ("value head learns
+  approaching-goal predicts death") -> the RTG-labeled data corrupts the
+  learned dynamics/imagination, not (primarily) the value head.
+- The "amplifier" finding re-aims: deliberation amplifies the quality of
+  the IMAGINATION (0.0-6.2% span tracks the proposer, not the judge).
+- Open (future forensics): decompose the v9/v10 seed-reversal stacks the
+  same way — the original "value heads are seed-fragile" claim may also
+  localize to imagination differences.
+- DAgger repair re-read: cycle-1's win = on-policy data repairing the
+  IMAGINATION's coverage; cycle-2's regression = the same channel poisoned.
+
+Still running: main chain seed-2 diffusion evals (GPU 1). Full writeup +
+paper pass when they land.
+
 ## 2026-07-16 EVENING: SEED-1 RESULTS + A MAJOR SURPRISE — THE POISON IS THE IMAGINATION, NOT THE JUDGE
 
 Proposer v1 bug found+fixed: conditioning only on lossy ctx_h and diffusing
