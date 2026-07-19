@@ -382,6 +382,41 @@ def fig6_decomposition():
     plt.close(fig)
 
 
+def fig7_expert_dagger():
+    # True DAgger (expert corrections on visited states, imagination fixed):
+    # corrective data doubles the campaign ceiling in 1-2 rounds, then
+    # plateaus ~10% — the next binding constraint (frozen encoder).
+    runs = {
+        "seed 1": ("closed_loop_drone_game_v20_expert_dagger_s1_r{r}", (0.061, 0.005)),
+        "seed 2": ("closed_loop_drone_game_v20_expert_dagger_s2_r{r}", (0.057, 0.001)),
+    }
+    fig, ax = plt.subplots(figsize=(7.2, 3.2), constrained_layout=True)
+    for (label, (tpl, (think0, bc0))), color in zip(runs.items(), (BLUE, RED)):
+        xs, think, bc = [0], [think0 * 100], [bc0 * 100]
+        for r in (1, 2, 3):
+            p_ = ROOT / "output" / tpl.format(r=r) / "summary.json"
+            d = json.loads(p_.read_text())["per_policy"]
+            xs.append(r)
+            think.append(d["gru_argmax"]["success_rate"] * 100)
+            bc.append(d["bc"]["success_rate"] * 100)
+        ax.plot(xs, think, color=color, lw=2, marker="o", ms=5, mec="white", label=f"{label} — think")
+        ax.plot(xs, bc, color=color, lw=1.6, ls="--", marker="s", ms=4, mec="white", alpha=0.65,
+                label=f"{label} — BC alone")
+    ax.axhline(6.1, color=GRAY, lw=1, ls=":")
+    ax.annotate("previous campaign ceiling (6.1%)", (0.05, 6.35), fontsize=7.6, color=MUTED)
+    ax.set_xticks([0, 1, 2, 3])
+    ax.set_xticklabels(["0\n(self-imitation\nDAgger)", "1", "2", "3"], fontsize=8)
+    ax.set_xlabel("expert-correction round")
+    ax.set_ylabel("success rate (%)")
+    ax.set_ylim(0, 12.5)
+    ax.legend(frameon=False, fontsize=7.6, loc="lower right", ncols=2)
+    ax.set_title("Corrective data ladders where self-imitation could not, then plateaus\n"
+                 "(expert labels on visited states; imagination and judge held fixed; n=1000/point; expert ceiling 41.5%)",
+                 fontsize=9)
+    fig.savefig(OUT / "fig7_expert_dagger.png", dpi=200)
+    plt.close(fig)
+
+
 if __name__ == "__main__":
-    fig0_architecture(); fig1(); fig2(); fig3(); fig4_trace_grid(); fig5_dagger_cycles(); fig6_decomposition()
+    fig0_architecture(); fig1(); fig2(); fig3(); fig4_trace_grid(); fig5_dagger_cycles(); fig6_decomposition(); fig7_expert_dagger()
     print(json.dumps({"phase": "figures_done", "out": str(OUT), "files": sorted(p.name for p in OUT.glob("*.png"))}))

@@ -174,6 +174,28 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-19 GOOD-DATA VERDICT: TRUE DAGGER LADDERS (two seeds) — PAPER v1.6, PUSHED
+
+run_expert_dagger.py: expert chunk labels via env snapshot->expert
+rollout->restore at every visited state; imagination+judge FIXED (c1
+stacks); only the BC head retrains per round on the aggregate. Results
+(think / bc success, n=1000, v20_expert_dagger_s{1,2}_r{1,2,3}):
+  s1: r1 6.2/8.7  r2 8.7/7.6  r3 8.3/9.8
+  s2: r1 9.3/5.8  r2 11.1/7.5 r3 9.7/7.3
+Both seeds clear the 6.1% all-time ceiling in ROUND 1 and stay above it
+(11/12 post-round arm-points); best 11.1%; plateau ~10% vs 41.5% expert.
+Think-vs-bc ordering stays seed/round-inconsistent (+-2pp) — selection
+neither reliably helps nor hurts once the prior is strong (deliberation =
+crutch for a weak policy; Dreamer's distill-then-drop endgame from the
+other direction). Plateau + known encoder-cap (61% BC acc) locates the
+next binding constraint in the frozen REPRESENTATION.
+CONSTRAINT ORDERING (final): (1) action-causal imagination, (2)
+corrective on-policy data, (3) representation capacity; judge & search
+never binding. Paper v1.6: abstract, §6.3, §9, Fig 7. Data-sourcing spec
+for the user: docs/RIGHT_DATA_SPEC.md.
+Reboot note: box rebooted again under LIGHT load (2 GPUs <30C) — hardware
+(PSU?) suspicion strengthened; systemd guard auto-recovered (first test).
+
 ## 2026-07-19 CAMPAIGN COMPLETE — PAPER v1.5 FINAL (all three workstreams two-seed)
 
 PLAN_GRAD seed-2 (v18_plangrad_{good,bad}judge_seed2): 0.2%/0.1% success

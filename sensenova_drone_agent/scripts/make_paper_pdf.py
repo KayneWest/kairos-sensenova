@@ -30,6 +30,9 @@ FIGURES = {
                  "the imagination in all 8 cells (2 seeds x 4 configurations) and is invariant to the judge. Right: "
                  "value-guided diffusion under the good judge — an action-blind generative prior gives guidance "
                  "nothing to steer."),
+    "@@FIG7@@": ("fig7_expert_dagger.png", "Figure 7 — True DAgger: expert-corrective labels on visited states "
+                 "(imagination and judge fixed) clear the campaign ceiling in one round in both seeds and roughly "
+                 "double it before plateauing at the representation bound."),
 }
 ANCHORS = [
     ("heads (§5).", "@@FIG0@@"),
@@ -37,6 +40,7 @@ ANCHORS = [
     ("a reliable behavioral advantage.", "@@FIG2@@"),
     ("self-improvement ladder.", "@@FIG5@@"),
     ("second-order by comparison.", "@@FIG6@@"),
+    ("binding at any point we could measure.", "@@FIG7@@"),
     ("rest on the latent-space audit.", "@@FIG4@@"),
 ]
 for anchor, placeholder in ANCHORS:

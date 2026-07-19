@@ -1,6 +1,6 @@
 # From Scene Priors to Decision-Quality Imagination: Retrofitting Action Grounding into Video World-Model Latent Spaces
 
-*Draft v1.5 — 2026-07-19. Numbers are final from the July 2026 campaign; see
+*Draft v1.6 — 2026-07-19. Numbers are final from the July 2026 campaign; see
 WORKLOG.md for artifact paths. Bracketed notes mark writing TODOs.*
 
 ## Abstract
@@ -40,7 +40,12 @@ diffusion sampling: trained by pure likelihood, the generative proposer
 recapitulates scene priors (action-conditioning inert), and guidance over
 an action-blind prior collapses into passivity under either judge.
 Deliberation needs an action-causal imagination before it needs a better
-judge.
+judge. Finally, replacing outcome labels with *corrective* ones — an
+expert's action at each state the agent visits, classic DAgger — ladders
+where self-imitation could not: the whole stack clears its previous
+ceiling in one round and roughly doubles it before plateauing (~10% vs
+41.5% expert), locating the next binding constraint in the frozen
+representation rather than the data.
 
 ## 1. Introduction
 
@@ -492,6 +497,37 @@ side: the binding constraint on thinking-in-frames is the action-causal
 quality of the imagination; search strategy and judge quality are
 second-order by comparison.
 
+### 6.3 Corrective data: true DAgger ladders, then hits the representation wall (Fig. 7)
+
+Every self-improvement failure above used *outcome-labeled own episodes*.
+The classic DAgger guarantee assumes something stronger: an expert's
+action at each state the learner visits. Our environment's scripted
+expert (41.5% success) makes the real thing testable: roll out the
+think-then-act agent; at every visited state, snapshot the environment,
+roll the expert forward one horizon to obtain a corrective action chunk,
+restore, and continue. The healthy cycle-1 imagination and judge are
+*held fixed* — only the BC candidate head retrains each round on the
+aggregated (visited state → expert chunk) pairs, isolating the data
+variable completely.
+
+It ladders. In both seeds, round 1 alone lifts the best arm past the
+campaign's all-time ceiling (8.7% / 9.3% vs 6.1%), round 2 continues
+(8.7% / 11.1%), and round 3 flattens (9.8% / 9.7%) — six consecutive
+round-evaluations above every number produced by any other method, n =
+1000 each. Two boundaries are equally informative. First, think-vs-BC
+ordering remains seed- and round-inconsistent (±2pp) even in the
+laddering regime: with a strong corrective prior, act-time selection
+neither reliably helps nor hurts — consistent with deliberation being a
+crutch for a weak policy, shed as the policy improves (Dreamer's
+distill-then-drop-the-search endgame, reached from the opposite
+direction). Second, the plateau at ~10% against a 41.5% teacher, with BC
+action accuracy long known to be encoder-capped (§6, round 8), locates
+the next binding constraint in the frozen representation — not in data
+quantity, data quality, judge, or search. The campaign's constraint
+ordering is thus: (1) action-causal imagination, (2) corrective on-policy
+data, (3) representation capacity — with judge and search strategy never
+binding at any point we could measure.
+
 ## 7. Visible thinking traces
 
 A decoder-only, motion-weighted fine-tune of the frozen tokenizer (encoder
@@ -578,8 +614,10 @@ while pre-DAgger seed-fragility is distributed across components (4-cell
 exchange); likelihood-only generative proposers recapitulate scene
 priors, so value-guided sampling over them fails softly (two seeds, both
 judges); soft plan-manifold search does not beat random selection in
-either seed; and contrast training of the diffusion prior reaches
-action-sensitivity only on an unstable knife-edge (five configurations). We
+either seed; contrast training of the diffusion prior reaches
+action-sensitivity only on an unstable knife-edge (five configurations);
+and expert-corrective data ladders the stack past its previous ceiling in
+both seeds before plateauing at the representation bound (§6.3). We
 do not claim: behavioral improvement without on-policy data (refuted by
 the reversal); iterated self-improvement from outcome-labeled self-data (a
 second self-collection round fails the strict gate under accumulation,
@@ -662,5 +700,6 @@ fig1_training_dynamics.png, fig2_closed_loop.png (four-panel arc:
 pre-DAgger win/reversal, post-DAgger two-seed consistency),
 fig3_two_seed_scorer.png, fig4_trace_grid.png, fig5_dagger_cycles.png
 (the iteration arc: repair, not ladder), fig6_decomposition.png (the
-exchange test + guided-diffusion floors); full trace grids under
+exchange test + guided-diffusion floors), fig7_expert_dagger.png
+(corrective data ladders); full trace grids under
 output/imagination_traces_armE_latest_v2dec/.*
