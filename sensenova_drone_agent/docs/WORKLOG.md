@@ -174,6 +174,35 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-19 CONTRAST-DIFFUSION VERDICT: NO STABLE ACTION-CAUSAL EQUILIBRIUM (5 configs) + PLAN_GRAD SEED-1
+
+CONTRAST-DIFFUSION (c): five configurations, one thorough negative with a
+mechanistic shape — likelihood + contrast on the flat-latent diffusion
+class is a KNIFE-EDGE, no stable action-causal equilibrium found:
+  v2  (FiLM only, no contrast):        stable, action-blind (ratio ~1.0)
+  v3  (FiLM, 2-sided hinge w=1):       stable, action-blind (hinge
+      saturated at margin for 30k steps — ignoring plan is cheaper)
+  v3b (trunk-inject, 2-sided w=10):    BIT (wrong/true 3.0 at 4k; first
+      plan-use ever) then eps-loss blowup -> NaN weights ~9k
+  v3c (trunk, 1-sided hinge w=3):      plan_over_free 0.75 at 2-6k (first
+      sample-level action-sensitivity) -> loss explosion ~5k -> NaN
+  v3d (trunk, 1-sided w=1, lr 1e-4):   oscillated 0.56-1.54 around the
+      equilibrium for 28k steps, never converged, then skip-cascade (111
+      nonfinite steps). Killed.
+POSITIVE ARTIFACT: the trunk-injection pathway CAN couple actions into
+the generative prior (0.56-0.75 ratios, wrong/true 3.0) — it has just not
+coexisted stably with likelihood training in any tested config. Paper
+§6.2 gets this boundary. Candidate future fixes (not run): EMA weights,
+contrast warmup schedule, x0-prediction parameterization, transformer
+trunk over per-frame tokens.
+
+PLAN_GRAD (a) seed-1 (v18_contrastdiff_{good,bad}judge): 1.5% success
+BOTH judges — beats bc CI-clean (+1.0pp, +2.2 return) but TIES bc_random
+(CIs span 0) and is judge-invariant. Soft plan-sphere optimization is
+much weaker than hard argmax (5.3-6.2%); actions must decode through the
+inverse head (the §5 thin link) instead of executing a discrete BC
+candidate. Seed-2 evals RUNNING (v18_plangrad_{good,bad}judge_seed2).
+
 ## 2026-07-19 REVERSAL FORENSICS VERDICT: pre-DAgger fragility is DISTRIBUTED, not imagination-only
 
 v19_revforensics grid (n=1000, common eval seed, think success vs own
