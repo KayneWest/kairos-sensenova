@@ -69,17 +69,18 @@ class FiLMBlock(nn.Module):
 class DiffusionProposer(nn.Module):
     """Epsilon-predictor over the flattened future chunk (horizon * z_dim)."""
 
-    def __init__(self, *, x_dim: int, ctx_dim: int, plan_dim: int, z_dim: int, width: int = 2048, depth: int = 4, t_dim: int = 256):
+    def __init__(self, *, x_dim: int, ctx_dim: int, plan_dim: int, z_dim: int, width: int = 2048, depth: int = 4, t_dim: int = 256, plan_in_trunk: bool = False):
         super().__init__()
         self.x_dim, self.ctx_dim, self.plan_dim = int(x_dim), int(ctx_dim), int(plan_dim)
         self.z_dim = int(z_dim)
         self.width, self.depth, self.t_dim = int(width), int(depth), int(t_dim)
+        self.plan_in_trunk = bool(plan_in_trunk)
         cond_dim = 512
         self.t_mlp = nn.Sequential(nn.Linear(t_dim, cond_dim), nn.SiLU(), nn.Linear(cond_dim, cond_dim))
         self.ctx_proj = nn.Linear(ctx_dim, cond_dim)
         self.plan_proj = nn.Linear(plan_dim, cond_dim)
         self.z_proj = nn.Linear(z_dim, cond_dim)  # last ctx frame latent — the anchor the delta continues from
-        self.in_proj = nn.Linear(x_dim, width)
+        self.in_proj = nn.Linear(x_dim + (plan_dim if self.plan_in_trunk else 0), width)
         self.blocks = nn.ModuleList([FiLMBlock(width, cond_dim) for _ in range(depth)])
         self.out_norm = nn.LayerNorm(width)
         self.out_proj = nn.Linear(width, x_dim)
@@ -94,6 +95,8 @@ class DiffusionProposer(nn.Module):
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor, ctx_h: torch.Tensor, plan: torch.Tensor, last_z: torch.Tensor) -> torch.Tensor:
         cond = self.t_mlp(self.time_embed(t)) + self.ctx_proj(ctx_h) + self.plan_proj(plan) + self.z_proj(last_z)
+        if self.plan_in_trunk:
+            x_t = torch.cat([x_t, plan.expand(x_t.shape[0], -1)], dim=-1)
         h = self.in_proj(x_t)
         for blk in self.blocks:
             h = blk(h, cond)
@@ -173,6 +176,8 @@ def main() -> int:
     p.add_argument("--contrast-margin", type=float, default=0.05)
     p.add_argument("--contrast-modes", default="shuffle,zero,time_shift,time_shift2,time_perm,time_reverse")
     p.add_argument("--contrast-per-step", type=int, default=2, help="Contrast modes sampled per training step.")
+    p.add_argument("--plan-in-trunk", type=int, default=0,
+                   help="Concatenate the plan token to the trunk input (structural pathway, not just FiLM).")
     p.add_argument("--norm-batches", type=int, default=100)
     p.add_argument("--eval-every", type=int, default=2000)
     p.add_argument("--eval-samples", type=int, default=64)
@@ -206,7 +211,8 @@ def main() -> int:
                         drop_last=True, collate_fn=collate_batch, persistent_workers=args.num_workers > 0)
     x_dim = cfg.horizon * z_dim
     model = DiffusionProposer(x_dim=x_dim, ctx_dim=cfg.hidden_dim, plan_dim=cfg.plan_dim,
-                              z_dim=z_dim, width=args.width, depth=args.depth).to(device)
+                              z_dim=z_dim, width=args.width, depth=args.depth,
+                              plan_in_trunk=bool(args.plan_in_trunk)).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     scaler = torch.amp.GradScaler("cuda")
     n_params = sum(q.numel() for q in model.parameters())
@@ -343,7 +349,8 @@ def main() -> int:
     ckpt = {"model": model.state_dict(),
             "config": {"x_dim": x_dim, "ctx_dim": cfg.hidden_dim, "plan_dim": cfg.plan_dim,
                        "width": args.width, "depth": args.depth, "diffusion_T": T,
-                       "horizon": cfg.horizon, "z_dim": z_dim, "ddim_steps": args.ddim_steps},
+                       "horizon": cfg.horizon, "z_dim": z_dim, "ddim_steps": args.ddim_steps,
+                       "plan_in_trunk": bool(args.plan_in_trunk)},
             "norm": {"mu": mu.cpu(), "sigma": sigma.cpu(), "parameterization": "persistence_delta_perdim"},
             "planner_ckpt": str(args.planner_ckpt), "step": args.steps}
     torch.save(ckpt, out_dir / "final.pt")

@@ -60,7 +60,8 @@ class Stack:
         dck = torch.load(resolve_path(args.diffusion_ckpt), map_location="cpu", weights_only=False)
         dc = dck["config"]
         self.diff = DiffusionProposer(x_dim=dc["x_dim"], ctx_dim=dc["ctx_dim"], plan_dim=dc["plan_dim"],
-                                      z_dim=dc["z_dim"], width=dc["width"], depth=dc["depth"]).to(device)
+                                      z_dim=dc["z_dim"], width=dc["width"], depth=dc["depth"],
+                                      plan_in_trunk=bool(dc.get("plan_in_trunk", False))).to(device)
         self.diff.load_state_dict(dck["model"])
         self.diff.eval()
         self.T = int(dc["diffusion_T"])
