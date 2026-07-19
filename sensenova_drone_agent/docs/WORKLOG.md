@@ -174,6 +174,22 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-19 REVERSAL FORENSICS VERDICT: pre-DAgger fragility is DISTRIBUTED, not imagination-only
+
+v19_revforensics grid (n=1000, common eval seed, think success vs own
+controls bc/random): s1p-s1j 2.5% (mild +, replicates v9's 2.8%);
+s1p-s2j 1.6% (null); s2p-s1j 2.1% (mild -); s2p-s2j 0.4% (strong -,
+replicates v10 reversal). BOTH seed-2 components degrade thinking mildly
+alone and compound when paired — unlike post-DAgger c2c where the
+imagination carried the entire effect (8/8 cells). BOUNDARY FINDING:
+imagination-dominance is specific to self-training poisoning; generic
+seed-fragility in the low-signal pre-DAgger regime is distributed across
+the imagination-judge system. Note confound handled: s2 bc head is
+stronger (3.1% vs 1.4%), so s2 cells face higher control bars — but the
+within-row judge effect and within-column proposer effect are both
+present regardless. Paper §6.1 "open forensics" sentence gets this answer
+in the v1.5 pass (batch with contrast-diffusion results).
+
 ## 2026-07-18 THREE WORKSTREAMS LAUNCHED (commit 40de81c): contrast-diffusion (c) + plan-grad (a) + reversal forensics (b)
 
 (c) CONTRAST-DIFFUSION (GPU 1, chain `run_contrast_diffusion_campaign.sh`,
