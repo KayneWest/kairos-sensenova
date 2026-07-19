@@ -174,6 +174,29 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-18 THREE WORKSTREAMS LAUNCHED (commit 40de81c): contrast-diffusion (c) + plan-grad (a) + reversal forensics (b)
+
+(c) CONTRAST-DIFFUSION (GPU 1, chain `run_contrast_diffusion_campaign.sh`,
+setsid; status output/contrastdiff_chain_status.log): trainer gained an
+absolute-margin contrast hinge — at low-noise t, x0 reconstruction under
+the TRUE plan must beat wrong-action plans (shuffle/zero/tshift/tperm/
+treverse, 2 modes per step) by margin 0.05; wrong_over_true telemetry per
+200 steps. Success criterion: sample plan_over_free < ~0.9 and closed-loop
+diff_argmax/diff_guided leaving the bc_random band. Chain: train v3
+seed1 (30k, ~3.5h) -> lambda sweep {0.25,1,4} -> n=1000 evals good+
+inverted judges (v18_contrastdiff_{good,bad}judge) -> seed2 repeat.
+(a) PLAN_GRAD arm rides in the same evals: 10 steps of gradient ascent on
+the judge score THROUGH the GRU proposer, re-projected onto the unit-norm
+plan sphere; plan-free inverse decode. Soft-vs-hard comparison on the
+already-action-causal imagination.
+(b) REVERSAL FORENSICS (GPU 0, 4 containers): the pre-DAgger v9/v10
+seed-reversal stacks (drone_game_v4_scoredrop{,_seed2} + bc heads
+v2{,_seed2}) exchanged proposer x judge, common eval seed 20260710,
+n=1000 -> closed_loop_drone_game_v19_revforensics_{s1,s2}prop-{s1,s2}judge.
+If success follows the proposer again, the original "value heads are
+seed-fragile" claim re-attributes to imagination fragility (paper §6
+two-seed-test paragraph would need a caveat -> §6.1 already flags it).
+
 ## 2026-07-17 DIFFUSION-THINK CAMPAIGN COMPLETE (TWO-SEED) — PAPER v1.4 FINAL
 
 Seed-2 diffusion evals mirror seed 1 exactly: diff_prior/diff_guided 0%
