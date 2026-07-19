@@ -284,8 +284,9 @@ def main() -> int:
         with torch.amp.autocast("cuda"):
             eps = model(x_t, t, ctx_h, plan, last_z)
             loss_eps = torch.nn.functional.mse_loss(eps.float(), noise)
-            loss = loss_eps
-            contrast_val, contrast_ratio = 0.0, 1.0
+        loss = loss_eps
+        contrast_val, contrast_ratio = 0.0, 1.0
+        if True:
             if args.contrast_weight > 0 and contrast_modes:
                 # Contrast at low-noise t where reconstruction is feasible:
                 # given the TRUE plan the model must reconstruct better than
@@ -309,11 +310,16 @@ def main() -> int:
                     x0_w = (x_tc - (1 - ab_c).sqrt() * eps_w) / ab_c.sqrt()
                     mse_w = (x0_w.float() - x0).pow(2).mean(dim=1)
                     wrong_mses.append(mse_w.mean().item())
-                    loss_c = loss_c + torch.relu(mse_true + args.contrast_margin - mse_w).mean()
+                    # one-sided: only raise wrong-plan error; never degrade the true-plan path
+                    loss_c = loss_c + torch.relu(mse_true.detach() + args.contrast_margin - mse_w).mean()
                 loss_c = loss_c / max(1, len(idx))
                 loss = loss + args.contrast_weight * loss_c
                 contrast_val = float(loss_c.item())
                 contrast_ratio = float(sum(wrong_mses) / max(1, len(wrong_mses)) / max(1e-8, mse_true.mean().item()))
+        if not torch.isfinite(loss):
+            print(json.dumps({"step": step, "skipped_nonfinite": True}), flush=True)
+            opt.zero_grad(set_to_none=True)
+            continue
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
