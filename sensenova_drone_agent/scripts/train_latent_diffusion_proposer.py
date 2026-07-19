@@ -37,6 +37,7 @@ from train_latent_imagination_planner import (  # noqa: E402
     LatentImaginationPlanner,
     PlannerConfig,
     encode_batch,
+    make_action_variant,
     resolve_path,
     seed_everything,
     split_batch,
@@ -167,6 +168,11 @@ def main() -> int:
     p.add_argument("--depth", type=int, default=4)
     p.add_argument("--diffusion-T", type=int, default=1000)
     p.add_argument("--plan-dropout", type=float, default=0.5)
+    p.add_argument("--contrast-weight", type=float, default=0.0,
+                   help="Absolute-margin hinge: wrong-plan x0 reconstructions must be worse than true-plan by the margin.")
+    p.add_argument("--contrast-margin", type=float, default=0.05)
+    p.add_argument("--contrast-modes", default="shuffle,zero,time_shift,time_shift2,time_perm,time_reverse")
+    p.add_argument("--contrast-per-step", type=int, default=2, help="Contrast modes sampled per training step.")
     p.add_argument("--norm-batches", type=int, default=100)
     p.add_argument("--eval-every", type=int, default=2000)
     p.add_argument("--eval-samples", type=int, default=64)
@@ -223,7 +229,7 @@ def main() -> int:
             plan = planner.encode_plan(ctx_h, future_actions)
             last_z = ctx_z[:, -1]
             delta = (future_z - last_z[:, None, :]).flatten(1)
-        return ctx_h, plan, last_z, delta, future_z
+        return ctx_h, plan, last_z, delta, future_z, future_actions
 
     # --- per-dim normalization stats over the persistence DELTA ---
     print(json.dumps({"phase": "norm_stats", "batches": args.norm_batches}), flush=True)
@@ -231,7 +237,7 @@ def main() -> int:
     acc2 = torch.zeros(x_dim, device=device)
     n_acc = 0
     for _ in range(args.norm_batches):
-        _, _, _, delta, _ = prep(next(it))
+        _, _, _, delta, _, _ = prep(next(it))
         acc += delta.sum(dim=0)
         acc2 += (delta ** 2).sum(dim=0)
         n_acc += delta.shape[0]
@@ -243,7 +249,7 @@ def main() -> int:
     # generative MSE here is a training diagnostic; decision-quality is
     # measured downstream)
     eval_raw = next(it)
-    eval_ctx_h, eval_plan, eval_last_z, eval_delta, eval_future = prep(eval_raw)
+    eval_ctx_h, eval_plan, eval_last_z, eval_delta, eval_future, _efa = prep(eval_raw)
     ns_eval = min(args.eval_samples, eval_ctx_h.shape[0])
     eval_ctx_h, eval_plan = eval_ctx_h[:ns_eval], eval_plan[:ns_eval]
     eval_last_z, eval_future = eval_last_z[:ns_eval], eval_future[:ns_eval].flatten(1)
@@ -256,9 +262,12 @@ def main() -> int:
 
     started = time.time()
     T = args.diffusion_T
+    contrast_modes = [m for m in args.contrast_modes.split(",") if m]
+    mode_rng = torch.Generator().manual_seed(args.seed + 7)
     for step in range(1, args.steps + 1):
-        ctx_h, plan, last_z, delta, _ = prep(next(it))
+        ctx_h, plan_true, last_z, delta, _, future_actions = prep(next(it))
         x0 = (delta - mu[None, :]) / sigma[None, :]
+        plan = plan_true
         if args.plan_dropout > 0:
             drop = (torch.rand(plan.shape[0], 1, device=device) < args.plan_dropout).float()
             plan = plan * (1 - drop)
@@ -268,7 +277,37 @@ def main() -> int:
         x_t = ab.sqrt() * x0 + (1 - ab).sqrt() * noise
         with torch.amp.autocast("cuda"):
             eps = model(x_t, t, ctx_h, plan, last_z)
-            loss = torch.nn.functional.mse_loss(eps.float(), noise)
+            loss_eps = torch.nn.functional.mse_loss(eps.float(), noise)
+            loss = loss_eps
+            contrast_val, contrast_ratio = 0.0, 1.0
+            if args.contrast_weight > 0 and contrast_modes:
+                # Contrast at low-noise t where reconstruction is feasible:
+                # given the TRUE plan the model must reconstruct better than
+                # given a wrong-action plan, by an ABSOLUTE margin (relative
+                # margins collapse plan-sensitivity — arm C).
+                t_c = torch.randint(0, T // 2, (x0.shape[0],), device=device)
+                ab_c = cosine_alpha_bar(t_c.float(), T)[:, None]
+                noise_c = torch.randn_like(x0)
+                x_tc = ab_c.sqrt() * x0 + (1 - ab_c).sqrt() * noise_c
+                eps_true = model(x_tc, t_c, ctx_h, plan_true, last_z)
+                x0_true = (x_tc - (1 - ab_c).sqrt() * eps_true) / ab_c.sqrt()
+                mse_true = (x0_true.float() - x0).pow(2).mean(dim=1)
+                loss_c = x0.new_zeros(())
+                wrong_mses = []
+                idx = torch.randperm(len(contrast_modes), generator=mode_rng)[: args.contrast_per_step]
+                for mi in idx.tolist():
+                    wa, _wm = make_action_variant(future_actions, torch.ones_like(future_actions), contrast_modes[mi])
+                    with torch.no_grad():
+                        plan_w = planner.encode_plan(ctx_h, wa)
+                    eps_w = model(x_tc, t_c, ctx_h, plan_w, last_z)
+                    x0_w = (x_tc - (1 - ab_c).sqrt() * eps_w) / ab_c.sqrt()
+                    mse_w = (x0_w.float() - x0).pow(2).mean(dim=1)
+                    wrong_mses.append(mse_w.mean().item())
+                    loss_c = loss_c + torch.relu(mse_true + args.contrast_margin - mse_w).mean()
+                loss_c = loss_c / max(1, len(idx))
+                loss = loss + args.contrast_weight * loss_c
+                contrast_val = float(loss_c.item())
+                contrast_ratio = float(sum(wrong_mses) / max(1, len(wrong_mses)) / max(1e-8, mse_true.mean().item()))
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
@@ -277,7 +316,9 @@ def main() -> int:
         scaler.update()
 
         if step % 200 == 0:
-            row = {"step": step, "loss": float(loss.item()), "elapsed_s": time.time() - started}
+            row = {"step": step, "loss": float(loss.item()), "loss_eps": float(loss_eps.item()),
+                   "contrast": contrast_val, "wrong_over_true": round(contrast_ratio, 4),
+                   "elapsed_s": time.time() - started}
             print(json.dumps(row), flush=True)
             log.write(json.dumps(row) + "\n")
             log.flush()

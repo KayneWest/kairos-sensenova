@@ -144,6 +144,33 @@ def plan_chunk_diffusion(stack: Stack, *, policy, frames, act_hist, K, rng, lam,
         pick = int(scores.argmax())
         return list(chunks[pick])
 
+    if policy == "plan_grad":
+        # Soft thinking on the plan manifold: gradient-ascend the judge's
+        # score THROUGH the action-conditioned GRU proposer, re-projecting
+        # onto the unit-norm plan sphere each step; decode actions plan-free
+        # from the final imagined future. "Force z down a thinking
+        # trajectory" where actions have causal grip.
+        best = [int(i) for i in logits.argmax(dim=-1).tolist()]
+        onehot = torch.zeros((1, h, NUM_ACTIONS), device=dev)
+        for t, a in enumerate(best):
+            onehot[0, t, a] = 1.0
+        zero_plan_j = torch.zeros((1, stack.judge.plan_dim), device=dev)
+        zero_plan_p = torch.zeros((1, stack.planner.plan_dim), device=dev)
+        with torch.no_grad():
+            plan = stack.planner.encode_plan(ctx_h, onehot)
+        for _ in range(int(lam_steps := 10)):
+            with torch.enable_grad():
+                pl = plan.detach().requires_grad_(True)
+                fut = stack.planner.propose_future(ctx_z, ctx_h, pl, horizon=h)
+                sc = stack.judge.score_future(ctx_h_j, fut, zero_plan_j).sum()
+                g = torch.autograd.grad(sc, pl)[0]
+            plan = plan + 0.5 * g
+            plan = torch.nn.functional.normalize(plan, dim=-1) * (stack.planner.plan_dim ** 0.5)
+        with torch.no_grad():
+            fut = stack.planner.propose_future(ctx_z, ctx_h, plan, horizon=h)
+            act_logits = stack.planner.inverse_actions(ctx_h, fut, zero_plan_p)[0]
+        return [int(i) for i in act_logits.argmax(dim=-1).tolist()]
+
     if policy in ("diff_prior", "diff_guided"):
         scale = 0.0 if policy == "diff_prior" else float(lam)
         zero_plan = torch.zeros((1, stack.planner.plan_dim), device=dev)
@@ -241,7 +268,7 @@ def main() -> int:
         print(json.dumps({"policy": policy, **per_policy[policy]}), flush=True)
 
     gates = {}
-    for think in ("diff_argmax", "diff_guided", "diff_prior", "gru_argmax"):
+    for think in ("diff_argmax", "diff_guided", "diff_prior", "gru_argmax", "plan_grad"):
         if think not in per_policy:
             continue
         for ctrl in ("bc", "bc_random", "diff_prior"):
@@ -249,7 +276,7 @@ def main() -> int:
                 continue
             gates[f"{think}_vs_{ctrl}_return"] = paired_ci(returns[think], returns[ctrl])
             gates[f"{think}_vs_{ctrl}_success"] = paired_ci(succ[think], succ[ctrl])
-    for think in ("diff_argmax", "diff_guided", "gru_argmax"):
+    for think in ("diff_argmax", "diff_guided", "gru_argmax", "plan_grad"):
         if think in per_policy and "bc" in per_policy and "bc_random" in per_policy:
             gates[f"{think}_wins"] = bool(
                 gates[f"{think}_vs_bc_success"]["ci_lo"] > 0
