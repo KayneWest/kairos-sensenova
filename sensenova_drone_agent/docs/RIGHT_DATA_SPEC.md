@@ -53,7 +53,10 @@ findings. Each requirement cites the experiment that established it.
    dataset is much higher than P(failure | random prefix), the data will
    poison imagination training. Fixes in order of preference:
    - **corrective labels**: (visited state → expert/teacher action) pairs
-     — this is what makes iteration ladder (classic DAgger's guarantee);
+     — this is what makes iteration ladder (classic DAgger's guarantee),
+     now empirically confirmed in our stack: one round of expert-corrected
+     labels cleared the campaign's all-time ceiling in both seeds and
+     roughly doubled it by round 2 (Fig. 7 of the paper);
    - success-preserving reweighting (upweight the rare wins);
    - keep such data out of dynamics training entirely (policy-head only).
 
@@ -87,6 +90,32 @@ findings. Each requirement cites the experiment that established it.
 - If a teacher/expert exists (scripted policy, MPC oracle, human
   tele-operator willing to relabel): capture its action at visited states
   — this is the highest-value column in the whole spec (see #4).
+
+## How much data (measured, not guessed)
+
+Our confirmed ladder used surprisingly little: ~200 teacher episodes plus
+~400 agent episodes with teacher labels (~25k labeled states total) per
+round, with gains flattening after round 2. Two implications for sourcing:
+- **A modest, well-targeted corrective set beats a large passive one.**
+  Don't pay for volume before checking the properties above.
+- **Data investment has a hard stop**: once the representation binds (our
+  BC accuracy was encoder-capped at 61%), more/better data stops paying.
+  If a pilot round of corrective data doesn't move behavior, suspect the
+  encoder before the dataset.
+
+## Tokenizer-domain match (for new visual domains)
+
+Everything above concerns the planner's data. The frozen tokenizer has its
+own requirement: the visual domain must be in (or near) its training
+distribution. Cheap pre-check before committing to a source: encode →
+decode a few hundred frames and inspect reconstructions; if the tokenizer
+can't reconstruct the domain, either budget a decoder/tokenizer fine-tune
+(our motion-weighted decoder recipe) or expect quantitative claims to be
+latent-space-only. Teacher chunk labels: if the teacher can be queried in
+sim, roll it forward one horizon from each visited state
+(snapshot/restore) — chunk labels supervised our head better than
+single-action labels would; from humans, short 8-step corrections at
+failure points are the equivalent.
 
 ## Quick evaluation protocol for a candidate dataset
 
