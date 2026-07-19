@@ -1,6 +1,6 @@
 # From Scene Priors to Decision-Quality Imagination: Retrofitting Action Grounding into Video World-Model Latent Spaces
 
-*Draft v1.4 — 2026-07-17. Numbers are final from the July 2026 campaign; see
+*Draft v1.5 — 2026-07-19. Numbers are final from the July 2026 campaign; see
 WORKLOG.md for artifact paths. Bracketed notes mark writing TODOs.*
 
 ## Abstract
@@ -432,8 +432,13 @@ dreams faithfully selects against the goal. This retrospectively re-aims
 the amplifier finding: across every configuration we can decompose,
 deliberation amplifies the quality of the *imagination* (think-success
 spans 0.0–6.2% with the proposer, holding the judge fixed either way).
-Whether the §6 two-seed reversal also localizes to the imagination is open
-forensics — the same exchange applied to those stacks would answer it.
+Applying the same exchange to the §6 pre-DAgger reversal stacks answers
+the natural follow-up: there, the effect is *distributed* — each seed-2
+component (imagination and judge) degrades thinking mildly on its own and
+the pairing compounds (think-success 2.5% / 1.6% / 2.1% / 0.4% across the
+four cells at n = 1000) — so imagination-dominance is the signature of
+*data poisoning* specifically, while generic seed-fragility in the
+low-signal regime is spread across the whole imagination-judge system.
 
 ### 6.2 Value-guided generation: soft thinking needs an action-causal prior
 
@@ -461,7 +466,28 @@ absorbing-state pairing), and the guidance scale is flat over two orders
 of magnitude. The floor property that motivated the design does hold —
 under the inverted judge, guided selection sits at the prior's level
 rather than below random — but it holds vacuously, because guidance has no
-leverage anywhere. The lesson is the same one §6.1 teaches from the other
+leverage anywhere. Two follow-ups complete the picture. *Soft search on the plan manifold*
+(gradient ascent on the judge's score through the action-conditioned GRU
+proposer, re-projected onto the unit-norm plan sphere; actions decoded
+plan-free from the optimized future) is no rescue either: in one seed it
+beats no-thinking BC (CI-clean) but ties random selection at 1.5%
+success; in the second it sits at BC's floor (0.1–0.2%) — judge-invariant
+in both, far below hard argmax's 4.5–6.2%, and seed-fragile even in its
+failure mode. The plausible mechanism is the §5 thin link: argmax
+executes a discrete, guaranteed-valid behavior-prior candidate, while any
+soft method must decode actions from an optimized future through the
+inverse head. And *making the generative prior action-causal by
+transplanting the contrast recipe* proves to be a knife-edge in this
+model class: across five configurations, FiLM-only conditioning stays
+action-blind (the hinge saturates — ignoring the plan is the cheaper
+equilibrium), while a structural plan-into-trunk pathway does reach
+sample-level action-sensitivity (conditioned-over-free error 0.56–0.75;
+wrong-plan reconstructions up to 3x worse) but destabilizes to
+divergence within thousands of steps at every tested weight and learning
+rate, or oscillates without converging. The capability exists; a stable
+training equilibrium was not found (candidate stabilizers — EMA,
+contrast warmup, x0-parameterization, a sequence-structured trunk —
+remain untested). The lesson is the same one §6.1 teaches from the other
 side: the binding constraint on thinking-in-frames is the action-causal
 quality of the imagination; search strategy and judge quality are
 second-order by comparison.
@@ -547,9 +573,13 @@ offline decision-quality metrics do not predict the sign of closed-loop
 selection value (two-seed reversal, both CI-clean); and one DAgger iteration
 restores a two-seed-consistent behavioral win for thinking (success and
 return over both controls, all CIs clear, n = 1000 x 2 seeds). We claim additionally: the self-training poison localizes to the
-imagination, not the value head (8/8 exchange cells, two seeds, Fig. 6);
-and likelihood-only generative proposers recapitulate scene priors, so
-value-guided sampling over them fails softly (two seeds, both judges). We
+imagination, not the value head (8/8 exchange cells, two seeds, Fig. 6),
+while pre-DAgger seed-fragility is distributed across components (4-cell
+exchange); likelihood-only generative proposers recapitulate scene
+priors, so value-guided sampling over them fails softly (two seeds, both
+judges); soft plan-manifold search does not beat random selection in
+either seed; and contrast training of the diffusion prior reaches
+action-sensitivity only on an unstable knife-edge (five configurations). We
 do not claim: behavioral improvement without on-policy data (refuted by
 the reversal); iterated self-improvement from outcome-labeled self-data (a
 second self-collection round fails the strict gate under accumulation,
@@ -585,9 +615,12 @@ generative proposer (contrast-trained, as the GRU proposer was — not
 likelihood-only), after which guidance has something to steer; a
 plan-token variant (gradient ascent on the judge through the
 action-conditioned proposer, re-projected onto the unit-norm plan sphere
-each step) is the direct next candidate. Decomposing the §6 seed-reversal
-stacks with the §6.1 exchange is cheap and would settle where
-seed-fragility itself lives.
+each step) was run and does not beat random selection (§6.2); the §6
+seed-reversal stacks have been decomposed (§6.1). What remains open is
+stabilizing contrast-diffusion training (EMA, contrast warmup,
+x0-parameterization, a sequence-structured trunk) — the engineering
+problem standing between this paper's negative and a working
+soft-thinking substrate.
 
 ## 11. Reproducibility
 

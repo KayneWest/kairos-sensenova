@@ -174,6 +174,28 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-19 CAMPAIGN COMPLETE — PAPER v1.5 FINAL (all three workstreams two-seed)
+
+PLAN_GRAD seed-2 (v18_plangrad_{good,bad}judge_seed2): 0.2%/0.1% success
+— at BC's floor, BELOW random selection, judge-invariant. Two-seed
+verdict: soft plan-manifold search never beats random (1.5% then 0.1-0.2%
+vs argmax's 4.5-6.2%), seed-fragile even in its failure mode. Mechanism:
+the §5 inverse-head thin link (argmax executes a discrete valid BC
+candidate; soft methods must decode actions from an optimized future).
+
+PAPER v1.5 (all formats regenerated, artifact same URL): §6.1 forensics
+answer (imagination-dominance = data-poisoning signature; pre-DAgger
+fragility distributed), §6.2 gains plan-grad two-seed + contrast-
+diffusion knife-edge boundary, §9 claims both directions, §10 reduced to
+the one genuinely open item (stabilizing contrast-diffusion training).
+
+CAMPAIGN STATE: nothing running; GPUs idle; guard active (systemd).
+Unpushed commits on thinking-in-frames-campaign: push + PR whenever the
+user says. The campaign law survived every attempted refutation this
+week: hard selection over an action-causal imagination is the only
+winning configuration; failures localize to the imagination or the
+action-decode path, never the judge or the search.
+
 ## 2026-07-19 CONTRAST-DIFFUSION VERDICT: NO STABLE ACTION-CAUSAL EQUILIBRIUM (5 configs) + PLAN_GRAD SEED-1
 
 CONTRAST-DIFFUSION (c): five configurations, one thorough negative with a
