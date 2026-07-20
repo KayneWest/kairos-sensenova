@@ -174,6 +174,23 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-20 VIZDOOM ADAPTER SHIPPED (second visual domain for self-collected data)
+
+src/sensenova_drone/vizdoom_game.py — DroneMazeEnv-compatible (same
+reset/step/render/expert_action_index/snapshot/restore + terminal-reward
+conventions), 9-slot action layout preserved -> every collector/DAgger/
+eval script works by swapping the env class. Default scenario
+health_gathering (160 steps): oracle 30/30 survive-to-win vs noop 0/20;
+3.8k env-steps/s; modal action 40%, shift1-cos 0.67. deadly_corridor kept
+as hard variant (heuristic pistol teacher not viable at skill>=1 combat —
+would need a real bot). CAVEAT: ZDoom save/load restore is only
+approximately deterministic (position drift ~O(10 units)/5 steps) — fine
+for expert chunk labels (label noise), weaker for exact counterfactual
+branches. Verify: scripts/smoke_vizdoom_game.py. vizdoom==1.3.0 on host;
+NOT in the docker image yet (add pip install to image before GPU-side
+collection). Next steps for the domain: tokenizer check on Doom frames
+(encode/decode recon), then the expert-DAgger pipeline as-is.
+
 ## 2026-07-19 GOOD-DATA VERDICT: TRUE DAGGER LADDERS (two seeds) — PAPER v1.6, PUSHED
 
 run_expert_dagger.py: expert chunk labels via env snapshot->expert
