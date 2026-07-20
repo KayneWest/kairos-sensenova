@@ -20,6 +20,7 @@ p.add_argument("--max-steps", type=int, default=160)
 p.add_argument("--pad-terminal", type=int, default=12)
 p.add_argument("--seed", type=int, default=20270400)
 p.add_argument("--overwrite", action="store_true")
+p.add_argument("--random-policy", action="store_true")
 args = p.parse_args()
 out_dir = resolve_path(args.out)
 if out_dir.exists() and not args.overwrite:
@@ -34,7 +35,7 @@ writer = TaskWriter(task_name="doom_health", text="vizdoom health_gathering orac
 rng = np.random.default_rng(args.seed)
 outcomes = {"success": 0, "collision_or_oob": 0, "timeout": 0}
 for ep in range(args.episodes):
-    eps = [0.0, 0.3, 0.6][ep % 3]  # oracle / mild-noise / heavy-noise thirds
+    eps = 1.0 if args.random_policy else [0.0, 0.3, 0.6][ep % 3]
     env.reset(seed=int(rng.integers(0, 2**31 - 1)))
     writer.append(episode=ep, frame_rgb=env.render(), action=np.zeros(NUM_ACTIONS, dtype=np.float32), reward=0.0)
     done, term_r, steps = False, 0.0, 0
