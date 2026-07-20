@@ -174,6 +174,45 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-20 DOOM PIPELINE STARTED (docker :vzd image, base collection running)
+
+Docker image sensenova_drone_agent-dreamer:vzd = :local + vizdoom 1.3.0.
+Tokenizer domain check (check_tokenizer_domain_vizdoom.py): drone
+tokenizer's variance-normalized recon on Doom is only 1.25x its drone
+value -> CHEAP PATH: reuse drone_game_tokenizer_v1 for Doom planner
+training; the planner's offline audit is the real domain test (latents
+need discrimination, not pretty decode). Caveat: absolute recon numbers
+from this script are uncalibrated (decode-path API), only the cross-
+domain ratio is meaningful.
+
+RUNNING: collect_vizdoom_dataset.py -> data/vizdoom_health/base_v1
+(600 eps, thirds at eps 0.0/0.3/0.6 oracle-noise, pad-terminal 12,
+max-steps 160). Expected mix: ~50-65% success (spec-compliant density).
+
+NEXT COMMANDS (each turnkey, :vzd image, GPU 1):
+1. RTG relabel: relabel_rewards_return_to_go.py --src data/vizdoom_health/base_v1
+   --out data/vizdoom_health/base_v1_rtg --overwrite
+2. Manifest data/vizdoom_health/doom_v1_manifest.json (single source w1,
+   tasks_json = base_v1_rtg/tasks.json), then planner train via
+   launch_latent_imagination_planner.sh with RUN_ID=doom_health_v1,
+   MANIFEST_JSON=<above>, TOKENIZER_CKPT=drone_game_tokenizer_v1/latest.pt,
+   the drone v4_scoredrop flag set (GAMMA=0 REWARD_LOSS_WEIGHT=0.5
+   SCORE_PLAN_DROPOUT=0.5 RANK_LOSS_WEIGHT=1.0 PLAN_UNIT_NORM=1
+   PLAN_STEP_CONDITIONING=1 INVERSE_PLAN_DROPOUT=0.5
+   INVERSE_IMAGINED_WEIGHT=0.25 INVERSE_CROSS_WEIGHT=0.5 MAX_STEPS=60000)
+   — NOTE: image must be :vzd if payload imports env; planner training
+   doesn't need vizdoom, :local fine.
+3. BC head: train_drone_bc_chunk_head.py on base_v1 (NUM_ACTIONS=9 same).
+4. Closed-loop eval: eval_gym_drone_game_diffusion_think.py policies
+   bc,bc_random,gru_argmax — REQUIRES env swap: the eval imports
+   DroneMazeEnv; add --env vizdoom flag or an env-registry import switch
+   (small patch, not yet written).
+5. Expert-DAgger ladder: run_expert_dagger.py — same env-swap caveat.
+GATE: offline audit on doom data (eval_latent_imagination_decision_quality)
+decides whether the drone tokenizer suffices or a Doom tokenizer must be
+trained (tokenizer-training provenance for drone_game_tokenizer_v1 not
+re-located yet; check dreamer4 train_dynamics usage).
+
 ## 2026-07-20 VIZDOOM ADAPTER SHIPPED (second visual domain for self-collected data)
 
 src/sensenova_drone/vizdoom_game.py — DroneMazeEnv-compatible (same
