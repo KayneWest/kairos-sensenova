@@ -174,6 +174,22 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-20 DOOM VERDICT: BORROWED TOKENIZER WORKS — cross-domain latent reuse confirmed offline
+
+doom_health_v1 planner (60k, DRONE tokenizer latents, v4_scoredrop recipe,
+base_v1 oracle-mix w2 + base_v1b random-failure w1): final evals
+rank_fid_corr 0.86-0.92, zero_over_normal 10.7-14.1x, timing contrasts
+1.28-1.66x, score_return_corr 0.34, future_mse 0.021. The offline
+think-loop lands in the healthy regime on an unseen visual domain without
+touching the tokenizer. base_v1b random slice: collected (fixed missing
+docker -i heredoc trap by adding --random-policy flag to collector).
+RUNNING: doom_bc_chunk_head_v1.pt (15k steps, ~70min, GPU 1).
+REMAINING for the Doom ladder: (1) env-swap flag (--env vizdoom) in
+eval_gym_drone_game_diffusion_think.py + run_expert_dagger.py (both
+import DroneMazeEnv directly; swap in VizdoomCorridorEnv with
+max_episode_steps=160); (2) closed-loop eval bc/bc_random/gru_argmax;
+(3) expert-DAgger ladder with the 100% oracle teacher. All via :vzd image.
+
 ## 2026-07-20 DOOM PIPELINE STARTED (docker :vzd image, base collection running)
 
 Docker image sensenova_drone_agent-dreamer:vzd = :local + vizdoom 1.3.0.
