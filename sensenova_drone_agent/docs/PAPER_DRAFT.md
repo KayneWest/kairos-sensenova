@@ -1,6 +1,6 @@
 # From Scene Priors to Decision-Quality Imagination: Retrofitting Action Grounding into Video World-Model Latent Spaces
 
-*Draft v1.6 — 2026-07-19. Numbers are final from the July 2026 campaign; see
+*Draft v1.7 — 2026-07-23. Numbers are final from the July 2026 campaign; see
 WORKLOG.md for artifact paths. Bracketed notes mark writing TODOs.*
 
 ## Abstract
@@ -45,7 +45,16 @@ expert's action at each state the agent visits, classic DAgger — ladders
 where self-imitation could not: the whole stack clears its previous
 ceiling in one round and roughly doubles it before plateauing (~10% vs
 41.5% expert), locating the next binding constraint in the frozen
-representation rather than the data.
+representation rather than the data. A second domain replicates the
+whole arc at scale: on ViZDoom, with the *drone game's* tokenizer
+(never trained on a Doom frame) and a 100%-success scripted teacher,
+one round of clean corrective labels lifts selection to a 78–84%
+survival ceiling in both seeds and saturates immediately; a
+drift-corrupted variant of the same teacher tops out below half that,
+and under data aggregation the behavior-cloned proposer degrades
+monotonically while argmax selection over the fixed imagination holds
+the ceiling — corrective-label quality and representation capacity
+bind, in that order, while selection acts as a robustness layer.
 
 ## 1. Introduction
 
@@ -527,6 +536,52 @@ quantity, data quality, judge, or search. The campaign's constraint
 ordering is thus: (1) action-causal imagination, (2) corrective on-policy
 data, (3) representation capacity — with judge and search strategy never
 binding at any point we could measure.
+
+### 6.4 A second domain: Doom, a borrowed tokenizer, and a perfect teacher (Fig. 8)
+
+Everything above is one environment. To test whether the stack — and the
+constraint ordering — is domain-general, we added ViZDoom
+(health-gathering: survive 160 steps on an acid floor by collecting
+medikits; a privileged-state scripted oracle survives 100%) behind the
+same nine-action environment interface, and deliberately kept the *drone
+game's* frozen tokenizer, which has never seen a Doom frame. The planner
+trained on these borrowed latents passes the same offline audit gates as
+the drone planner (rank-fidelity 0.86–0.92, zero-plan contrast 10.7–14.1x),
+and the full expert-DAgger ladder of §6.3 then runs unchanged.
+
+One methodological result first. Our original labeling loop —
+snapshot, roll the expert a horizon, restore, *at every step of the live
+episode* — silently destroys the episode it is labeling: ViZDoom's
+save/load carries a small state perturbation, and 160 accumulated
+restores kill the 100% oracle entirely (0/20 survival vs 20/20 clean;
+our round-0 "expert" collected 0/200). The fix is structural, not
+parametric: expert episodes take chunk labels from the expert's *own
+executed future* (no snapshots at all), and agent episodes save
+snapshots during the rollout but defer every labeling restore to after
+the episode ends. Corrective labeling must never touch the mainline
+trajectory it is correcting — a constraint invisible in simulators with
+exact state restore, and exactly the kind of defect the drifted run
+turns into a free ablation: a *noisy teacher*.
+
+The two ladders (three rounds each, n = 500 per evaluation, two seeds
+for the clean run) say three things (Fig. 8). First, the clean teacher
+produces the campaign's highest absolute closed-loop performance
+immediately: selection reaches 78.6–84.4% survival in every evaluation
+across both seeds (vs 41.5%-teacher-capped ~10% in the drone game), and
+saturates in round 1 — rounds 2 and 3 add 100k more labeled states and
+no selected-policy gains. The representation wall of §6.3 replicates in
+a second domain, on a tokenizer that never saw it, just at a far higher
+ceiling. Second, the teacher-label channel is decisive: the drift-noised
+teacher's best round (45.0%) is barely half the clean teacher's worst
+(78.0%) — the poisoning constraint of §6 in its purest form, with the
+world model held fixed and only labels varying. Third, selection is a
+robustness layer: under aggregation the BC head *degrades* monotonically
+in both seeds (66.4→25.0%, 75.8→43.6%) while hard-argmax selection over
+the fixed imagination holds the ceiling throughout, and the one
+evaluation where the selection gate fails (seed 2, round 1) is precisely
+where BC is at its strongest (75.8%). Thinking's margin appears exactly
+when — and only when — the proposer is off-ceiling, the same
+deliberation-as-crutch asymmetry §6.3 observed from the opposite side.
 
 ## 7. Visible thinking traces
 

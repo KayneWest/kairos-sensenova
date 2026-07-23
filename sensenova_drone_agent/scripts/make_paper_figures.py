@@ -417,6 +417,44 @@ def fig7_expert_dagger():
     plt.close(fig)
 
 
+def fig8_doom_expert_dagger():
+    # Second domain (ViZDoom health-gathering, borrowed drone tokenizer,
+    # 100% scripted teacher): clean corrective labels jump selection to a
+    # ~78-84% ceiling in round 1 and saturate (two seeds); the drift-noised
+    # teacher tops out below half that; BC degrades under aggregation while
+    # selection holds the ceiling.
+    runs = [
+        ("clean teacher — seed 1", "closed_loop_drone_game_v20_doom_expert_dagger_s1fix_r{r}", BLUE, "-"),
+        ("clean teacher — seed 2", "closed_loop_drone_game_v20_doom_expert_dagger_s2fix_r{r}", RED, "-"),
+        ("noisy teacher (drifted labels)", "closed_loop_drone_game_v20_doom_expert_dagger_s1_r{r}", GRAY, "-"),
+    ]
+    fig, ax = plt.subplots(figsize=(7.2, 3.4), constrained_layout=True)
+    for label, tpl, color, ls in runs:
+        xs, think, bc = [], [], []
+        for r in (1, 2, 3):
+            p_ = ROOT / "output" / tpl.format(r=r) / "summary.json"
+            d = json.loads(p_.read_text())["per_policy"]
+            xs.append(r)
+            think.append(d["gru_argmax"]["success_rate"] * 100)
+            bc.append(d["bc"]["success_rate"] * 100)
+        ax.plot(xs, think, color=color, lw=2, ls=ls, marker="o", ms=5, mec="white",
+                label=f"{label} — think")
+        ax.plot(xs, bc, color=color, lw=1.6, ls="--", marker="s", ms=4, mec="white",
+                alpha=0.6, label=f"{label} — BC alone")
+    ax.axhline(100, color=GRAY, lw=1, ls=":")
+    ax.annotate("teacher (100%)", (1.02, 95.0), fontsize=7.6, color=MUTED)
+    ax.set_xticks([1, 2, 3])
+    ax.set_xlabel("expert-correction round")
+    ax.set_ylabel("survival rate (%)")
+    ax.set_ylim(0, 104)
+    ax.legend(frameon=False, fontsize=7.2, loc="lower left", ncols=2)
+    ax.set_title("Doom, borrowed tokenizer: clean corrective labels hit a ~80% ceiling immediately;\n"
+                 "BC degrades under aggregation while selection holds (n=500/point; teacher 100%)",
+                 fontsize=9)
+    fig.savefig(OUT / "fig8_doom_expert_dagger.png", dpi=200)
+    plt.close(fig)
+
+
 if __name__ == "__main__":
-    fig0_architecture(); fig1(); fig2(); fig3(); fig4_trace_grid(); fig5_dagger_cycles(); fig6_decomposition(); fig7_expert_dagger()
+    fig0_architecture(); fig1(); fig2(); fig3(); fig4_trace_grid(); fig5_dagger_cycles(); fig6_decomposition(); fig7_expert_dagger(); fig8_doom_expert_dagger()
     print(json.dumps({"phase": "figures_done", "out": str(OUT), "files": sorted(p.name for p in OUT.glob("*.png"))}))

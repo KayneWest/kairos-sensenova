@@ -34,6 +34,10 @@ FIGURES = {
     "@@FIG7@@": ("fig7_expert_dagger.png", "Figure 7 — True DAgger: expert-corrective labels on visited states "
                  "(imagination and judge fixed) clear the campaign ceiling in one round in both seeds and roughly "
                  "double it before plateauing at the representation bound."),
+    "@@FIG8@@": ("fig8_doom_expert_dagger.png", "Figure 8 — Second domain (ViZDoom, borrowed drone tokenizer, "
+                 "100% scripted teacher): one round of clean corrective labels lifts selection to a ~78–84% "
+                 "survival ceiling in both seeds and saturates; the drift-noised teacher tops out below half "
+                 "that; BC degrades monotonically under aggregation while selection holds the ceiling."),
 }
 
 # Insert placeholders after the paragraph that first cites each figure.
@@ -44,6 +48,7 @@ ANCHORS = [
     ("self-improvement ladder.", "@@FIG5@@"),
     ("second-order by comparison.", "@@FIG6@@"),
     ("binding at any point we could measure.", "@@FIG7@@"),
+    ("observed from the opposite side.", "@@FIG8@@"),
     ("rest on the latent-space audit.", "@@FIG4@@"),
 ]
 for anchor, placeholder in ANCHORS:

@@ -143,3 +143,6 @@ sensenova_drone_agent/sensenova_drone_agent/data/
 sensenova_drone_agent/sensenova_drone_agent/logs/
 sensenova_drone_agent/sensenova_drone_agent/output/
 sensenova_drone_agent/third_party/
+
+# company-private planning docs (never commit)
+URUN_PRIML_PLAN.local.md
