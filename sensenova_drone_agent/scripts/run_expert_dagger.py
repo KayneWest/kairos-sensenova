@@ -4,8 +4,11 @@
 The campaign's "DAgger" was self-imitation (outcome-labeled own episodes) —
 it repaired coverage once, then poisoned the imagination. This is the real
 thing: roll out the think-then-act agent, and at EVERY visited state record
-what the scripted expert would do for the next horizon (env snapshot ->
-expert rollout -> restore). The healthy cycle-1 imagination is HELD FIXED;
+what the scripted expert would do for the next horizon. Expert episodes take
+labels from the expert's own executed future; agent episodes save() a
+snapshot per step and run all labeling restores AFTER the episode ends
+(ZDoom load() drift on a live mainline killed the oracle 0/20 vs 20/20).
+The healthy cycle-1 imagination is HELD FIXED;
 only the BC candidate head retrains each round on the aggregated
 expert-labeled data. If corrective data is the missing capacity, success
 ladders round over round toward the 41.5% expert ceiling.
@@ -32,6 +35,13 @@ import numpy as np
 import torch
 
 from sensenova_drone.gym_drone_game import DroneGameConfig, DroneMazeEnv
+
+
+def make_env(kind: str, max_steps: int):
+    if kind == "vizdoom":
+        from sensenova_drone.vizdoom_game import VizdoomCorridorEnv, VizdoomGameConfig
+        return VizdoomCorridorEnv(VizdoomGameConfig(max_episode_steps=max_steps))
+    return DroneMazeEnv(DroneGameConfig(max_episode_steps=max_steps))
 from train_dynamics import align_actions_to_frames, pack_bottleneck_to_spatial, temporal_patchify  # noqa: E402
 from train_drone_bc_chunk_head import BCChunkHead  # noqa: E402
 from train_latent_diffusion_proposer import load_planner  # noqa: E402
@@ -54,9 +64,10 @@ def encode_ctx_h(planner, encoder, patch, ns, pk, cfg, frames, act_hist, device)
     return planner.encode_context(ctx_z, actions.clamp(-1, 1) * amask)
 
 
-def expert_chunk(env, horizon: int) -> list[int]:
-    """Expert's next-h actions from the current state (snapshot/restore)."""
-    snap = env.snapshot()
+def expert_rollout(env, horizon: int) -> list[int]:
+    """Expert's next-h actions from the env's CURRENT state, consuming it.
+    The caller owns snapshot/restore bookkeeping (restores must never touch a
+    live mainline trajectory — ZDoom load() drift kills the oracle)."""
     chunk = []
     for _ in range(horizon):
         a = int(env.expert_action_index())
@@ -66,13 +77,12 @@ def expert_chunk(env, horizon: int) -> list[int]:
             break
     while len(chunk) < horizon:
         chunk.append(0)  # absorbing convention: hover
-    env.restore(snap)
     return chunk
 
 
 def collect_round(*, planner, encoder, patch, ns, pk, cfg, bc_head, episodes, max_steps,
-                  seed, device, num_candidates, replan_every, bc_temperature, expert_acts):
-    env = DroneMazeEnv(DroneGameConfig(max_episode_steps=max_steps))
+                  seed, device, num_candidates, replan_every, bc_temperature, expert_acts, env_kind="drone"):
+    env = make_env(env_kind, max_steps)
     rng = np.random.default_rng(seed)
     h = int(cfg.horizon)
     xs, ys = [], []
@@ -83,13 +93,19 @@ def collect_round(*, planner, encoder, patch, ns, pk, cfg, bc_head, episodes, ma
         frames = [frame] * int(cfg.ctx_len)
         act_hist = [np.zeros(NUM_ACTIONS, dtype=np.float32)] * int(cfg.ctx_len)
         pending, done, term_r, steps = [], False, 0.0, 0
+        acts_taken, snaps = [], []
         while not done and steps < max_steps:
             ctx_h = encode_ctx_h(planner, encoder, patch, ns, pk, cfg, frames, act_hist, device)
             xs.append(ctx_h[0].cpu().numpy().astype(np.float32))
-            ys.append(np.array(expert_chunk(env, h), dtype=np.int64))
             if expert_acts:
                 a = int(env.expert_action_index())
+                acts_taken.append(a)
             else:
+                # ViZDoom's restore() perturbs the live trajectory (~10 units of
+                # drift each call killed the oracle: 0/20 vs 20/20 clean), so
+                # labeling restores are deferred to after the episode; only the
+                # non-perturbing save() happens on the mainline.
+                snaps.append(env.snapshot())
                 if not pending:
                     pending = ev.plan_chunk(policy="act_bc_think", model=planner, encoder=encoder,
                                             patch=patch, n_spatial=ns, packing_factor=pk, cfg=cfg,
@@ -105,6 +121,19 @@ def collect_round(*, planner, encoder, patch, ns, pk, cfg, bc_head, episodes, ma
             act_hist = act_hist[1:] + [v]
             term_r, steps, done = float(r), steps + 1, (t1 or t2)
         outcomes["success" if (done and term_r > 5.0) else ("collision_or_oob" if done else "timeout")] += 1
+        if expert_acts:
+            # the expert's own executed future IS the chunk label — no snapshots
+            for t in range(len(acts_taken)):
+                chunk = acts_taken[t:t + h]
+                chunk += [0] * (h - len(chunk))
+                ys.append(np.array(chunk, dtype=np.int64))
+        else:
+            for snap in snaps:
+                env.restore(snap)
+                ys.append(np.array(expert_rollout(env, h), dtype=np.int64))
+                path = snap.get("path") if isinstance(snap, dict) else None
+                if path:
+                    Path(path).unlink(missing_ok=True)
     return np.stack(xs), np.stack(ys), outcomes
 
 
@@ -141,6 +170,7 @@ def main() -> int:
     p.add_argument("--expert-episodes", type=int, default=200)
     p.add_argument("--episodes-per-round", type=int, default=400)
     p.add_argument("--max-steps", type=int, default=80)
+    p.add_argument("--env", default="drone", choices=["drone", "vizdoom"])
     p.add_argument("--num-candidates", type=int, default=32)
     p.add_argument("--replan-every", type=int, default=4)
     p.add_argument("--bc-temperature", type=float, default=0.8)
@@ -170,7 +200,7 @@ def main() -> int:
                                  bc_head=bc_head, episodes=args.expert_episodes, max_steps=args.max_steps,
                                  seed=args.seed, device=device, num_candidates=args.num_candidates,
                                  replan_every=args.replan_every, bc_temperature=args.bc_temperature,
-                                 expert_acts=True)
+                                 expert_acts=True, env_kind=args.env)
     all_x.append(xs)
     all_y.append(ys)
     log({"round": 0, "mode": "expert", "states": int(xs.shape[0]), "outcomes": outc})
@@ -181,7 +211,7 @@ def main() -> int:
                                      bc_head=bc_head, episodes=args.episodes_per_round,
                                      max_steps=args.max_steps, seed=args.seed + rnd * 1000, device=device,
                                      num_candidates=args.num_candidates, replan_every=args.replan_every,
-                                     bc_temperature=args.bc_temperature, expert_acts=False)
+                                     bc_temperature=args.bc_temperature, expert_acts=False, env_kind=args.env)
         all_x.append(xs)
         all_y.append(ys)
         log({"round": rnd, "mode": "agent_collect", "states": int(xs.shape[0]), "outcomes": outc})
@@ -203,6 +233,7 @@ def main() -> int:
                             "--bc-head", str(head_path),
                             "--diffusion-ckpt", str(PROJECT_ROOT / "output" / "latent_diffusion_proposer_v2" / "final.pt"),
                             "--out-dir", str(eval_out), "--episodes", str(args.eval_episodes),
+                            "--env", args.env, "--max-steps", str(args.max_steps),
                             "--seed", str(args.eval_seed), "--policies", "bc,bc_random,gru_argmax"])
         if r.returncode != 0:
             log({"round": rnd, "mode": "eval", "error": r.returncode})

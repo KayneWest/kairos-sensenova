@@ -174,6 +174,68 @@ infrastructure now in place (bc-encoder-grad planner flags,
 train_drone_imagination_policy.py, act_policy* eval arms). This matches and
 extends the paper's central finding; add one sentence to PAPER_DRAFT §9.
 
+## 2026-07-23 DOOM EXPERT-DAGGER VERDICT (seed 1): CLEAN TEACHER JUMPS TO ~83%, THEN REPRESENTATION-BOUND — plus a snapshot-drift forensic
+
+Closed-loop think-then-act TRANSFERS TO DOOM on the borrowed drone tokenizer,
+and the teacher-label channel is decisive. Two complete 3-round ladders
+(run_expert_dagger.py --env vizdoom, health_gathering 160 steps, n=500/round,
+seed 20260710, planner latent_imagination_planner_doom_health_v1 held fixed,
+init head doom_bc_chunk_head_v1):
+
+SNAPSHOT-DRIFT BUG (found via expert 0/200 in round 0 vs 30/30 smoke): the
+per-step expert_chunk snapshot->rollout->restore cycle CORRUPTS the live
+mainline — ZDoom load() drift. A/B: plain oracle 20/20; with per-step
+save+restore 0/20 (mean len 67 ~= the ladder's 63). save() alone is clean
+(20/20). Post-terminal load() silently never applies (finished episodes
+don't tic) — vizdoom_game.restore() now does new_episode() first. Fix in
+collect_round: expert episodes take chunk labels from the expert's OWN
+executed future (no snapshots at all); agent episodes save() per step and
+run all labeling restores AFTER the episode ends. Old behavior kept as the
+"noisy teacher" ablation below.
+
+NOISY teacher (pre-fix, out-prefix doom_expert_dagger_s1):
+  r1 bc 11.8 / bc_random 25.2 / gru_argmax 39.0
+  r2 bc  4.4 / bc_random 24.2 / gru_argmax 38.6
+  r3 bc  4.2 / bc_random 21.6 / gru_argmax 45.0   (gate true all rounds)
+CLEAN teacher (fixed, out-prefix doom_expert_dagger_s1fix; expert 200/200,
+collecting agent 29.8-38% per round):
+  r1 bc 66.4 / bc_random 63.8 / gru_argmax 83.6   (train_acc 55.6)
+  r2 bc 41.0 / bc_random 54.4 / gru_argmax 79.8   (train_acc 52.5)
+  r3 bc 25.0 / bc_random 60.8 / gru_argmax 82.4   (train_acc 48.0)
+
+Reading: (1) ONE round of clean corrective labels ~doubles the noisy run's
+best-ever (83.6 vs 45) — teacher quality is the whole ballgame, matching
+RIGHT_DATA_SPEC #4. (2) The ladder SATURATES immediately: rounds 2-3 add
+data but no selected-policy gains (~80-84 plateau) — the Doom analog of the
+drone representation wall, now at a much higher ceiling (survive-to-win is
+easier than reach-goal). (3) BC alone DEGRADES monotonically as harder
+agent-visited states enter the aggregate (66->41->25; chunk acc falls in
+step), while selection stays flat-high — selection over action-causal
+imagination is robust to a collapsing proposer; the campaign law again.
+(4) Noisy-teacher ablation: corrupted labels poison BC (12->4) yet
+gru_argmax still climbs 39->45 — selection extracts signal even from a
+degraded label channel.
+
+Artifacts: output/closed_loop_drone_game_v20_doom_expert_dagger_s1{,fix}_r{1,2,3},
+heads output/doom_expert_dagger_s1{,fix}_head_r{1,2,3}.pt, per-round data
+npz alongside.
+
+SEED-2 REPEAT (2026-07-23 later, seed 20260711, out-prefix
+doom_expert_dagger_s2fix — CLAIMABLE under the two-seed rule):
+  r1 bc 75.8 / bc_random 68.4 / gru_argmax 78.6   (gate FALSE — see below)
+  r2 bc 49.4 / bc_random 64.0 / gru_argmax 84.4   (gate true)
+  r3 bc 43.6 / bc_random 51.8 / gru_argmax 78.0   (gate true)
+Two-seed verdict: (1) the clean-teacher jump to a ~78-84% ceiling replicates
+(all 6 evals in-band; s1 mean 81.9, s2 80.3); (2) NO laddering after round 1
+in either seed — immediate saturation at the representation bound; (3) BC
+degrades monotonically under aggregation in both seeds (66->25, 76->44);
+(4) selection gate true 5/6 cells — the single false cell (s2 r1) is
+exactly where BC was at its strongest (75.8), i.e. thinking's margin
+appears whenever the proposer is off-ceiling, the campaign law's
+selection-as-robustness-layer form. Doom + borrowed tokenizer + clean
+expert DAgger = the stack's highest absolute closed-loop performance to
+date (~4x the drone game's best), from ONE round of corrective data.
+
 ## 2026-07-20 DOOM VERDICT: BORROWED TOKENIZER WORKS — cross-domain latent reuse confirmed offline
 
 doom_health_v1 planner (60k, DRONE tokenizer latents, v4_scoredrop recipe,

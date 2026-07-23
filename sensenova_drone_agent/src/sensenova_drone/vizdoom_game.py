@@ -174,6 +174,10 @@ class VizdoomCorridorEnv:
         return {"path": path, "step_index": self._step_index, "goal": self._goal_xy}
 
     def restore(self, snapshot: dict[str, Any]) -> None:
+        # ZDoom applies load() on the next tic; a finished/dead episode never
+        # tics, so the load would silently never happen. new_episode() first.
+        if self.game.is_episode_finished() or self.game.is_player_dead():
+            self.game.new_episode()
         self.game.load(snapshot["path"])
         self._step_index = snapshot["step_index"]
         self._goal_xy = snapshot["goal"]

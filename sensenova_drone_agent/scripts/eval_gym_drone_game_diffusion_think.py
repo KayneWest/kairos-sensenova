@@ -35,6 +35,13 @@ import numpy as np
 import torch
 
 from sensenova_drone.gym_drone_game import DroneGameConfig, DroneMazeEnv
+
+
+def make_env(kind: str, max_steps: int):
+    if kind == "vizdoom":
+        from sensenova_drone.vizdoom_game import VizdoomCorridorEnv, VizdoomGameConfig
+        return VizdoomCorridorEnv(VizdoomGameConfig(max_episode_steps=max_steps))
+    return DroneMazeEnv(DroneGameConfig(max_episode_steps=max_steps))
 from train_dynamics import align_actions_to_frames, pack_bottleneck_to_spatial, temporal_patchify  # noqa: E402
 from train_drone_bc_chunk_head import BCChunkHead  # noqa: E402
 from train_latent_diffusion_proposer import DiffusionProposer, ddim_sample, load_planner  # noqa: E402
@@ -205,6 +212,7 @@ def main() -> int:
     p.add_argument("--out-dir", required=True)
     p.add_argument("--episodes", type=int, default=1000)
     p.add_argument("--max-steps", type=int, default=80)
+    p.add_argument("--env", default="drone", choices=["drone", "vizdoom"])
     p.add_argument("--num-candidates", type=int, default=32)
     p.add_argument("--replan-every", type=int, default=4)
     p.add_argument("--ddim-steps", type=int, default=0)
@@ -223,7 +231,7 @@ def main() -> int:
 
     per_policy, returns, succ = {}, {}, {}
     for policy in policies:
-        env = DroneMazeEnv(DroneGameConfig(max_episode_steps=args.max_steps))
+        env = make_env(args.env, args.max_steps)
         rng = np.random.default_rng(args.seed + 17)
         gen = torch.Generator(device=device.type).manual_seed(args.seed + 23)
         rows = []
