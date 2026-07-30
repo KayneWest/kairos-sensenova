@@ -1,0 +1,13 @@
+{
+  "prompt": "",
+  "input_image": "sensenova_drone_agent/sim_assets/sample_frames/gazebo_rgb_000001.png",
+  "negative_prompt": "bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, deformed limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards, contorted human joints, objects floating against natural forces, abrupt shot changes",
+  "seed": 0,
+  "tiled": true,
+  "height": 480,
+  "width": 640,
+  "num_frames": 49,
+  "cfg_scale": 5,
+  "use_prompt_rewriter": false,
+  "output_dir": "sensenova_drone_agent/output/real_i2v_480p_test"
+}

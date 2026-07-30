@@ -1,0 +1,39 @@
+FROM python:3.10-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PYTHONPATH=/workspace/sensenova_drone_agent/src:/workspace/sensenova_drone_agent:/workspace
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    ffmpeg \
+    git \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    unzip \
+    wget \
+    xvfb \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --upgrade pip setuptools wheel \
+  && pip install \
+    "numpy<2" \
+    imageio \
+    imageio-ffmpeg \
+    opencv-python-headless \
+    pillow \
+    tqdm \
+    "gymnasium==0.29.1" \
+    "minigrid==2.3.1" \
+    "procgen==0.10.7" \
+    "vizdoom==1.2.4" \
+    "ai2thor==5.0.0"
+
+RUN pip install \
+    --index-url https://download.pytorch.org/whl/cpu \
+    "torch==2.6.0+cpu"
+
+WORKDIR /workspace

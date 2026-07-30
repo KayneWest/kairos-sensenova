@@ -1,0 +1,21 @@
+# User-level systemd unit for the sda thermal/power guard.
+# Install (once):
+#   mkdir -p ~/.config/systemd/user
+#   cp sda-thermal-guard.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now sda-thermal-guard
+#   loginctl enable-linger $USER     # survive logout/reboot without a session
+# Status / logs:
+#   systemctl --user status sda-thermal-guard
+#   tail -f sensenova_drone_agent/output/thermal_guard.log
+[Unit]
+Description=Thermal/power guard for sda-* docker GPU jobs (pause on heat/power)
+After=docker.service
+
+[Service]
+ExecStart=/bin/bash /home/mkrzus/kairos-sensenova/sensenova_drone_agent/scripts/experiments/thermal_guard.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

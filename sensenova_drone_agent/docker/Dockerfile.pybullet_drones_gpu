@@ -1,0 +1,30 @@
+FROM mkrzus/director-mode:5090-runtime
+
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PYTHONPATH=/workspace/sensenova_drone_agent/src:/workspace/sensenova_drone_agent:/workspace
+
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    git \
+    libgl1 \
+    libglib2.0-0 \
+  && rm -rf /var/lib/apt/lists/*
+
+# Keep the CUDA-enabled PyTorch from the base image. Install only the PyBullet
+# runtime dependencies needed by the drone imagination experiments.
+RUN python -m pip install \
+    "setuptools<81" \
+    pybullet==3.2.7 \
+    scipy \
+    transforms3d \
+    matplotlib \
+    control \
+    gymnasium \
+    pillow \
+  && python -m pip install --no-deps \
+    "gym-pybullet-drones @ git+https://github.com/learnsyslab/gym-pybullet-drones.git@90b178aba69b09085dd70e7a1e88bb58ca00b4c9"
+
+WORKDIR /workspace

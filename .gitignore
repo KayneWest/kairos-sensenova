@@ -118,6 +118,7 @@ venv.bak/
 .idea
 
 output/
+models/*
 _my_configs/
 z_scripts/
 z_tools/
@@ -129,3 +130,19 @@ workdir/
 workdirs/
 work_dirs/
 checkpoints/
+
+# Local drone-sim workspace artifacts
+sensenova_drone_agent/.px4-sim-home/
+sensenova_drone_agent/.tools-home/
+sensenova_drone_agent/.venv-drone-sim/
+sensenova_drone_agent/.pytest_cache/
+sensenova_drone_agent/data/
+sensenova_drone_agent/logs/
+sensenova_drone_agent/sim_assets/sample_frames/
+sensenova_drone_agent/sensenova_drone_agent/data/
+sensenova_drone_agent/sensenova_drone_agent/logs/
+sensenova_drone_agent/sensenova_drone_agent/output/
+sensenova_drone_agent/third_party/
+
+# company-private planning docs (never commit)
+URUN_PRIML_PLAN.local.md

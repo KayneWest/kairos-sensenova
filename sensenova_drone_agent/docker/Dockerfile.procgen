@@ -1,0 +1,19 @@
+FROM python:3.10-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PYTHONPATH=/workspace/sensenova_drone_agent/src:/workspace/sensenova_drone_agent:/workspace
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libgl1 \
+    libglib2.0-0 \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --upgrade pip setuptools wheel \
+  && pip install \
+    "numpy<2" \
+    pillow \
+    procgen==0.10.7
+
+WORKDIR /workspace
